@@ -7,13 +7,19 @@ def main():
         ("main.py", "main.py"),
         ("deck.csv", "deck.csv"),
         ("src/model.py", "model.py"),
-        ("src/agent.py", "agent.py")
+        ("src/agent.py", "agent.py"),
+        ("cg", "cg")
     ]
     
-    if os.path.exists("model.pth"):
+    # Prioritize using Epoch 5 weights (model5.pth) as the submission weights
+    if os.path.exists("out/model5.pth"):
+        files_to_include.append(("out/model5.pth", "model.pth"))
+        print("Packaging out/model5.pth as model.pth in submission archive...")
+    elif os.path.exists("model.pth"):
         files_to_include.append(("model.pth", "model.pth"))
+        print("Packaging root model.pth in submission archive...")
     else:
-        print("Warning: model.pth not found. The submission will not include trained model weights.")
+        print("Warning: No model weights found. The submission will not include trained model weights.")
 
     output_filename = "submission.tar.gz"
     

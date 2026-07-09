@@ -233,7 +233,10 @@ def agent(obs_dict: dict) -> list[int]:
     
     # Load deck list
     if _deck is None:
-        base_path = os.path.dirname(os.path.abspath(__file__))
+        if "__file__" in globals():
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        else:
+            base_path = os.getcwd()
         deck_path = os.path.join(base_path, "deck.csv")
         try:
             with open(deck_path, "r") as f:
@@ -242,10 +245,17 @@ def agent(obs_dict: dict) -> list[int]:
             # Default sample deck
             _deck = [721,721,722,722,722,722,723,723,723,723,1092,1121,1121,1145,1145,1163,1163,1219,1219,1219,1219,1227,1227,1227,1227,1262,1262,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3]
 
+    # Check if this is the initial deck-registration step (obs.select is None)
+    if obs_dict.get("select") is None:
+        return _deck
+
     # Load model weights
     if _model is None:
         _model = MyModel(128, 2, 256, 1, 1)
-        base_path = os.path.dirname(os.path.abspath(__file__))
+        if "__file__" in globals():
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        else:
+            base_path = os.getcwd()
         model_path = os.path.join(base_path, "model.pth")
         
         # Load weights if available
