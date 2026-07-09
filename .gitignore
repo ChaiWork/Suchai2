@@ -1,2 +1,16 @@
 *.pdf
 *.csv
+
+# Ignore generated images and metrics plots
+*.png
+
+# Ignore packaged submission tarballs
+*.gz
+
+# Ignore local checkpoints and models
+*.pth
+out/
+
+# Ignore Python bytecode and runtime caches
+__pycache__/
+.ipynb_checkpoints/

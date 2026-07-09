@@ -7,6 +7,11 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
 
+# Add nested src/ folder to path for local execution compatibility
+src_dir = os.path.join(current_dir, "src")
+if os.path.exists(src_dir) and src_dir not in sys.path:
+    sys.path.append(src_dir)
+
 kaggle_path = '/kaggle_simulations/agent'
 if os.path.exists(kaggle_path) and kaggle_path not in sys.path:
     sys.path.append(kaggle_path)

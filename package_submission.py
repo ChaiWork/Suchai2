@@ -2,16 +2,16 @@ import os
 import tarfile
 
 def main():
-    # List of files to package in the root of the submission bundle
+    # Mapping of local file path to path in the root of the archive
     files_to_include = [
-        "main.py",
-        "deck.csv",
-        "model.py",
-        "agent.py"
+        ("main.py", "main.py"),
+        ("deck.csv", "deck.csv"),
+        ("src/model.py", "model.py"),
+        ("src/agent.py", "agent.py")
     ]
     
     if os.path.exists("model.pth"):
-        files_to_include.append("model.pth")
+        files_to_include.append(("model.pth", "model.pth"))
     else:
         print("Warning: model.pth not found. The submission will not include trained model weights.")
 
@@ -19,13 +19,13 @@ def main():
     
     print(f"Creating {output_filename}...")
     with tarfile.open(output_filename, "w:gz") as tar:
-        for file in files_to_include:
-            if os.path.exists(file):
-                print(f"  Adding {file}")
+        for local_path, arc_name in files_to_include:
+            if os.path.exists(local_path):
+                print(f"  Adding {local_path} -> {arc_name}")
                 # Add to tar archive at the root directory level (not nested)
-                tar.add(file, arcname=os.path.basename(file))
+                tar.add(local_path, arcname=arc_name)
             else:
-                print(f"  Error: Required file '{file}' does not exist!")
+                print(f"  Error: Required file '{local_path}' does not exist!")
                 return
                 
     # Verify the final archive size against constraints (197.7 MiB)
