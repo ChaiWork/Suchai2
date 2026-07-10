@@ -422,7 +422,8 @@ def main():
                             "energy": count_attached_energy(state_ps),
                             "pokemon": count_pokemon(state_ps),
                             "opp_pokemon": count_pokemon(opp_ps),
-                            "bench_size": len([p for p in state_ps.bench if p is not None])
+                            "bench_size": len([p for p in state_ps.bench if p is not None]),
+                            "deck_size": state_ps.deckCount
                         }
 
                         # Retrieve action and sample
@@ -479,7 +480,8 @@ def main():
                                         "energy": count_attached_energy(final_ps),
                                         "pokemon": count_pokemon(final_ps),
                                         "opp_pokemon": count_pokemon(final_opp_ps),
-                                        "bench_size": len([p for p in final_ps.bench if p is not None])
+                                        "bench_size": len([p for p in final_ps.bench if p is not None]),
+                                        "deck_size": final_ps.deckCount
                                     }
                                 
                                 # Compute differences
@@ -508,6 +510,12 @@ def main():
                                 # Reward for benching a Pokémon when bench was dangerously low
                                 if pre["bench_size"] <= 1 and (post["bench_size"] > pre["bench_size"]):
                                     step_reward += 5.0
+                                
+                                # Deck out penalty (apply penalty if deck size is critically low)
+                                if post["deck_size"] <= 3:
+                                    step_reward -= 5.0  # Critical danger
+                                elif post["deck_size"] <= 5:
+                                    step_reward -= 2.0  # Impending danger
                                 
                                 rewards.append(step_reward)
                             
