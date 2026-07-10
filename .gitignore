@@ -6,6 +6,8 @@
 
 # Ignore packaged submission tarballs
 *.gz
+*.tar.gz
+
 
 # Ignore local checkpoints and models
 *.pth

@@ -28,7 +28,7 @@ from cg.api import (
     search_end,
 )
 
-SEARCH_COUNT = 10  # MCTS Search count
+SEARCH_COUNT = 15  # MCTS Search count
 
 
 class LearnSample:
@@ -270,7 +270,17 @@ def agent(obs_dict: dict) -> list[int]:
         _model = _model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         _model.eval()
 
+    # Determine adaptive search count budget based on current turn
+    obs = to_observation_class(obs_dict)
+    turn = obs.current.turn if (obs.current is not None) else 0
+    if turn <= 3:
+        search_count = 150
+    elif turn <= 8:
+        search_count = 100
+    else:
+        search_count = 50
+
     with torch.inference_mode():
-        action, _ = mcts_agent(obs_dict, _deck, _model)
+        action, _ = mcts_agent(obs_dict, _deck, _model, search_count=search_count)
         
     return action

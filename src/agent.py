@@ -28,7 +28,7 @@ from cg.api import (
     search_end,
 )
 
-SEARCH_COUNT = 10  # MCTS Search count
+SEARCH_COUNT = 15  # MCTS Search count
 
 
 class LearnSample:
@@ -135,6 +135,85 @@ def create_node(parent: Node | None,
 
     return (node, sample)
 
+# --- Opponent Deck Database & Belief State Identification ---
+OPPONENT_DECKS = {
+    'BasicallyBot_85134910': [788, 788, 788, 788, 789, 789, 789, 789, 928, 928, 928, 928, 855, 855, 855, 855, 1079, 1079, 1079, 1079, 1121, 1121, 1121, 1121, 1232, 1232, 1232, 1232, 1225, 1225, 1225, 1231, 1231, 1231, 17, 17, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+    'Cada_85134382': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 121, 140, 184, 235, 1120, 1071, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1097, 131, 131, 132, 133, 1121, 1121, 1121, 1120, 1120, 1152, 1152, 1152, 1182, 1182, 1182, 1198, 1198, 1198, 1198, 1210, 1210, 1227, 1227, 1227, 1227, 1256, 1256, 2, 2, 2, 2, 5, 5, 5, 5],
+    'Cotini_85137077': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 131, 131, 132, 132, 133, 235, 140, 1071, 112, 1227, 1227, 1227, 1227, 1198, 1198, 1198, 1182, 1182, 1231, 1121, 1121, 1121, 1121, 1152, 1152, 1152, 1152, 1086, 1086, 1086, 1086, 1120, 1120, 1120, 1120, 1097, 1097, 1080, 1256, 1256, 1161, 343, 2, 2, 2, 5, 5, 5, 7, 7],
+    'DarkLayer_85136498': [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 57, 169, 169, 169, 169, 190, 190, 190, 190, 666, 666, 666, 666, 1097, 1097, 1097, 1121, 1121, 1121, 1121, 1122, 1122, 1122, 1122, 1147, 1147, 1147, 1147, 1152, 1152, 1152, 1152, 1159, 1182, 1182, 1182, 1185, 1185, 1185, 1185, 1213, 1227, 1227, 1227, 1227, 1244, 1244, 1244, 1244],
+    'DRAGOPULT': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 121, 131, 131, 132, 133, 112, 140, 184, 1086, 1086, 1086, 1086, 1121, 1121, 1121, 1121, 1079, 1079, 1097, 1097, 1182, 1182, 1182, 1227, 1227, 1227, 1198, 1198, 1201, 1240, 1231, 1152, 1152, 1152, 1152, 1080, 1246, 1246, 5, 5, 5, 5, 2, 2, 2, 7, 1079, 1123, 1119, 1122],
+    'ek': [1158, 721, 721, 722, 722, 722, 722, 723, 723, 723, 723, 1145, 1145, 1145, 1145, 1205, 1205, 1227, 1227, 1227, 1227, 1235, 1235, 1235, 1235, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+    'Gholdengo Lunatone': [186, 186, 186, 186, 191, 676, 676, 675, 675, 311, 547, 140, 695, 1182, 1182, 1182, 1184, 1142, 1142, 1142, 1086, 1088, 1174, 1174, 6, 6, 6, 6, 6, 6, 6, 6, 8, 8, 8, 8, 700, 700, 700, 1213, 1213, 1213, 1213, 1123, 1123, 1118, 1118, 1118, 1118, 1121, 1121, 1121, 1121, 1119, 1119, 1097, 1171, 1177, 1086, 1086],
+    'Hermes Lu': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 121, 140, 184, 235, 235, 1071, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1097, 1120, 1120, 1120, 1120, 1121, 1121, 1121, 1121, 1152, 1152, 1152, 1156, 1182, 1182, 1182, 1198, 1198, 1198, 1198, 1210, 1210, 1227, 1227, 1227, 1227, 1256, 1256, 2, 2, 2, 2, 5, 5, 5, 5],
+    'itofuki': [65, 65, 65, 66, 66, 66, 878, 878, 878, 878, 879, 879, 879, 879, 304, 304, 1227, 1227, 1227, 1227, 1182, 1182, 1182, 1213, 1213, 1086, 1086, 1086, 1086, 1152, 1152, 1152, 1152, 1097, 1097, 1097, 1097, 1080, 1123, 1123, 1115, 1115, 1122, 1122, 1171, 1171, 1171, 1171, 1255, 1255, 1255, 1255, 19, 19, 19, 19, 11, 11, 11, 11],
+    'JBMetrix': [1030, 1030, 1030, 1030, 1031, 1031, 1031, 1031, 726, 726, 727, 727, 728, 478, 1086, 1086, 1086, 1086, 1145, 1145, 1145, 1145, 1227, 1227, 1227, 1227, 1182, 1182, 1205, 1205, 1122, 1122, 1122, 1122, 1097, 1097, 1123, 1123, 1235, 1235, 1213, 1158, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+    'Penguin': [756, 756, 756, 756, 344, 344, 344, 345, 345, 345, 1227, 1227, 1227, 1227, 1182, 1182, 1182, 1182, 1219, 1219, 1219, 1219, 1225, 1225, 1225, 1186, 1186, 1197, 1204, 1147, 1147, 1147, 1147, 1122, 1122, 1122, 1086, 1086, 1121, 1123, 1087, 1159, 1161, 1257, 1242, 1123, 14, 14, 14, 14, 18, 18, 18, 18, 11, 11, 11, 11, 1, 1086],
+    'Raging Bolt Ogerpon': [172, 172, 172, 173, 173, 173, 63, 63, 96, 96, 174, 174, 171, 184, 140, 176, 75, 209, 1182, 1198, 1201, 1213, 1121, 1121, 1121, 1121, 1097, 1097, 1097, 1097, 1098, 1088, 1250, 1250, 1250, 1, 1, 1, 1, 1, 6, 6, 6, 4, 4, 4, 478, 171, 1198, 1198, 1198, 1132, 1132, 1132, 1132, 1119, 1119, 1119, 1124, 1152],
+    'Ryan Talcoff': [149, 149, 149, 149, 93, 93, 150, 150, 150, 96, 96, 96, 920, 920, 920, 1079, 1079, 1079, 1079, 1086, 1086, 1086, 1086, 1121, 1121, 1121, 1121, 1152, 1152, 1227, 1227, 1227, 1227, 1192, 1192, 1182, 1182, 1182, 1123, 1123, 1116, 1116, 1097, 1097, 1175, 1175, 1158, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    'Saikattyo_85136004': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 11, 11, 11, 11, 14, 14, 14, 14, 18, 18, 18, 18, 344, 344, 344, 344, 345, 345, 345, 345, 1086, 1086, 1086, 1086, 1147, 1147, 1147, 1147, 1159, 1212, 1212, 1212, 1212, 1227, 1227, 1227, 1227, 1235, 1235, 1235, 1235],
+    'Terapagos Noctowl': [176, 176, 176, 172, 172, 172, 173, 173, 173, 175, 175, 65, 65, 66, 66, 140, 1086, 1086, 1086, 1086, 1121, 1121, 1121, 1121, 1097, 1097, 1097, 1152, 1152, 1152, 1152, 1082, 1182, 1182, 1182, 1227, 1227, 1227, 1227, 1250, 1250, 1250, 1246, 1246, 1123, 1123, 1123, 1123, 1122, 1122, 1, 1, 1, 3, 3, 3, 4, 4, 4, 4],
+}
+
+
+def get_opponent_revealed_card_ids(obs, opponent_index: int) -> list[int]:
+    """Scans visible zones (active, bench, discard) to find cards played by the opponent."""
+    revealed = []
+    ps = obs.current.players[opponent_index]
+    
+    # Active Pokémon + attached cards (energies, tools)
+    for poke in ps.active:
+        if poke is not None:
+            revealed.append(poke.id)
+            if poke.tools:
+                revealed.extend(t.id for t in poke.tools if t)
+            if poke.energyCards:
+                revealed.extend(e.id for e in poke.energyCards if e)
+                
+    # Bench Pokémon + attached cards
+    for poke in ps.bench:
+        if poke is not None:
+            revealed.append(poke.id)
+            if poke.tools:
+                revealed.extend(t.id for t in poke.tools if t)
+            if poke.energyCards:
+                revealed.extend(e.id for e in poke.energyCards if e)
+                
+    # Discard pile
+    for card in ps.discard:
+        if card is not None:
+            revealed.append(card.id)
+            
+    return revealed
+
+
+def identify_opponent_deck(revealed_ids: list[int], opponent_decks: dict) -> list[int]:
+    """Identifies the opponent's deck template using multiset intersection match."""
+    if not revealed_ids:
+        # Default to BasicallyBot if no cards have been revealed yet
+        return opponent_decks.get("BasicallyBot_85134910")
+        
+    best_name = None
+    best_matches = -1
+    
+    for name, deck in opponent_decks.items():
+        # Count frequency of each card ID in the deck
+        deck_counts = {}
+        for cid in deck:
+            deck_counts[cid] = deck_counts.get(cid, 0) + 1
+            
+        # Count matches based on multiset intersection
+        matches = 0
+        for cid in revealed_ids:
+            if deck_counts.get(cid, 0) > 0:
+                matches += 1
+                deck_counts[cid] -= 1
+                
+        if matches > best_matches:
+            best_matches = matches
+            best_name = name
+            
+    return opponent_decks[best_name]
+
 
 def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_count: int = SEARCH_COUNT) -> tuple[list[int], LearnSample]:
     """Perform MCTS exploration and select the best action list, returning it and a training sample."""
@@ -143,15 +222,41 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     state = obs.current
     active = state.players[1 - your_index].active
     
-    # Construct belief states of hidden information for planning
+    # Dynamically match opponent deck based on revealed cards
+    opp_index = 1 - your_index
+    revealed_ids = get_opponent_revealed_card_ids(obs, opp_index)
+    matched_deck = identify_opponent_deck(revealed_ids, OPPONENT_DECKS)
+    
+    # Remove revealed cards from the matched deck list to find hidden cards
+    remaining_cards = matched_deck.copy()
+    for cid in revealed_ids:
+        if cid in remaining_cards:
+            remaining_cards.remove(cid)
+            
+    # Shuffle and sample to construct MCTS opponent beliefs
+    random.shuffle(remaining_cards)
+    
+    deck_count = state.players[opp_index].deckCount
+    prize_count = len(state.players[opp_index].prize)
+    hand_count = state.players[opp_index].handCount
+    
+    total_needed = deck_count + prize_count + hand_count
+    if len(remaining_cards) < total_needed:
+        # Fallback padding with Basic Water Energy (3) if deck mismatch occurs
+        remaining_cards.extend([3] * (total_needed - len(remaining_cards)))
+        
+    opp_deck_sampled = remaining_cards[:deck_count]
+    opp_prize_sampled = remaining_cards[deck_count:deck_count + prize_count]
+    opp_hand_sampled = remaining_cards[deck_count + prize_count:deck_count + prize_count + hand_count]
+    
     search_state = search_begin(
         obs,
         your_deck=random.sample(your_deck, state.players[your_index].deckCount),
         your_prize=random.sample(your_deck, len(state.players[your_index].prize)),
-        opponent_deck=[1072] * state.players[1 - your_index].deckCount,          # Snorlax card ID
-        opponent_prize=[1] * len(state.players[1 - your_index].prize),           # Basic Energy
-        opponent_hand=[1] * state.players[1 - your_index].handCount,             # Basic Energy
-        opponent_active=[1072] if len(active) > 0 and active[0] is None else []   # Snorlax if facedown
+        opponent_deck=opp_deck_sampled,
+        opponent_prize=opp_prize_sampled,
+        opponent_hand=opp_hand_sampled,
+        opponent_active=[1072] if len(active) > 0 and active[0] is None else []
     )
     
     root, sample = create_node(None, search_state, your_index, your_deck, model)
@@ -270,7 +375,17 @@ def agent(obs_dict: dict) -> list[int]:
         _model = _model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         _model.eval()
 
+    # Determine adaptive search count budget based on current turn
+    obs = to_observation_class(obs_dict)
+    turn = obs.current.turn if (obs.current is not None) else 0
+    if turn <= 3:
+        search_count = 150
+    elif turn <= 8:
+        search_count = 100
+    else:
+        search_count = 50
+
     with torch.inference_mode():
-        action, _ = mcts_agent(obs_dict, _deck, _model)
+        action, _ = mcts_agent(obs_dict, _deck, _model, search_count=search_count)
         
     return action
