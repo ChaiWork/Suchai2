@@ -11,13 +11,16 @@ def main():
         ("cg", "cg")
     ]
     
-    # Prioritize using Epoch 5 weights (model5.pth) as the submission weights
-    if os.path.exists("out/model5.pth"):
-        files_to_include.append(("out/model5.pth", "model.pth"))
-        print("Packaging out/model5.pth as model.pth in submission archive...")
+    # Prioritize best_model.pth (highest evaluation win rate) over final model.pth
+    if os.path.exists("best_model.pth"):
+        files_to_include.append(("best_model.pth", "model.pth"))
+        print("Packaging best_model.pth in submission archive...")
     elif os.path.exists("model.pth"):
         files_to_include.append(("model.pth", "model.pth"))
         print("Packaging root model.pth in submission archive...")
+    elif os.path.exists("out/model5.pth"):
+        files_to_include.append(("out/model5.pth", "model.pth"))
+        print("Packaging out/model5.pth as model.pth in submission archive...")
     else:
         print("Warning: No model weights found. The submission will not include trained model weights.")
 

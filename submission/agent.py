@@ -251,7 +251,7 @@ def agent(obs_dict: dict) -> list[int]:
 
     # Load model weights
     if _model is None:
-        _model = MyModel(128, 2, 256, 1, 1)
+        _model = MyModel(256, 4, 512, 2, 2)
         if "__file__" in globals():
             base_path = os.path.dirname(os.path.abspath(__file__))
         else:
@@ -261,7 +261,11 @@ def agent(obs_dict: dict) -> list[int]:
         # Load weights if available
         if os.path.exists(model_path):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            _model.load_state_dict(torch.load(model_path, map_location=device))
+            checkpoint = torch.load(model_path, map_location=device)
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                _model.load_state_dict(checkpoint["state_dict"])
+            else:
+                _model.load_state_dict(checkpoint)
         
         _model = _model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         _model.eval()

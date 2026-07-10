@@ -61,6 +61,35 @@ def plot_metrics(csv_path="out/training_metrics.csv", output_dir="out"):
     plt.savefig(os.path.join(output_dir, "reward_curve.png"), dpi=150)
     plt.close()
 
+    # 4. Plot Combined Learning Curves Dashboard
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # Subplot 1: Win Rate
+    axs[0].plot(epochs, win_rates, marker="o", color="#2ca02c", linewidth=2.0)
+    axs[0].set_title("Win Rate Curve (vs Test Decks)", fontsize=12, fontweight="bold")
+    axs[0].set_xlabel("Epoch", fontsize=10)
+    axs[0].set_ylabel("Win Rate (%)", fontsize=10)
+    axs[0].set_ylim(-5, 105)
+    axs[0].grid(True, linestyle="--", alpha=0.6)
+    
+    # Subplot 2: Loss
+    axs[1].plot(epochs, losses, marker="s", color="#d62728", linewidth=2.0)
+    axs[1].set_title("Model Training Loss", fontsize=12, fontweight="bold")
+    axs[1].set_xlabel("Epoch", fontsize=10)
+    axs[1].set_ylabel("Loss", fontsize=10)
+    axs[1].grid(True, linestyle="--", alpha=0.6)
+    
+    # Subplot 3: Reward
+    axs[2].plot(epochs, rewards, marker="d", color="#1f77b4", linewidth=2.0)
+    axs[2].set_title("Episode Reward (Average Root Value)", fontsize=12, fontweight="bold")
+    axs[2].set_xlabel("Epoch", fontsize=10)
+    axs[2].set_ylabel("Reward", fontsize=10)
+    axs[2].grid(True, linestyle="--", alpha=0.6)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "learning_curves.png"), dpi=150)
+    plt.close()
+
     print(f"Generated plots successfully in '{output_dir}/'")
 
 if __name__ == "__main__":
