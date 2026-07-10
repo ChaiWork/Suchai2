@@ -45,8 +45,9 @@ class DecoderLayer(torch.nn.Module):
     """Decoder Layer of the Transformer Model."""
     def __init__(self, d_model: int, num_heads: int, d_feedforward: int):
         super(DecoderLayer, self).__init__()
-        self.attention = torch.nn.MultiheadAttention(d_model, num_heads)
+        self.attention = torch.nn.MultiheadAttention(d_model, num_heads, dropout=0.1)
         self.fc1 = torch.nn.Linear(d_model, d_feedforward)
+        self.dropout = torch.nn.Dropout(0.1)
         self.fc2 = torch.nn.Linear(d_feedforward, d_model)
         self.norm1 = torch.nn.LayerNorm(d_model)
         self.norm2 = torch.nn.LayerNorm(d_model)
@@ -55,7 +56,8 @@ class DecoderLayer(torch.nn.Module):
         y, _ = self.attention(x, encoder_out, encoder_out, need_weights=False)
         res = self.norm1(x + y)
         y = self.fc1(res)
-        y = torch.nn.functional.relu(y)
+        y = torch.nn.functional.gelu(y)  # GELU is smoother than ReLU, better for transformers
+        y = self.dropout(y)
         y = self.fc2(y)
         return self.norm2(res + y)
 
@@ -73,7 +75,7 @@ class MyModel(torch.nn.Module):
         self.d_model = d_model
 
         self.encoder_bag = torch.nn.EmbeddingBag(encoder_size, d_model, mode="sum")
-        encoder_layer = torch.nn.TransformerEncoderLayer(d_model, num_heads, d_feedforward, 0)
+        encoder_layer = torch.nn.TransformerEncoderLayer(d_model, num_heads, d_feedforward, dropout=0.1)
         self.encoder = torch.nn.TransformerEncoder(encoder_layer, num_layers_encoder, enable_nested_tensor=False)
         self.encoder_fc = torch.nn.Linear(d_model, 1)
         
@@ -104,7 +106,7 @@ class MyModel(torch.nn.Module):
             p = layer(p, encoder_out)
         p = self.decoder_fc(p)
         p = p.transpose(0, 1).view(batch_size, -1)
-        p = torch.tanh(p)
+        # Policy outputs raw logits — softmax applied in cross-entropy loss or at inference
         return (v, p)
 
 

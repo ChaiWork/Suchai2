@@ -11,12 +11,12 @@ RL Strategy: Pokémon TCG AI Agent
 Primary Objective: Maximize long-term win rate against diverse deck archetypes.
 
 Decision Priorities (encoded in reward shaping):
-  1. Win the game           — terminal reward ±100
-  2. Take prizes efficiently — r_prize_taken * 12.0 (key win condition)
-  3. Prevent opponent setup — r_prize_lost * 8.0 (opponent taking prizes)
-  4. Attach energy first    — r_energy * 1.5 + r_no_energy penalty (-1.0/step)
-  5. Maintain attackers     — bench reward (+5.0 recovery, -1.0 danger)
-  6. Play efficiently       — r_stall -0.15/turn (anti-stall pressure)
+  1. Win the game           — terminal reward ±1.0
+  2. Take prizes efficiently — r_prize_taken * 0.20 (key win condition)
+  3. Prevent opponent setup — r_prize_lost * 0.15 (opponent taking prizes)
+  4. Attach energy first    — r_energy * 0.03 (prerequisite to attacking)
+  5. Maintain attackers     — bench reward (+0.10 recovery, -0.02 danger)
+  6. Play efficiently       — r_stall -0.005/step (anti-stall pressure)
 
 Tactical Action Sequence (optimal turn order):
   Abilities → Items/Search → Energy Attachment → Supporter → Attack
@@ -48,7 +48,7 @@ from cg.api import (
     search_end,
 )
 
-SEARCH_COUNT = 15  # MCTS Search count
+SEARCH_COUNT = 50  # MCTS Search count — need ≥50 for meaningful visit differentiation
 
 
 class LearnSample:
@@ -143,10 +143,11 @@ def create_node(parent: Node | None,
         node.value = v
         node.backprop(v)
 
-        # Compute probabilities using softmax-like temperature scaling
+        # Convert raw logits to probabilities via numerically stable softmax
+        max_logit = max(policy)
         prob_sum = 0.0
         for i in range(len(policy)):
-            p = math.exp(policy[i] * 10.0)
+            p = math.exp(policy[i] - max_logit)  # Numerically stable softmax
             node.children.append(Child(actions[i], p))
             prob_sum += p
         for c in node.children:
@@ -281,6 +282,18 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     
     root, sample = create_node(None, search_state, your_index, your_deck, model)
 
+    # Add Dirichlet noise to root prior for exploration (AlphaZero-style)
+    # Without noise, MCTS always explores the same paths from the NN prior,
+    # causing mode collapse (the agent repeatedly selects "end turn").
+    if len(root.children) > 0:
+        dir_alpha = 0.3  # TCG has moderate action space
+        noise_frac = 0.25
+        noise = [random.gammavariate(dir_alpha, 1.0) for _ in root.children]
+        noise_sum = sum(noise) + 1e-8
+        noise = [n / noise_sum for n in noise]
+        for i, child in enumerate(root.children):
+            child.prob = (1.0 - noise_frac) * child.prob + noise_frac * noise[i]
+
     # Search loop
     for _ in range(search_count):
         current = root
@@ -326,16 +339,27 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
             if min_value > v:
                 min_value = v
 
-    # Generate targets/labels for training policy
+    # Generate targets/labels for training
+    # Value target: root mean value
     sample.value = root.total / root.visit
-    for i in range(len(root.children)):
-        child = root.children[i]
-        v = sample.value
-        if child.node is None:
-            v = min_value - v - 0.03
-        else:
-            v = child.node.total / child.node.visit - v
-        sample.policy[i] = max(-1.0, min(1.0, v))
+
+    # Policy target: visit count distribution (AlphaZero-style)
+    # Visit counts are more robust than Q-value differences with limited simulations.
+    total_child_visits = sum(
+        child.node.visit for child in root.children if child.node is not None
+    )
+    if total_child_visits > 0:
+        for i in range(len(root.children)):
+            child = root.children[i]
+            if child.node is not None:
+                sample.policy[i] = child.node.visit / total_child_visits
+            else:
+                sample.policy[i] = 0.0
+    else:
+        # Fallback: uniform if no visits
+        n = len(root.children)
+        for i in range(n):
+            sample.policy[i] = 1.0 / n
 
     search_end()
     return (max_child.select, sample)
