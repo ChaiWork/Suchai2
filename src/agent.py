@@ -5,6 +5,26 @@ import random
 import sys
 import torch
 
+"""
+RL Strategy: Pokémon TCG AI Agent
+==================================
+Primary Objective: Maximize long-term win rate against diverse deck archetypes.
+
+Decision Priorities (encoded in reward shaping):
+  1. Win the game           — terminal reward ±100
+  2. Take prizes efficiently — r_prize_taken * 12.0 (key win condition)
+  3. Prevent opponent setup — r_prize_lost * 8.0 (opponent taking prizes)
+  4. Attach energy first    — r_energy * 1.5 + r_no_energy penalty (-1.0/step)
+  5. Maintain attackers     — bench reward (+5.0 recovery, -1.0 danger)
+  6. Play efficiently       — r_stall -0.15/turn (anti-stall pressure)
+
+Tactical Action Sequence (optimal turn order):
+  Abilities → Items/Search → Energy Attachment → Supporter → Attack
+
+Key Principle: Every action must increase P(win), not just deal damage.
+"""
+
+
 from model import (
     MyModel,
     SparseVector,

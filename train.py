@@ -221,7 +221,7 @@ def main():
         writer = csv.writer(f)
         writer.writerow(["epoch", "win_rate", "avg_loss", "avg_reward",
                          "r_prize_taken", "r_prize_lost", "r_kos", "r_own_kos",
-                         "r_energy", "r_bench", "r_deckout", "r_terminal", "r_stall",
+                         "r_energy", "r_bench", "r_deckout", "r_terminal", "r_stall", "r_no_energy",
                          "avg_game_length"])
 
     deck_matchup_path = os.path.join(run_dir, "deck_matchup.csv")
@@ -269,7 +269,8 @@ def main():
         
         # Per-epoch reward component accumulators
         rc = {"prize_taken": 0.0, "prize_lost": 0.0, "kos": 0.0, "own_kos": 0.0,
-              "energy": 0.0, "bench": 0.0, "deckout": 0.0, "terminal": 0.0, "stall": 0.0}
+              "energy": 0.0, "bench": 0.0, "deckout": 0.0, "terminal": 0.0, "stall": 0.0,
+              "no_energy": 0.0}
         rc_count = 0  # Number of steps accumulated
         total_game_length = 0
         total_games = 0
@@ -464,7 +465,8 @@ def main():
                             "pokemon": count_pokemon(state_ps),
                             "opp_pokemon": count_pokemon(opp_ps),
                             "bench_size": len([p for p in state_ps.bench if p is not None]),
-                            "deck_size": state_ps.deckCount
+                            "deck_size": state_ps.deckCount,
+                            "energy_attached_flag": obs_class.current.energyAttached  # True if energy was attached this turn
                         }
 
                         # Retrieve action and sample
@@ -549,7 +551,8 @@ def main():
                                         "pokemon": count_pokemon(final_ps),
                                         "opp_pokemon": count_pokemon(final_opp_ps),
                                         "bench_size": len([p for p in final_ps.bench if p is not None]),
-                                        "deck_size": final_ps.deckCount
+                                        "deck_size": final_ps.deckCount,
+                                        "energy_attached_flag": True  # Game over — no penalty on final step
                                     }
                                 
                                 # Compute differences
@@ -567,6 +570,7 @@ def main():
                                 r_ko = 0.0
                                 r_own_ko = 0.0
                                 r_en = 0.0
+                                r_no_energy = 0.0  # Penalty for skipping energy attachment
                                 r_bench = 0.0
                                 r_deck = 0.0
                                 
@@ -579,9 +583,15 @@ def main():
                                 if own_kos > 0:
                                     r_own_ko = own_kos * 5.0
                                 if energy_attached > 0:
-                                    r_en = energy_attached * 0.2
+                                    r_en = energy_attached * 1.5  # Boosted: energy is prerequisite to attacking
                                 elif energy_attached < 0:
                                     r_en = energy_attached * 1.0  # negative addition
+                                
+                                # Penalty for ending a turn without attaching energy.
+                                # energyAttached flag goes True only once energy is attached this turn.
+                                # If still False after this step, apply pressure to attach.
+                                if not pre["energy_attached_flag"] and not post.get("energy_attached_flag", True):
+                                    r_no_energy = -1.0
                                 
                                 # Bench cushion penalty (apply penalty if bench is dangerously low: 0 or 1 Pokémon)
                                 # Softened from -2.0 to -1.0 to stop it dominating all other reward signals
@@ -598,7 +608,7 @@ def main():
                                 elif post["deck_size"] <= 5:
                                     r_deck -= 2.0  # Impending danger
                                 
-                                step_reward = r_stall + r_prize_t - r_prize_l + r_ko - r_own_ko + r_en + r_bench + r_deck
+                                step_reward = r_stall + r_prize_t - r_prize_l + r_ko - r_own_ko + r_en + r_no_energy + r_bench + r_deck
                                 
                                 # Accumulate reward components (Player 0 only)
                                 if i == 0:
@@ -610,6 +620,7 @@ def main():
                                     rc["bench"] += r_bench
                                     rc["deckout"] += r_deck
                                     rc["stall"] += r_stall
+                                    rc["no_energy"] += r_no_energy
                                     rc_count += 1
                                 
                                 rewards.append(step_reward)
@@ -730,7 +741,7 @@ def main():
                              rc["kos"] / rc_div, rc["own_kos"] / rc_div,
                              rc["energy"] / rc_div, rc["bench"] / rc_div,
                              rc["deckout"] / rc_div, rc["terminal"] / max(1, total_games),
-                             rc["stall"] / rc_div, avg_gl])
+                             rc["stall"] / rc_div, rc["no_energy"] / rc_div, avg_gl])
         
         # Log deck matchup stats
         with open(deck_matchup_path, mode="a", newline="", encoding="utf-8-sig") as f:
