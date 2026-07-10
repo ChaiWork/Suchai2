@@ -30,7 +30,9 @@ all_card = all_card_data()
 card_table = {c.cardId: c for c in all_card}
 card_count = max(all_card, key=lambda c: c.cardId).cardId + 1
 
-attack_count = max(all_attack(), key=lambda a: a.attackId).attackId + 1
+all_attack_list = all_attack()
+attack_table = {a.attackId: a for a in all_attack_list}
+attack_count = max(all_attack_list, key=lambda a: a.attackId).attackId + 1
 
 num_words_encoder = 24
 encoder_size = 22000
@@ -39,6 +41,118 @@ decoder_main_feature = 8
 decoder_attack_offset = 14
 decoder_card_offset = decoder_attack_offset + attack_count
 decoder_size = decoder_card_offset + (1 + decoder_main_feature + SelectContext.RECOVER_SPECIAL_CONDITION) * card_count
+
+
+def extract_card_features(card: Card | None) -> list[float]:
+    features = [0.0] * 32
+    if card is None:
+        return features
+    
+    # 1. cardType (one-hot, 7 dims)
+    if hasattr(card, "cardType") and 0 <= card.cardType <= 6:
+        features[card.cardType] = 1.0
+        
+    # 2. energyType (one-hot, 11 dims)
+    if hasattr(card, "energyType") and 0 <= card.energyType <= 10:
+        features[7 + card.energyType] = 1.0
+        
+    # 3. HP (normalized, 1 dim)
+    hp = getattr(card, "hp", 0)
+    features[18] = min(1.0, hp / 400.0)
+    
+    # 4. Stage (one-hot, 3 dims)
+    if getattr(card, "basic", False):
+        features[19] = 1.0
+    if getattr(card, "stage1", False):
+        features[20] = 1.0
+    if getattr(card, "stage2", False):
+        features[21] = 1.0
+        
+    # 5. Subtype markers (4 dims)
+    if getattr(card, "ex", False):
+        features[22] = 1.0
+    if getattr(card, "megaEx", False):
+        features[23] = 1.0
+    if getattr(card, "tera", False):
+        features[24] = 1.0
+    if getattr(card, "aceSpec", False):
+        features[25] = 1.0
+        
+    # 6. Retreat Cost (normalized, 1 dim)
+    retreat = getattr(card, "retreatCost", 0)
+    features[26] = min(1.0, retreat / 4.0)
+    
+    # 7. Attacks & Abilities (5 dims)
+    attacks = getattr(card, "attacks", None)
+    if attacks:
+        features[27] = 1.0
+        features[28] = min(1.0, len(attacks) / 2.0)
+        max_dmg = 0
+        for aid in attacks:
+            att = attack_table.get(aid)
+            if att is not None:
+                max_dmg = max(max_dmg, getattr(att, "damage", 0))
+        features[29] = min(1.0, max_dmg / 300.0)
+        
+    skills = getattr(card, "skills", None)
+    if skills:
+        features[30] = 1.0
+        features[31] = min(1.0, len(skills) / 2.0)
+        
+    return features
+
+
+def get_encoder_card_map() -> torch.Tensor:
+    card_map = [-1] * encoder_size
+    pos = 0
+
+    def safe_assign(idx, val):
+        if 0 <= idx < encoder_size:
+            card_map[idx] = val
+
+    def add_pokemon_map(pos):
+        for cid in range(card_count):
+            safe_assign(pos + 2 + cid, cid)
+            safe_assign(pos + 2 + card_count + cid, cid)
+            safe_assign(pos + 2 + 2 * card_count + cid, cid)
+        return pos + 2 + 3 * card_count
+
+    for i in range(2):
+        pos = add_pokemon_map(pos)
+
+    for i in range(2):
+        pos = add_pokemon_map(pos)
+
+    for i in range(2):
+        for cid in range(card_count):
+            safe_assign(pos + 16 + cid, cid)
+        pos += 16 + card_count
+
+    for cid in range(card_count):
+        safe_assign(pos + cid, cid)
+    pos += card_count
+
+    for cid in range(card_count):
+        safe_assign(pos + cid, cid)
+    pos += card_count
+
+    for cid in range(card_count):
+        safe_assign(pos + cid, cid)
+    pos += card_count
+
+    pos += 3
+    return torch.tensor(card_map, dtype=torch.long)
+
+
+def get_decoder_card_map() -> torch.Tensor:
+    card_map = [-1] * decoder_size
+    num_contexts = 1 + decoder_main_feature + SelectContext.RECOVER_SPECIAL_CONDITION
+    for offset_factor in range(num_contexts):
+        base = decoder_card_offset + offset_factor * card_count
+        for cid in range(card_count):
+            if base + cid < decoder_size:
+                card_map[base + cid] = cid
+    return torch.tensor(card_map, dtype=torch.long)
 
 
 class DecoderLayer(torch.nn.Module):
@@ -85,6 +199,20 @@ class MyModel(torch.nn.Module):
             self.decoder.append(DecoderLayer(d_model, num_heads, d_feedforward))
         self.decoder_fc = torch.nn.Linear(d_model, 1)
 
+        # Precompute static card features buffer
+        features_list = []
+        for cid in range(card_count):
+            card = card_table.get(cid)
+            features_list.append(extract_card_features(card))
+        self.register_buffer("card_features", torch.tensor(features_list, dtype=torch.float32))
+
+        # Register card maps as buffers
+        self.register_buffer("encoder_card_map", get_encoder_card_map())
+        self.register_buffer("decoder_card_map", get_decoder_card_map())
+
+        # Feature projection layer
+        self.feature_projection = torch.nn.Linear(32, d_model)
+
     def forward(self,
                 index_encoder: torch.Tensor,
                 value_encoder: torch.Tensor,
@@ -93,14 +221,39 @@ class MyModel(torch.nn.Module):
                 value_decoder: torch.Tensor,
                 offset_decoder: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        v = self.encoder_bag(index_encoder, offset_encoder, value_encoder)
+        device = index_encoder.device
+
+        # Project card features
+        proj_features = self.feature_projection(self.card_features)  # (card_count, d_model)
+        # Pad with zero features at index card_count for -1 mapping
+        proj_features_padded = torch.cat([
+            proj_features,
+            torch.zeros(1, self.d_model, device=device)
+        ], dim=0)
+
+        # Map to vocabulary spaces
+        enc_feat = proj_features_padded[self.encoder_card_map]  # (encoder_size, d_model)
+        dec_feat = proj_features_padded[self.decoder_card_map]  # (decoder_size, d_model)
+
+        # Combine learnable embeddings and card features
+        enc_weight = self.encoder_bag.weight + enc_feat
+        dec_weight = self.decoder_bag.weight + dec_feat
+
+        # Use functional embedding_bag to pass the combined weights
+        v = torch.nn.functional.embedding_bag(
+            index_encoder, enc_weight, offset_encoder,
+            per_sample_weights=value_encoder, mode="sum"
+        )
         v = v.reshape(-1, num_words_encoder, self.d_model).transpose(0, 1)
         batch_size = v.size(1)
         encoder_out = self.encoder(v)
         v = self.encoder_fc(encoder_out)
         v = torch.tanh(v.mean(0))
 
-        p = self.decoder_bag(index_decoder, offset_decoder, value_decoder)
+        p = torch.nn.functional.embedding_bag(
+            index_decoder, dec_weight, offset_decoder,
+            per_sample_weights=value_decoder, mode="sum"
+        )
         p = p.reshape(batch_size, -1, self.d_model).transpose(0, 1)
         for layer in self.decoder:
             p = layer(p, encoder_out)
@@ -344,7 +497,10 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
     return sv
 
 
-def eval_nn(sv_enc: SparseVector, sv_dec: SparseVector, model: MyModel) -> tuple[float, list[float]]:
+def eval_nn(sv_enc: SparseVector, sv_dec: SparseVector, model) -> tuple[float, list[float]]:
+    if hasattr(model, "eval_nn"):
+        return model.eval_nn(sv_enc, sv_dec)
+        
     device = next(model.parameters()).device
     value, policy = model(
         torch.tensor(sv_enc.index, dtype=torch.int32, device=device),

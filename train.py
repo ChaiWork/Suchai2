@@ -9,6 +9,9 @@ import torch
 import torch.nn
 import torch.optim
 import time
+import queue
+import threading
+import multiprocessing as mp
 
 # Resolve cg-lib path dynamically for Kaggle vs Local environments
 try:
@@ -23,8 +26,7 @@ if os.path.exists(src_dir) and src_dir not in sys.path:
     sys.path.append(src_dir)
 
 from model import MyModel, SparseVector, LearnInput
-from agent import LearnSample, mcts_agent, random_agent
-from plot_metrics import plot_metrics
+from agent import LearnSample, mcts_agent, random_agent, GPUInferenceClient
 
 from cg.game import battle_start, battle_finish, battle_select
 from cg.api import to_observation_class, OptionType
@@ -166,12 +168,13 @@ _league_cache = {}  # {path: model}
 def get_league_model(path, device):
     """Load a league opponent model, caching recently used checkpoints."""
     if path not in _league_cache:
+        from model import MyModel
         m = MyModel(256, 4, 512, 2, 2).to(device)
         checkpoint = torch.load(path, map_location=device)
         if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-            m.load_state_dict(checkpoint["state_dict"])
+            m.load_state_dict(checkpoint["state_dict"], strict=False)
         else:
-            m.load_state_dict(checkpoint)
+            m.load_state_dict(checkpoint, strict=False)
         m.eval()
         # Keep cache small — only last 3 opponents
         if len(_league_cache) >= 3:
@@ -180,14 +183,456 @@ def get_league_model(path, device):
         _league_cache[path] = m
     return _league_cache[path]
 
+
+class GPUInferenceServer:
+    """Collects and batches NN evaluations from parallel game workers."""
+    def __init__(self, model, parent_conns, model_lock, batch_size=64, timeout=0.005):
+        self.model = model
+        self.parent_conns = parent_conns
+        self.model_lock = model_lock
+        self.batch_size = batch_size
+        self.timeout = timeout
+        self.running = True
+        self.thread = None
+
+    def start(self, device):
+        self.thread = threading.Thread(target=self._loop, args=(device,))
+        self.thread.daemon = True
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join()
+
+    def _loop(self, device):
+        while self.running:
+            ready_conns = mp.connection.wait(self.parent_conns, timeout=self.timeout)
+            if not ready_conns or not self.running:
+                continue
+
+            batch_conns = []
+            batch_sv_enc = []
+            batch_sv_dec = []
+
+            for conn in ready_conns:
+                if len(batch_conns) >= self.batch_size:
+                    break
+                try:
+                    if conn.poll():
+                        sv_enc, sv_dec = conn.recv()
+                        batch_conns.append(conn)
+                        batch_sv_enc.append(sv_enc)
+                        batch_sv_dec.append(sv_dec)
+                except (EOFError, OSError):
+                    pass
+
+            if not batch_conns:
+                continue
+
+            input_enc = LearnInput()
+            for sv in batch_sv_enc:
+                input_enc.add(sv)
+
+            orig_lens = []
+            input_dec = LearnInput()
+            for sv in batch_sv_dec:
+                orig_len = len(sv.offset)
+                orig_lens.append(orig_len)
+                if orig_len < 64:
+                    for _ in range(64 - orig_len):
+                        sv.offset.append(len(sv.index))
+                input_dec.add(sv)
+
+            with self.model_lock:
+                with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')), torch.inference_mode():
+                    out_enc, out_dec = self.model(
+                        torch.tensor(input_enc.index, dtype=torch.int32, device=device),
+                        torch.tensor(input_enc.value, dtype=torch.float32, device=device),
+                        torch.tensor(input_enc.offset, dtype=torch.int32, device=device),
+                        torch.tensor(input_dec.index, dtype=torch.int32, device=device),
+                        torch.tensor(input_dec.value, dtype=torch.float32, device=device),
+                        torch.tensor(input_dec.offset, dtype=torch.int32, device=device)
+                    )
+                    values = out_enc.squeeze(-1).tolist()
+                    policies = out_dec.tolist()
+
+            for idx, conn in enumerate(batch_conns):
+                val = values[idx]
+                pol = policies[idx][:orig_lens[idx]]
+                try:
+                    conn.send((val, pol))
+                except (OSError, IOError):
+                    pass
+
+
+def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_str):
+    """The game worker execution loop."""
+    random.seed(42 + worker_id)
+    torch.manual_seed(42 + worker_id)
+    device = torch.device(device_str)
+    
+    client = GPUInferenceClient(inference_conn)
+    
+    while True:
+        try:
+            cmd, args = command_queue.get()
+        except KeyboardInterrupt:
+            break
+            
+        if cmd == "STOP":
+            break
+            
+        elif cmd == "PLAY_SELF":
+            sample_deck, opponent_deck, opponent_type, opponent_path = args
+            
+            opp_model = None
+            if opponent_path is not None:
+                try:
+                    from model import MyModel
+                    opp_model = MyModel(256, 4, 512, 2, 2).to(device)
+                    checkpoint = torch.load(opponent_path, map_location=device)
+                    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                        opp_model.load_state_dict(checkpoint["state_dict"], strict=False)
+                    else:
+                        opp_model.load_state_dict(checkpoint, strict=False)
+                    opp_model.eval()
+                except Exception as e:
+                    opp_model = None
+            
+            try:
+                obs, start_data = battle_start(sample_deck, opponent_deck)
+                if start_data.errorPlayer >= 0:
+                    result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0)))
+                    continue
+            except Exception as e:
+                result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0)))
+                continue
+
+            samples = [[], []]
+            while True:
+                if obs["current"]["result"] >= 0:
+                    break
+
+                curr_player = obs["current"]["yourIndex"]
+                curr_deck = sample_deck if curr_player == 0 else opponent_deck
+                
+                obs_class = to_observation_class(obs)
+                state_ps = obs_class.current.players[curr_player]
+                opp_ps = obs_class.current.players[1 - curr_player]
+                
+                pre_metrics = {
+                    "prizes": len(state_ps.prize),
+                    "opp_prizes": len(opp_ps.prize),
+                    "energy": count_attached_energy(state_ps),
+                    "pokemon": count_pokemon(state_ps),
+                    "opp_pokemon": count_pokemon(opp_ps),
+                    "bench_size": len([p for p in state_ps.bench if p is not None]),
+                    "deck_size": state_ps.deckCount,
+                    "energy_attached_flag": obs_class.current.energyAttached
+                }
+
+                if curr_player == 0:
+                    selected, sample = mcts_agent(obs, curr_deck, client)
+                    sample.pred_val = sample.value
+                    samples[0].append((sample, pre_metrics))
+                else:
+                    if opponent_type == "Current":
+                        selected, sample = mcts_agent(obs, curr_deck, client)
+                        sample.pred_val = sample.value
+                        samples[1].append((sample, pre_metrics))
+                    elif opp_model is not None:
+                        selected, sample = mcts_agent(obs, curr_deck, opp_model)
+                    else:
+                        selected = random_agent(obs)
+                
+                obs = battle_select(selected)
+                
+            battle_finish()
+            
+            result = obs["current"]["result"]
+            obs_class = to_observation_class(obs)
+            final_turn = obs_class.current.turn if (obs_class is not None and obs_class.current is not None) else 0
+            
+            processed_samples = []
+            rc_worker = {"prize_taken": 0.0, "prize_lost": 0.0, "kos": 0.0, "own_kos": 0.0,
+                         "energy": 0.0, "bench": 0.0, "deckout": 0.0, "terminal": 0.0, "stall": 0.0,
+                         "no_energy": 0.0}
+            
+            for i in range(2):
+                player_samples = samples[i]
+                n_steps = len(player_samples)
+                if n_steps == 0:
+                    continue
+                    
+                if result == 2:
+                    terminal_reward = 0.0
+                elif i == result:
+                    terminal_reward = 1.0
+                else:
+                    terminal_reward = -1.0
+                    
+                rewards = []
+                for step_idx in range(n_steps):
+                    sample_obj, pre = player_samples[step_idx]
+                    
+                    if step_idx < n_steps - 1:
+                        _, post = player_samples[step_idx + 1]
+                    else:
+                        final_obs = to_observation_class(obs)
+                        final_ps = final_obs.current.players[i]
+                        final_opp_ps = final_obs.current.players[1 - i]
+                        post = {
+                            "prizes": len(final_ps.prize),
+                            "opp_prizes": len(final_opp_ps.prize),
+                            "energy": count_attached_energy(final_ps),
+                            "pokemon": count_pokemon(final_ps),
+                            "opp_pokemon": count_pokemon(final_opp_ps),
+                            "bench_size": len([p for p in final_ps.bench if p is not None]),
+                            "deck_size": final_ps.deckCount,
+                            "energy_attached_flag": True
+                        }
+                    
+                    prizes_taken = pre["prizes"] - post["prizes"]
+                    prizes_lost = pre["opp_prizes"] - post["opp_prizes"]
+                    opp_kos = pre["opp_pokemon"] - post["opp_pokemon"]
+                    own_kos = pre["pokemon"] - post["pokemon"]
+                    energy_attached = post["energy"] - pre["energy"]
+                    
+                    r_stall = -0.005
+                    r_prize_t = prizes_taken * 0.20 if prizes_taken > 0 else 0.0
+                    r_prize_l = prizes_lost * 0.15 if prizes_lost > 0 else 0.0
+                    r_ko = opp_kos * 0.10 if opp_kos > 0 else 0.0
+                    r_own_ko = own_kos * 0.08 if own_kos > 0 else 0.0
+                    
+                    if energy_attached > 0:
+                        r_en = energy_attached * 0.03
+                    elif energy_attached < 0:
+                        r_en = energy_attached * 0.02
+                    else:
+                        r_en = 0.0
+                        
+                    r_bench = 0.0
+                    if post["bench_size"] <= 1:
+                        r_bench -= 0.02
+                    if pre["bench_size"] <= 1 and (post["bench_size"] > pre["bench_size"]):
+                        r_bench += 0.10
+                        
+                    r_deck = 0.0
+                    if post["deck_size"] <= 3:
+                        r_deck -= 0.10
+                    elif post["deck_size"] <= 5:
+                        r_deck -= 0.04
+                        
+                    step_reward = r_stall + r_prize_t - r_prize_l + r_ko - r_own_ko + r_en + r_bench + r_deck
+                    
+                    if i == 0:
+                        rc_worker["prize_taken"] += r_prize_t
+                        rc_worker["prize_lost"] += r_prize_l
+                        rc_worker["kos"] += r_ko
+                        rc_worker["own_kos"] += r_own_ko
+                        rc_worker["energy"] += r_en
+                        rc_worker["bench"] += r_bench
+                        rc_worker["deckout"] += r_deck
+                        rc_worker["stall"] += r_stall
+                        
+                    rewards.append(step_reward)
+                    
+                if i == 0:
+                    rc_worker["terminal"] += terminal_reward
+                    
+                GAMMA = 0.99
+                LAMBDA = 0.95
+                pred_values = [player_samples[s][0].pred_val for s in range(n_steps)]
+                returns = [0.0] * n_steps
+                gae = 0.0
+                for step_idx in reversed(range(n_steps)):
+                    step_rew = rewards[step_idx]
+                    if step_idx == n_steps - 1:
+                        next_val = terminal_reward
+                    else:
+                        next_val = pred_values[step_idx + 1]
+                    delta = step_rew + GAMMA * next_val - pred_values[step_idx]
+                    gae = delta + GAMMA * LAMBDA * gae
+                    returns[step_idx] = gae + pred_values[step_idx]
+                    
+                for step_idx in range(n_steps):
+                    sample_obj, _ = player_samples[step_idx]
+                    sample_obj.value = max(-1.0, min(1.0, returns[step_idx]))
+                    td_error = returns[step_idx] - sample_obj.pred_val
+                    processed_samples.append((sample_obj, td_error))
+
+            # Calculate policy entropy
+            entropy_accum = 0.0
+            entropy_count = 0
+            for sample_obj, _ in samples[0]:
+                if sample_obj is not None and hasattr(sample_obj, 'policy') and len(sample_obj.policy) > 0:
+                    policy_probs = [max(1e-8, p) for p in sample_obj.policy if p > 0]
+                    p_sum = sum(policy_probs)
+                    if p_sum > 0:
+                        entropy = -sum((p/p_sum) * math.log(p/p_sum) for p in policy_probs)
+                        entropy_accum += entropy
+                        entropy_count += 1
+                        
+            result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, processed_samples, result, final_turn, rc_worker, entropy_accum, entropy_count)))
+            
+        elif cmd == "EVAL":
+            sample_deck, opponent_deck, opponent_name = args
+            
+            try:
+                obs, start_data = battle_start(sample_deck, opponent_deck)
+                if start_data.errorPlayer >= 0:
+                    result_queue.put(("EVAL_COMPLETE", (worker_id, opponent_name, -1.0)))
+                    continue
+            except Exception as e:
+                result_queue.put(("EVAL_COMPLETE", (worker_id, opponent_name, -1.0)))
+                continue
+                
+            your_index = worker_id % 2
+            while True:
+                if obs["current"]["result"] >= 0:
+                    break
+                    
+                if obs["current"]["yourIndex"] == your_index:
+                    selected, _ = mcts_agent(obs, sample_deck, client)
+                else:
+                    selected = random_agent(obs)
+                obs = battle_select(selected)
+                
+            battle_finish()
+            result = obs["current"]["result"]
+            
+            if result == 2:
+                outcome = 0.5
+            elif result == your_index:
+                outcome = 1.0
+            else:
+                outcome = 0.0
+                
+            result_queue.put(("EVAL_COMPLETE", (worker_id, opponent_name, outcome)))
+
+
+def drain_queue(q):
+    while not q.empty():
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            break
+
+
+def wilson_score_interval(wins, total, confidence=0.95):
+    if total == 0:
+        return 0.0, 0.0
+    z = 1.96
+    p = wins / total
+    denom = 1 + z**2 / total
+    mean = (p + z**2 / (2 * total)) / denom
+    spread = z * math.sqrt(p * (1 - p) / total + z**2 / (4 * total**2)) / denom
+    return max(0.0, mean - spread) * 100.0, min(1.0, mean + spread) * 100.0
+
+
+def sample_league_opponent(active_elo, checkpoints, league_elos, sigma=150.0):
+    weights = []
+    for path in checkpoints:
+        name = os.path.basename(path)
+        elo = league_elos.get(name, 1500.0)
+        w = math.exp(-((elo - active_elo) ** 2) / (2 * sigma ** 2))
+        weights.append(max(0.01, w))
+    w_sum = sum(weights)
+    probs = [w / w_sum for w in weights]
+    return random.choices(checkpoints, weights=probs, k=1)[0]
+
+
+def run_sprt_evaluation(command_queues, result_queue, num_workers, sample_deck, opponent_decks, test_opponent_names,
+                        alpha=0.05, beta=0.1, p0=0.50, p1=0.55):
+    drain_queue(result_queue)
+    
+    A = math.log(beta / (1.0 - alpha))
+    B = math.log((1.0 - beta) / alpha)
+    
+    log_lik_ratio = 0.0
+    wins, losses, draws = 0, 0, 0
+    total_games = 0
+    
+    games_sent = 0
+    games_received = 0
+    active_evals = {}
+    
+    for w_idx in range(num_workers):
+        opp_name = test_opponent_names[games_sent % len(test_opponent_names)]
+        opp_deck = opponent_decks[opp_name]
+        command_queues[w_idx].put(("EVAL", (sample_deck, opp_deck, opp_name)))
+        active_evals[w_idx] = opp_name
+        games_sent += 1
+        
+    print(f"SPRT Evaluation started. alpha={alpha}, beta={beta}, p0={p0}, p1={p1}")
+    deck_stats = {name: [0, 0, 0] for name in test_opponent_names}
+    
+    max_eval_games = 200
+    decision = None
+    
+    while games_received < max_eval_games:
+        msg, data = result_queue.get()
+        if msg == "EVAL_COMPLETE":
+            w_idx, opp_name, outcome = data
+            games_received += 1
+            total_games += 1
+            
+            if outcome == 1.0:
+                wins += 1
+                deck_stats[opp_name][0] += 1
+                log_lik_ratio += math.log(p1 / p0)
+            elif outcome == 0.0:
+                losses += 1
+                deck_stats[opp_name][1] += 1
+                log_lik_ratio += math.log((1.0 - p1) / (1.0 - p0))
+            elif outcome == 0.5:
+                draws += 1
+                deck_stats[opp_name][2] += 1
+                
+            denom = wins + losses
+            win_rate = 100.0 * wins / denom if denom > 0 else 0.0
+            print(f"  Game {total_games}: vs '{opp_name}' -> {'WIN' if outcome == 1.0 else 'LOSS' if outcome == 0.0 else 'DRAW'}. wins: {wins}, losses: {losses}, draws: {draws}, LLR: {log_lik_ratio:.4f} (Bounds: [{A:.2f}, {B:.2f}])")
+            sys.stdout.flush()
+                
+            if log_lik_ratio >= B:
+                decision = True  # ACCEPT
+                break
+            elif log_lik_ratio <= A:
+                decision = False  # REJECT
+                break
+                
+            if games_sent < max_eval_games:
+                opp_name = test_opponent_names[games_sent % len(test_opponent_names)]
+                opp_deck = opponent_decks[opp_name]
+                command_queues[w_idx].put(("EVAL", (sample_deck, opp_deck, opp_name)))
+                active_evals[w_idx] = opp_name
+                games_sent += 1
+                
+    time.sleep(0.5)
+    drain_queue(result_queue)
+    
+    denom = wins + losses
+    win_rate = 100.0 * wins / denom if denom > 0 else 0.0
+    low_ci, high_ci = wilson_score_interval(wins, denom)
+    
+    print(f"Overall SPRT Evaluation complete. Total games: {total_games}")
+    print(f"  -> Decision: {'ACCEPTED (Model Improved)' if decision else 'REJECTED (Model No Better)' if decision is not None else 'UNDECIDED'}")
+    print(f"  -> Win Rate: {win_rate:.1f}% (Wins: {wins}, Losses: {losses}, Draws: {draws})")
+    print(f"  -> 95% Wilson Confidence Interval: [{low_ci:.1f}%, {high_ci:.1f}%]")
+    
+    return decision, win_rate, wins, losses, draws, deck_stats
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train and evaluate the MCTS Pokemon TCG AI Agent.")
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs (default: 5)")
-    parser.add_argument("--eval-episodes", type=int, default=50, help="Number of evaluation games against random agent (default: 50)")
+    parser.add_argument("--eval-episodes", type=int, default=50, help="Target evaluation games (default: 50)")
     parser.add_argument("--self-play-episodes", type=int, default=100, help="Number of self-play games for data collection (default: 100)")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for model training (default: 128)")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate (default: 5e-5)")
     parser.add_argument("--patience", type=int, default=10, help="Patience for early stopping based on evaluation win rate (default: 10)")
+    parser.add_argument("--num-workers", type=int, default=max(1, mp.cpu_count() - 1), help="Number of parallel worker processes")
     args = parser.parse_args()
 
     # Reproducibility
@@ -197,41 +642,37 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 
-    # Load all available decks in the workspace
     opponent_decks = load_all_decks()
     if not opponent_decks:
         raise ValueError("No valid deck.csv found in root or subdirectories.")
         
-    # sample_deck is our main active agent deck
     sample_deck = opponent_decks.get("Current (Self)")
     if not sample_deck:
         raise ValueError("Root deck.csv not found.")
 
-    # Setup device, model, optimizer, and loss functions
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
     print(f"Hyperparameters: Epochs={args.epochs}, Eval-Episodes={args.eval_episodes}, Self-Play-Episodes={args.self_play_episodes}, Batch-Size={args.batch_size}, LR={args.lr}")
-    
+    print(f"Workers count: {args.num_workers}")
+
     model = MyModel(256, 4, 512, 2, 2)
     
-    # Load checkpoint if exists
     checkpoint_path = "model.pth"
     if os.path.exists(checkpoint_path):
         print(f"Loading existing model weights from {checkpoint_path}")
         try:
             checkpoint = torch.load(checkpoint_path, map_location=device)
             if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-                model.load_state_dict(checkpoint["state_dict"])
+                model.load_state_dict(checkpoint["state_dict"], strict=False)
                 print(f"  -> Successfully loaded checkpoint from epoch {checkpoint.get('epoch', 0)}")
             else:
-                model.load_state_dict(checkpoint)
+                model.load_state_dict(checkpoint, strict=False)
         except Exception as e:
             print(f"  -> Warning: Could not load checkpoint due to size mismatch ({e}). Starting from scratch.")
         
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     
-    # Cosine warmup scheduler — 3 epoch warmup avoids instability at start
     def _lr_lambda(epoch):
         warmup_epochs = 3
         if epoch < warmup_epochs:
@@ -240,10 +681,6 @@ def main():
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
     
-    loss_fn_enc = torch.nn.HuberLoss(delta=0.2)  # Encoder value loss (used for non-IS-weighted logging only)
-    loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)  # Kept for backward compat but unused by cross-entropy path
-    
-    # Mixed precision training scaler (CUDA only)
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     
     os.makedirs("out", exist_ok=True)
@@ -258,13 +695,26 @@ def main():
     league_dir = "out/league"
     os.makedirs(league_dir, exist_ok=True)
 
-    # Seed league with starting model (use run version to avoid collision)
     if os.path.exists("model.pth"):
         import shutil
         shutil.copy("model.pth", os.path.join(league_dir, f"model_epoch_0_run_{version}.pth"))
         print(f"Seeded league with initial model checkpoint as model_epoch_0_run_{version}.pth")
 
-    # Initialize CSV files for metrics inside run_dir
+    elo_path = os.path.join(league_dir, "elo.csv")
+    league_elos = {}
+    if os.path.exists(elo_path):
+        try:
+            with open(elo_path, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                next(reader)
+                for row in reader:
+                    if len(row) >= 2:
+                        league_elos[row[0]] = float(row[1])
+        except Exception as e:
+            print(f"Warning: Failed to load Elo file: {e}")
+    if "active" not in league_elos:
+        league_elos["active"] = 1500.0
+
     metrics_path = os.path.join(run_dir, "training_metrics.csv")
     with open(metrics_path, mode="w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
@@ -283,10 +733,17 @@ def main():
         writer = csv.writer(f)
         writer.writerow(["epoch", "attack", "play", "attach", "evolve", "ability", "retreat", "end", "other"])
 
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_writer = SummaryWriter(log_dir=run_dir)
+        print("TensorBoard logging enabled.")
+    except ImportError:
+        tb_writer = None
+        print("TensorBoard not installed. Skipping TensorBoard logging.")
+
     best_win_rate = -1.0
     patience_counter = 0
     
-    # 70/30 Train/Test Opponent Decks Split
     all_opponent_names = sorted([name for name in opponent_decks.keys() if name != "Current (Self)"])
     split_idx = int(0.7 * len(all_opponent_names))
     if len(all_opponent_names) >= 2:
@@ -303,427 +760,222 @@ def main():
     print(f"  -> Train Opponent Decks: {train_opponent_names}")
     print(f"  -> Test Opponent Decks: {test_opponent_names}")
 
-    # Initialize rolling deck stats for curriculum / adaptive selection (only for training decks)
     rolling_wins = {name: 0.0 for name in train_opponent_names}
     rolling_games = {name: 0.0 for name in train_opponent_names}
     
-    # Prioritized Experience Replay Buffer
     replay_buffer = PrioritizedReplayBuffer(capacity=50000)
 
-    # Main training loop
+    model_lock = threading.Lock()
+
+    num_workers = args.num_workers
+    print(f"Spawning {num_workers} parallel workers...")
+    
+    command_queues = [mp.Queue() for _ in range(num_workers)]
+    result_queue = mp.Queue()
+    
+    parent_conns = []
+    worker_conns = []
+    for _ in range(num_workers):
+        p_conn, c_conn = mp.Pipe(duplex=True)
+        parent_conns.append(p_conn)
+        worker_conns.append(c_conn)
+        
+    workers = []
+    for i in range(num_workers):
+        p = mp.Process(
+            target=worker_loop,
+            args=(i, command_queues[i], result_queue, worker_conns[i], "cpu")
+        )
+        p.daemon = True
+        p.start()
+        workers.append(p)
+
+    inference_server = GPUInferenceServer(model, parent_conns, model_lock, batch_size=args.batch_size)
+    inference_server.start(device)
+    print("GPU Inference Server started successfully.")
+
     for counter in range(1, args.epochs + 1):
         print(f"\n--- Epoch {counter}/{args.epochs} ---")
         
         epoch_rewards = []
-        
-        # Per-epoch reward component accumulators
         rc = {"prize_taken": 0.0, "prize_lost": 0.0, "kos": 0.0, "own_kos": 0.0,
               "energy": 0.0, "bench": 0.0, "deckout": 0.0, "terminal": 0.0, "stall": 0.0,
               "no_energy": 0.0}
-        rc_count = 0  # Number of steps accumulated
+        rc_count = 0
         total_game_length = 0
         total_games = 0
         
-        # Per-epoch action type counters
-        action_counts = {"attack": 0, "play": 0, "attach": 0, "evolve": 0,
-                         "ability": 0, "retreat": 0, "end": 0, "other": 0}
-        
-        # Policy entropy accumulator for mode collapse detection
         entropy_accum = 0.0
         entropy_count = 0
-        
-        # Per-epoch deck matchup tracking (evaluation)
         epoch_deck_stats = {}
         
-        # 1. Evaluation
-        model.eval()
         win_rate = 0.0
-        with torch.inference_mode():
-            if args.eval_episodes > 0:
-                results = [0, 0, 0]  # [Wins, Losses, Draws]
-                deck_stats = {}      # {deck_name: [wins, losses, draws]}
+        if args.eval_episodes > 0:
+            active_elo = league_elos.get("active", 1500.0)
+            decision, win_rate, wins, losses, draws, deck_stats = run_sprt_evaluation(
+                command_queues, result_queue, num_workers, sample_deck, opponent_decks, test_opponent_names,
+                alpha=0.05, beta=0.1, p0=0.50, p1=0.55
+            )
+            
+            for name, stats in deck_stats.items():
+                d_denom = stats[0] + stats[1]
+                d_win_rate = 100.0 * stats[0] / d_denom if d_denom > 0 else 0.0
+                epoch_deck_stats[name] = {"wins": stats[0], "losses": stats[1], "draws": stats[2], "win_rate": d_win_rate}
                 
-                # Use only the test opponent decks split
-                eval_opponent_names = test_opponent_names
-                
-                for name in eval_opponent_names:
-                    deck_stats[name] = [0, 0, 0]
-
-                for i in progress(args.eval_episodes, "Evaluating... "):
-                    # Round-robin distribution of test opponent decks
-                    opponent_name = eval_opponent_names[i % len(eval_opponent_names)]
-                    opponent_deck = opponent_decks[opponent_name]
-                    
-                    obs, start_data = battle_start(sample_deck, opponent_deck)
-                    if start_data.errorPlayer >= 0:
-                        error = f"Deck error in battle between your deck and '{opponent_name}'."
-                        if start_data.errorType == 1:
-                            error += " The deck contains invalid card ID."
-                        elif start_data.errorType == 2:
-                            error += " You can include up to four cards with the same name."
-                        elif start_data.errorType == 3:
-                            error += " There are no Basic Pokémon in the deck."
-                        elif start_data.errorType == 4:
-                            error += " You can include only one Ace Spec card."
-                        raise ValueError(error)
-                        
-                    your_index = i % 2
-                    while True:
-                        if obs["current"]["result"] >= 0:
-                            break
-
-                        if obs["current"]["yourIndex"] == your_index:
-                            selected, _ = mcts_agent(obs, sample_deck, model)
-                        else:
-                            selected = random_agent(obs)
-                        obs = battle_select(selected)
-                    
-                    battle_finish()
-
-                    result = obs["current"]["result"]
-                    if result == 2:  # Draw
-                        results[2] += 1
-                        deck_stats[opponent_name][2] += 1
-                    elif result == your_index:  # Win
-                        results[0] += 1
-                        deck_stats[opponent_name][0] += 1
-                    else:  # Lose
-                        results[1] += 1
-                        deck_stats[opponent_name][1] += 1
-                
-                denom = results[0] + results[1]
-                win_rate = 100.0 * results[0] / denom if denom > 0 else 0.0
-                print(f"Overall Evaluation win rate: {win_rate}% (Wins: {results[0]}, Losses: {results[1]}, Draws: {results[2]})", flush=True)
-                
-                # Check and save the best performing model
-                if win_rate > best_win_rate:
-                    best_win_rate = win_rate
+            if decision is True or (decision is None and win_rate > best_win_rate):
+                best_win_rate = win_rate
+                with model_lock:
                     best_checkpoint = {
                         "epoch": counter,
                         "state_dict": model.state_dict(),
-                        "win_rate": best_win_rate
+                        "win_rate": best_win_rate,
+                        "elo": active_elo
                     }
-                    torch.save(best_checkpoint, "best_model.pth")
-                    torch.save(best_checkpoint, os.path.join(run_dir, "best_model.pth"))
-                    print(f"  -> New best model checkpoint saved (Win Rate: {best_win_rate}%)")
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    print(f"  -> No improvement in Win Rate for {patience_counter} consecutive epochs.")
-                    if patience_counter >= args.patience:
-                        print(f"Early stopping triggered: Win Rate has not improved for {args.patience} epochs.")
-                        break
-                    
-                for name, stats in deck_stats.items():
-                    d_denom = stats[0] + stats[1]
-                    d_win_rate = 100.0 * stats[0] / d_denom if d_denom > 0 else 0.0
-                    print(f"  -> vs '{name}': {d_win_rate:.1f}% (Wins: {stats[0]}, Losses: {stats[1]}, Draws: {stats[2]})", flush=True)
-                    epoch_deck_stats[name] = {"wins": stats[0], "losses": stats[1], "draws": stats[2], "win_rate": d_win_rate}
-            else:
-                print("Skipping evaluation (eval-episodes=0).")
+                torch.save(best_checkpoint, "best_model.pth")
+                torch.save(best_checkpoint, os.path.join(run_dir, "best_model.pth"))
+                print(f"  -> Saved new best model checkpoint (Win Rate: {best_win_rate:.1f}%)")
+                patience_counter = 0
+            elif decision is False:
+                patience_counter += 1
+                print(f"  -> Model rejected. No improvement for {patience_counter} consecutive epochs.")
+                if patience_counter >= args.patience:
+                    print(f"Early stopping triggered.")
+                    break
+        else:
+            print("Skipping evaluation (eval-episodes=0).")
 
-            # 2. Self Play Data Collection with League & Adaptive Selection
-            if args.self_play_episodes > 0:
-                # Use only the train opponent decks split
-                eval_opponent_names = train_opponent_names
-                
-                for _ in progress(args.self_play_episodes, "Training Data Collecting... "):
-                    # Decide opponent deck using Adaptive Matchup Selection (bias to lower win rates)
-                    if not eval_opponent_names:
+        if args.self_play_episodes > 0:
+            drain_queue(result_queue)
+            games_sent = 0
+            games_received = 0
+            active_tasks = {}
+            active_elo = league_elos.get("active", 1500.0)
+            
+            def get_next_self_play_args():
+                if not train_opponent_names:
+                    opponent_name = "Current (Self)"
+                    opponent_deck = sample_deck
+                else:
+                    if random.random() < 0.5:
                         opponent_name = "Current (Self)"
                         opponent_deck = sample_deck
                     else:
-                        if random.random() < 0.5:
-                            opponent_name = "Current (Self)"
-                            opponent_deck = sample_deck
-                        else:
-                            # Calculate opponent deck weights based on current rolling win rates
-                            weights = []
-                            for name in eval_opponent_names:
-                                g = rolling_games[name]
-                                w = rolling_wins[name]
-                                wr = w / g if g > 0 else 0.5
-                                # Invert winrate to prioritize playing against tougher decks
-                                weights.append(max(0.1, 1.0 - wr))
-                            
-                            w_sum = sum(weights)
-                            probs = [w / w_sum for w in weights]
-                            opponent_name = random.choices(eval_opponent_names, weights=probs, k=1)[0]
-                            opponent_deck = opponent_decks[opponent_name]
-                    
-                    # Decide opponent checkpoint path based on 40/30/20/10 distribution
-                    use_league = False
-                    league_model = None
-                    r = random.random()
-                    opponent_path = None
-                    opponent_type = "Current"
-                    
-                    if r < 0.40:
-                        opponent_type = "Current"
-                    elif r < 0.70:
-                        best_path = "best_model.pth"
-                        if os.path.exists(best_path):
-                            opponent_path = best_path
-                            opponent_type = "Best Checkpoint"
-                        else:
-                            opponent_type = "Current"
-                    elif r < 0.90:
-                        prev_path = os.path.join(run_dir, f"model{counter-1}.pth")
-                        if counter > 1 and os.path.exists(prev_path):
-                            opponent_path = prev_path
-                            opponent_type = "Previous Checkpoint"
-                        else:
-                            opponent_type = "Current"
-                    else:
-                        if os.path.exists(league_dir):
-                            checkpoints = [os.path.join(league_dir, f) for f in os.listdir(league_dir) if f.endswith(".pth")]
-                            if checkpoints:
-                                opponent_path = random.choice(checkpoints)
-                                opponent_type = f"Random Historical ({os.path.basename(opponent_path)})"
-                                
-                    if opponent_path is not None:
-                        try:
-                            league_model = get_league_model(opponent_path, device)
-                            use_league = True
-                        except Exception as e:
-                            # Catch and skip size mismatch warnings silently or with warning
-                            print(f"  -> Warning: Skipping checkpoint {opponent_path}: {e}")
-                            use_league = False
-
-                    obs, _ = battle_start(sample_deck, opponent_deck)
-                    samples: list[list[tuple[LearnSample, dict]]] = [[], []]  # [Player0 samples, Player1 samples]
-                    
-                    while True:
-                        if obs["current"]["result"] >= 0:
-                            break
-
-                        curr_player = obs["current"]["yourIndex"]
-                        curr_deck = sample_deck if curr_player == 0 else opponent_deck
-                        
-                        # Inspect and store pre-action state metrics
-                        obs_class = to_observation_class(obs)
-                        state_ps = obs_class.current.players[curr_player]
-                        opp_ps = obs_class.current.players[1 - curr_player]
-                        
-                        pre_metrics = {
-                            "prizes": len(state_ps.prize),
-                            "opp_prizes": len(opp_ps.prize),
-                            "energy": count_attached_energy(state_ps),
-                            "pokemon": count_pokemon(state_ps),
-                            "opp_pokemon": count_pokemon(opp_ps),
-                            "bench_size": len([p for p in state_ps.bench if p is not None]),
-                            "deck_size": state_ps.deckCount,
-                            "energy_attached_flag": obs_class.current.energyAttached  # True if energy was attached this turn
-                        }
-
-                        # Retrieve action and sample
-                        if curr_player == 0:
-                            selected, sample = mcts_agent(obs, curr_deck, model)
-                            sample.pred_val = sample.value
-                            samples[0].append((sample, pre_metrics))
-                            
-                            # Policy entropy for monitoring exploration/mode collapse
-                            if sample is not None and hasattr(sample, 'policy') and len(sample.policy) > 0:
-                                policy_probs = [max(1e-8, p) for p in sample.policy if p > 0]
-                                p_sum = sum(policy_probs)
-                                if p_sum > 0:
-                                    entropy = -sum((p/p_sum) * math.log(p/p_sum) for p in policy_probs)
-                                    entropy_accum += entropy
-                                    entropy_count += 1
-                        else:
-                            if use_league:
-                                selected, _ = mcts_agent(obs, curr_deck, league_model)
-                            else:
-                                selected, sample = mcts_agent(obs, curr_deck, model)
-                                if opponent_name == "Current (Self)":
-                                    sample.pred_val = sample.value
-                                    samples[1].append((sample, pre_metrics))
-                        
-                        # Track action type distribution (Player 0 only)
-                        if curr_player == 0:
-                            for sel_idx in selected:
-                                if sel_idx < len(obs_class.select.option):
-                                    opt = obs_class.select.option[sel_idx]
-                                    if opt.type == OptionType.ATTACK:
-                                        action_counts["attack"] += 1
-                                    elif opt.type == OptionType.PLAY:
-                                        action_counts["play"] += 1
-                                    elif opt.type == OptionType.ATTACH:
-                                        action_counts["attach"] += 1
-                                    elif opt.type == OptionType.EVOLVE:
-                                        action_counts["evolve"] += 1
-                                    elif opt.type == OptionType.ABILITY:
-                                        action_counts["ability"] += 1
-                                    elif opt.type == OptionType.RETREAT:
-                                        action_counts["retreat"] += 1
-                                    elif opt.type == OptionType.END:
-                                        action_counts["end"] += 1
-                                    else:
-                                        action_counts["other"] += 1
-                        
-                        obs = battle_select(selected)
-                    
-                    battle_finish()
-
-                    # Update rolling stats for Adaptive selection (from Player 0's perspective)
-                    result = obs["current"]["result"]
-                    if opponent_name != "Current (Self)":
-                        rolling_games[opponent_name] += 1
-                        if result == 0:  # Player 0 won
-                            rolling_wins[opponent_name] += 1
-                        elif result == 2:  # Draw
-                            rolling_wins[opponent_name] += 0.5
-                        
-                        # Exponential decay so selector responds to current skill, not early history
-                        DECAY = 0.9
+                        weights = []
                         for name in train_opponent_names:
-                            rolling_wins[name] *= DECAY
-                            rolling_games[name] *= DECAY
-
-                    # Backpropagate and shape dense rewards
-                    for i in range(2):
-                        if i == 0 or (opponent_name == "Current (Self)" and not use_league):
-                            player_samples = samples[i]
-                            n_steps = len(player_samples)
-                            if n_steps == 0:
-                                continue
+                            g = rolling_games[name]
+                            w = rolling_wins[name]
+                            wr = w / g if g > 0 else 0.5
+                            weights.append(max(0.1, 1.0 - wr))
+                        w_sum = sum(weights)
+                        probs = [w / w_sum for w in weights]
+                        opponent_name = random.choices(train_opponent_names, weights=probs, k=1)[0]
+                        opponent_deck = opponent_decks[opponent_name]
+                        
+                opponent_type = "Current"
+                opponent_path = None
+                r = random.random()
+                if r < 0.40:
+                    opponent_type = "Current"
+                elif r < 0.70:
+                    best_path = "best_model.pth"
+                    if os.path.exists(best_path):
+                        opponent_path = best_path
+                        opponent_type = "Best Checkpoint"
+                elif r < 0.90:
+                    prev_path = os.path.join(run_dir, f"model{counter-1}.pth")
+                    if counter > 1 and os.path.exists(prev_path):
+                        opponent_path = prev_path
+                        opponent_type = "Previous Checkpoint"
+                else:
+                    if os.path.exists(league_dir):
+                        checkpoints = [os.path.join(league_dir, f) for f in os.listdir(league_dir) if f.endswith(".pth")]
+                        if checkpoints:
+                            opponent_path = sample_league_opponent(active_elo, checkpoints, league_elos)
+                            opponent_type = f"League ({os.path.basename(opponent_path)})"
                             
-                            # Terminal reward — normalized to [-1, 1] to match tanh output range
-                            if result == 2:         # Draw
-                                terminal_reward = 0.0
-                            elif i == result:       # Win
-                                terminal_reward = 1.0
-                            else:                   # Loss
-                                terminal_reward = -1.0
-                            if i == 0:  # Track only from Player 0's perspective
-                                rc["terminal"] += terminal_reward
-                                total_game_length += obs_class.current.turn if (obs_class is not None and obs_class.current is not None) else 0
-                                total_games += 1
+                return opponent_name, sample_deck, opponent_deck, opponent_type, opponent_path
+
+            for w_idx in range(num_workers):
+                if games_sent < args.self_play_episodes:
+                    opp_name, s_deck, o_deck, opp_type, opp_path = get_next_self_play_args()
+                    command_queues[w_idx].put(("PLAY_SELF", (s_deck, o_deck, opp_type, opp_path)))
+                    active_tasks[w_idx] = (opp_name, opp_type, opp_path)
+                    games_sent += 1
+
+            pbar = progress(args.self_play_episodes, "Training Data Collecting... ")
+            next(pbar)
+            
+            while games_received < args.self_play_episodes:
+                msg, data = result_queue.get()
+                if msg == "PLAY_SELF_COMPLETE":
+                    w_idx, samples, result, final_turn, rc_worker, e_accum, e_count = data
+                    games_received += 1
+                    
+                    pbar.send(games_received)
+                    
+                    opp_name, opp_type, opp_path = active_tasks[w_idx]
+                    
+                    if opp_name != "Current (Self)" and result >= 0:
+                        rolling_games[opp_name] += 1
+                        if result == 0:
+                            rolling_wins[opp_name] += 1
+                        elif result == 2:
+                            rolling_wins[opp_name] += 0.5
                             
-                            rewards = []
-                            for step_idx in range(n_steps):
-                                sample, pre = player_samples[step_idx]
-                                
-                                if step_idx < n_steps - 1:
-                                    _, post = player_samples[step_idx + 1]
-                                else:
-                                    final_obs = to_observation_class(obs)
-                                    final_ps = final_obs.current.players[i]
-                                    final_opp_ps = final_obs.current.players[1 - i]
-                                    post = {
-                                        "prizes": len(final_ps.prize),
-                                        "opp_prizes": len(final_opp_ps.prize),
-                                        "energy": count_attached_energy(final_ps),
-                                        "pokemon": count_pokemon(final_ps),
-                                        "opp_pokemon": count_pokemon(final_opp_ps),
-                                        "bench_size": len([p for p in final_ps.bench if p is not None]),
-                                        "deck_size": final_ps.deckCount,
-                                        "energy_attached_flag": True  # Game over — no penalty on final step
-                                    }
-                                
-                                # Compute differences
-                                prizes_taken = pre["prizes"] - post["prizes"]
-                                prizes_lost = pre["opp_prizes"] - post["opp_prizes"]
-                                opp_kos = pre["opp_pokemon"] - post["opp_pokemon"]
-                                own_kos = pre["pokemon"] - post["pokemon"]
-                                energy_attached = post["energy"] - pre["energy"]
-                                
-                                # Intermediate reward calculation — normalized to be proportional to ±1.0 terminal
-                                # Previously these were 10–100× too large, causing tanh saturation and flat gradients.
-                                step_reward = 0.0
-                                r_stall = -0.005   # Mild per-step anti-stall (was -0.15)
-                                r_prize_t = 0.0
-                                r_prize_l = 0.0
-                                r_ko = 0.0
-                                r_own_ko = 0.0
-                                r_en = 0.0
-                                r_bench = 0.0
-                                r_deck = 0.0
-                                
-                                if prizes_taken > 0:
-                                    r_prize_t = prizes_taken * 0.20   # (was 12.0) Key win condition
-                                if prizes_lost > 0:
-                                    r_prize_l = prizes_lost * 0.15    # (was 8.0) Opponent taking prizes
-                                if opp_kos > 0:
-                                    r_ko = opp_kos * 0.10             # (was 6.0) Encourage aggression
-                                if own_kos > 0:
-                                    r_own_ko = own_kos * 0.08         # (was 5.0) Own KOs penalty
-                                if energy_attached > 0:
-                                    r_en = energy_attached * 0.03     # (was 1.5) Energy prerequisite to attacking
-                                elif energy_attached < 0:
-                                    r_en = energy_attached * 0.02     # (was 1.0) Lost energy
-                                
-                                # REMOVED: r_no_energy penalty
-                                # The energy_attached_flag fires on every non-energy action within a turn,
-                                # not just at end-of-turn. This fired 97% of steps and drowned all other signals.
-                                # Energy attachment is already incentivized by r_en (+0.03 per energy attached).
-                                r_no_energy = 0.0
-                                
-                                # Bench cushion penalty — mild nudge, not dominant signal
-                                if post["bench_size"] <= 1:
-                                    r_bench -= 0.02   # (was -1.0)
-                                
-                                # Reward for benching a Pokémon when bench was dangerously low
-                                if pre["bench_size"] <= 1 and (post["bench_size"] > pre["bench_size"]):
-                                    r_bench += 0.10    # (was +5.0)
-                                
-                                # Deck out penalty (apply penalty if deck size is critically low)
-                                if post["deck_size"] <= 3:
-                                    r_deck -= 0.10     # (was -5.0) Critical danger
-                                elif post["deck_size"] <= 5:
-                                    r_deck -= 0.04     # (was -2.0) Impending danger
-                                
-                                step_reward = r_stall + r_prize_t - r_prize_l + r_ko - r_own_ko + r_en + r_bench + r_deck
-                                
-                                # Accumulate reward components (Player 0 only)
-                                if i == 0:
-                                    rc["prize_taken"] += r_prize_t
-                                    rc["prize_lost"] += r_prize_l
-                                    rc["kos"] += r_ko
-                                    rc["own_kos"] += r_own_ko
-                                    rc["energy"] += r_en
-                                    rc["bench"] += r_bench
-                                    rc["deckout"] += r_deck
-                                    rc["stall"] += r_stall
-                                    rc["no_energy"] += r_no_energy
-                                    rc_count += 1
-                                
-                                rewards.append(step_reward)
-                            
-                            # Propagate targets back using GAE(λ) — standard method from PPO/AlphaStar
-                            GAMMA = 0.99    # Discount factor
-                            LAMBDA = 0.95   # GAE lambda (was 0.98 — 0.95 is the standard sweet spot)
+                        for name in train_opponent_names:
+                            rolling_wins[name] *= 0.95
+                            rolling_games[name] *= 0.95
 
-                            # Collect model predictions for bootstrapping
-                            pred_values = [player_samples[s][0].pred_val for s in range(n_steps)]
+                    if opp_path is not None and "model" in os.path.basename(opp_path) and result >= 0:
+                        opp_name_file = os.path.basename(opp_path)
+                        active_elo = league_elos.get("active", 1500.0)
+                        opp_elo = league_elos.get(opp_name_file, 1500.0)
+                        
+                        exp_active = 1.0 / (1.0 + 10.0 ** ((opp_elo - active_elo) / 400.0))
+                        exp_opp = 1.0 - exp_active
+                        
+                        s_active = 1.0 if result == 0 else 0.0 if result == 1 else 0.5
+                        s_opp = 1.0 - s_active
+                        
+                        K = 32
+                        active_elo += K * (s_active - exp_active)
+                        opp_elo += K * (s_opp - exp_opp)
+                        
+                        league_elos["active"] = active_elo
+                        league_elos[opp_name_file] = opp_elo
+                        
+                        with open(elo_path, "w", newline="", encoding="utf-8") as f:
+                            writer = csv.writer(f)
+                            writer.writerow(["checkpoint", "elo"])
+                            for name_ch, elo in league_elos.items():
+                                writer.writerow([name_ch, elo])
 
-                            # Standard GAE lambda-return calculation
-                            returns = [0.0] * n_steps
-                            gae = 0.0
-                            for step_idx in reversed(range(n_steps)):
-                                step_rew = rewards[step_idx]
+                    for sample_obj, td_error in samples:
+                        replay_buffer.add(sample_obj, td_error)
+                        epoch_rewards.append(sample_obj.value)
 
-                                if step_idx == n_steps - 1:
-                                    next_val = terminal_reward  # Bootstrap from terminal
-                                else:
-                                    next_val = pred_values[step_idx + 1]
+                    for k in rc:
+                        if k in rc_worker:
+                            rc[k] += rc_worker[k]
+                    rc_count += len(samples) // 2 if len(samples) > 0 else 1
+                    total_game_length += final_turn
+                    total_games += 1
+                    
+                    entropy_accum += e_accum
+                    entropy_count += e_count
+                    
+                    if games_sent < args.self_play_episodes:
+                        opp_name, s_deck, o_deck, opp_type, opp_path = get_next_self_play_args()
+                        command_queues[w_idx].put(("PLAY_SELF", (s_deck, o_deck, opp_type, opp_path)))
+                        active_tasks[w_idx] = (opp_name, opp_type, opp_path)
+                        games_sent += 1
+            try:
+                pbar.send(args.self_play_episodes)
+            except StopIteration:
+                pass
+        else:
+            print("Skipping self-play data collection (self-play-episodes=0).")
 
-                                delta = step_rew + GAMMA * next_val - pred_values[step_idx]  # TD error
-                                gae = delta + GAMMA * LAMBDA * gae  # GAE accumulation
-                                returns[step_idx] = gae + pred_values[step_idx]  # λ-return = GAE + V(s)
-
-                            # Assign targets and add to replay
-                            for step_idx in range(n_steps):
-                                sample, _ = player_samples[step_idx]
-                                # Clamp target to [-1, 1] to match tanh output range
-                                sample.value = max(-1.0, min(1.0, returns[step_idx]))
-                                td_error = returns[step_idx] - sample.pred_val
-                                replay_buffer.add(sample, td_error)
-                                epoch_rewards.append(sample.value)
-            else:
-                print("Skipping self-play data collection (self-play-episodes=0).")
-
-        # 3. Model Training using Prioritized Replay Buffer
         avg_loss = 0.0
         if len(replay_buffer) >= args.batch_size:
             print("Training Start.")
@@ -733,7 +985,6 @@ def main():
             
             epoch_losses = []
             for i in range(batch_count):
-                # Anneal IS beta from 0.4 → 1.0 over training epochs
                 beta = min(1.0, 0.4 + 0.6 * (counter / args.epochs))
                 samples, indices, is_weights = replay_buffer.sample(args.batch_size, beta=beta)
                 
@@ -755,54 +1006,49 @@ def main():
                         label_dec.append(0.0)
                         input_dec.offset.append(len(input_dec.index))
 
-                # Convert to PyTorch tensors
                 mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device).view(args.batch_size, -1)
                 label_tensor_enc = torch.tensor(label_enc, dtype=torch.float32, device=device).view(args.batch_size, -1)
                 label_tensor_dec = torch.tensor(label_dec, dtype=torch.float32, device=device).view(args.batch_size, -1)
 
-                optimizer.zero_grad()
+                with model_lock:
+                    optimizer.zero_grad()
 
-                with torch.amp.autocast(device_type=device.type, enabled=(scaler is not None)):
-                    out_enc, out_dec = model(
-                        torch.tensor(input_enc.index, dtype=torch.int32, device=device),
-                        torch.tensor(input_enc.value, dtype=torch.float32, device=device),
-                        torch.tensor(input_enc.offset, dtype=torch.int32, device=device),
-                        torch.tensor(input_dec.index, dtype=torch.int32, device=device),
-                        torch.tensor(input_dec.value, dtype=torch.float32, device=device),
-                        torch.tensor(input_dec.offset, dtype=torch.int32, device=device)
-                    )
-                    
-                    # Importance sampling weight tensor for PER bias correction
-                    is_weight_tensor = torch.tensor(is_weights, dtype=torch.float32, device=device).view(args.batch_size, 1)
+                    with torch.amp.autocast(device_type=device.type, enabled=(scaler is not None)):
+                        out_enc, out_dec = model(
+                            torch.tensor(input_enc.index, dtype=torch.int32, device=device),
+                            torch.tensor(input_enc.value, dtype=torch.float32, device=device),
+                            torch.tensor(input_enc.offset, dtype=torch.int32, device=device),
+                            torch.tensor(input_dec.index, dtype=torch.int32, device=device),
+                            torch.tensor(input_dec.value, dtype=torch.float32, device=device),
+                            torch.tensor(input_dec.offset, dtype=torch.int32, device=device)
+                        )
+                        
+                        is_weight_tensor = torch.tensor(is_weights, dtype=torch.float32, device=device).view(args.batch_size, 1)
 
-                    # Value loss with IS weighting (element-wise then weighted mean)
-                    loss_enc_elem = torch.nn.functional.huber_loss(out_enc, label_tensor_enc, reduction="none", delta=0.2)
-                    loss_enc = (loss_enc_elem * is_weight_tensor).mean()
+                        loss_enc_elem = torch.nn.functional.huber_loss(out_enc, label_tensor_enc, reduction="none", delta=0.2)
+                        loss_enc = (loss_enc_elem * is_weight_tensor).mean()
 
-                    # Policy loss: masked cross-entropy (matching visit-count probability targets)
-                    # out_dec is raw logits (batch, 64), label_tensor_dec is probabilities (batch, 64)
-                    # Mask invalid actions by setting their logits to -inf before softmax
-                    masked_logits = out_dec + (1.0 - mask_tensor) * (-1e9)
-                    log_probs = torch.nn.functional.log_softmax(masked_logits, dim=-1)
-                    loss_dec_ce = -(label_tensor_dec * log_probs * mask_tensor)
-                    loss_dec_ce = (loss_dec_ce.sum(dim=-1, keepdim=True) * is_weight_tensor).mean()
+                        masked_logits = out_dec + (1.0 - mask_tensor) * (-1e9)
+                        log_probs = torch.nn.functional.log_softmax(masked_logits, dim=-1)
+                        loss_dec_ce = -(label_tensor_dec * log_probs * mask_tensor)
+                        loss_dec_ce = (loss_dec_ce.sum(dim=-1, keepdim=True) * is_weight_tensor).mean()
 
-                    loss = loss_enc + loss_dec_ce
+                        loss = loss_enc + loss_dec_ce
 
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                    optimizer.step()
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                        optimizer.step()
+                        
                 epoch_losses.append(loss.item())
                 
                 errors = (out_enc - label_tensor_enc).abs().squeeze().tolist()
-                # Handle single-item batch squeeze edge case
                 if isinstance(errors, float):
                     errors = [errors]
                 replay_buffer.update_priorities(indices, errors)
@@ -813,30 +1059,25 @@ def main():
             if args.self_play_episodes > 0:
                 print(f"Skipping training: collected buffer size ({len(replay_buffer)}) less than batch size ({args.batch_size}).")
 
-        # Compute average reward for this epoch
         avg_reward = sum(epoch_rewards) / len(epoch_rewards) if epoch_rewards else 0.0
 
-        # Save checkpoints AFTER training (not before)
         epoch_model_path = os.path.join(run_dir, f"model{counter}.pth")
-        checkpoint = {
-            "epoch": counter,
-            "state_dict": model.state_dict(),
-            "optimizer_state": optimizer.state_dict()
-        }
+        with model_lock:
+            checkpoint = {
+                "epoch": counter,
+                "state_dict": model.state_dict(),
+                "optimizer_state": optimizer.state_dict()
+            }
         torch.save(checkpoint, epoch_model_path)
         torch.save(checkpoint, "model.pth")
         
-        # Save to league directory (include run version to avoid collision)
         league_model_path = os.path.join(league_dir, f"model_epoch_{counter}_run_{version}.pth")
         torch.save(checkpoint, league_model_path)
         print(f"Saved checkpoint: {epoch_model_path}, model.pth, and {league_model_path}")
 
-        # Compute average reward components
         avg_gl = total_game_length / total_games if total_games > 0 else 0.0
         rc_div = max(1, rc_count)
         
-        # Log metrics to CSV (expanded with entropy)
-        avg_entropy = entropy_accum / max(1, entropy_count)
         with open(metrics_path, mode="a", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow([counter, win_rate, avg_loss, avg_reward,
@@ -847,41 +1088,53 @@ def main():
                              rc["stall"] / rc_div, rc["no_energy"] / rc_div, avg_gl,
                              avg_entropy])
         
-        # Log deck matchup stats
         with open(deck_matchup_path, mode="a", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             for name, stats in epoch_deck_stats.items():
                 writer.writerow([counter, name, stats["wins"], stats["losses"], stats["draws"], f"{stats['win_rate']:.1f}"])
         
-        # Log action distribution
-        with open(action_dist_path, mode="a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow([counter, action_counts["attack"], action_counts["play"],
-                             action_counts["attach"], action_counts["evolve"],
-                             action_counts["ability"], action_counts["retreat"],
-                             action_counts["end"], action_counts["other"]])
-            
-        # Step the scheduler
         scheduler.step()
-        print(f"Epoch Metrics Logged -> Win Rate: {win_rate}%, Loss: {avg_loss:.4f}, Reward: {avg_reward:.4f}")
-        print(f"Current Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
         
-    # Save the final model weights to model.pth only (best_model.pth is preserved from peak win rate)
-    final_checkpoint = {
-        "epoch": args.epochs,
-        "state_dict": model.state_dict(),
-        "optimizer_state": optimizer.state_dict()
-    }
+        active_elo = league_elos.get("active", 1500.0)
+        if tb_writer is not None:
+            tb_writer.add_scalar("Loss/Policy", loss_dec_ce.item() if 'loss_dec_ce' in locals() else 0.0, counter)
+            tb_writer.add_scalar("Loss/Value", loss_enc.item() if 'loss_enc' in locals() else 0.0, counter)
+            tb_writer.add_scalar("MCTS/AverageDepth", avg_gl, counter)
+            tb_writer.add_scalar("MCTS/Entropy", avg_entropy, counter)
+            tb_writer.add_scalar("League/ActiveElo", active_elo, counter)
+            tb_writer.add_scalar("Generalization/OOD_WinRate", win_rate, counter)
+
+        print(f"Epoch Metrics Logged -> Win Rate: {win_rate:.1f}%, Loss: {avg_loss:.4f}, Reward: {avg_reward:.4f}, Active Elo: {active_elo:.1f}")
+        print(f"Current Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+
+    print("Stopping worker processes...")
+    for q in command_queues:
+        q.put(("STOP", None))
+    for p in workers:
+        p.join()
+        
+    print("Stopping GPU inference server...")
+    inference_server.stop()
+        
+    with model_lock:
+        final_checkpoint = {
+            "epoch": args.epochs,
+            "state_dict": model.state_dict(),
+            "optimizer_state": optimizer.state_dict()
+        }
     torch.save(final_checkpoint, "model.pth")
     torch.save(final_checkpoint, os.path.join(run_dir, "model.pth"))
+    
+    if tb_writer is not None:
+        tb_writer.close()
+        
     print(f"\nTraining complete. Final weights saved to model.pth and inside {run_dir}")
     print(f"Best model (peak win rate) preserved in best_model.pth")
 
-
-    # Generate plots
     print("Generating learning curves...")
     plot_metrics(metrics_path, run_dir, deck_matchup_path, action_dist_path)
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     main()

@@ -60,6 +60,16 @@ class LearnSample:
         self.sv_dec = sv_dec
 
 
+class GPUInferenceClient:
+    """Client wrapper for workers to send inference queries to the GPU batch server."""
+    def __init__(self, conn):
+        self.conn = conn
+
+    def eval_nn(self, sv_enc: SparseVector, sv_dec: SparseVector) -> tuple[float, list[float]]:
+        self.conn.send((sv_enc, sv_dec))
+        return self.conn.recv()
+
+
 class Child:
     """MCTS Node Child representing a possible selected action combination."""
     node: 'Node | None'
@@ -287,19 +297,28 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     # causing mode collapse (the agent repeatedly selects "end turn").
     if len(root.children) > 0:
         dir_alpha = 0.3  # TCG has moderate action space
-        noise_frac = 0.25
+        turn = state.turn if (state is not None) else 0
+        noise_frac = max(0.05, 0.25 - 0.02 * turn)
         noise = [random.gammavariate(dir_alpha, 1.0) for _ in root.children]
         noise_sum = sum(noise) + 1e-8
         noise = [n / noise_sum for n in noise]
         for i, child in enumerate(root.children):
             child.prob = (1.0 - noise_frac) * child.prob + noise_frac * noise[i]
 
+    # Dynamic Simulation Count based on branch branching factor
+    if search_count == SEARCH_COUNT:
+        num_actions = len(root.children)
+        dynamic_search_count = max(20, min(150, num_actions * 10))
+    else:
+        dynamic_search_count = search_count
+
     # Search loop
-    for _ in range(search_count):
+    for _ in range(dynamic_search_count):
         current = root
         while True:
             value = -1e9
-            c = 0.4 * math.sqrt(current.visit)
+            # Dynamic PUCT Exploration
+            c = 0.1 + 0.3 * math.log((current.visit + 50) / 50)
             next_child = None
             for child in current.children:
                 visit = 0
