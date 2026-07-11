@@ -95,35 +95,34 @@ class PrioritizedReplayBuffer:
         return len(self.buffer)
 
 
-def progress(count: int, text: str):
-    """Helper generator to display training/evaluation progress in terminal with time estimation."""
-    current = 0
-    start_time = time.time()
-    while True:
-        percent = 100 * current // count
-        elapsed = time.time() - start_time
+class ProgressBar:
+    """Helper class to display training/evaluation progress in terminal with time estimation."""
+    def __init__(self, count: int, text: str):
+        self.count = count
+        self.text = text
+        self.start_time = time.time()
+
+    def update(self, current: int):
+        percent = min(100, 100 * current // self.count)
+        elapsed = time.time() - self.start_time
         
         # Estimate remaining time
         if current > 0:
             avg_time_per_item = elapsed / current
-            est_total_time = avg_time_per_item * count
+            est_total_time = avg_time_per_item * self.count
             est_remaining = est_total_time - elapsed
             
-            # Format time as mm:ss
             elapsed_min, elapsed_sec = divmod(int(elapsed), 60)
-            rem_min, rem_sec = divmod(int(est_remaining), 60)
+            rem_min, rem_sec = divmod(int(max(0, est_remaining)), 60)
             time_str = f"[{elapsed_min:02d}:{elapsed_sec:02d}<{rem_min:02d}:{rem_sec:02d}]"
         else:
             time_str = f"[00:00<--:--]"
             
-        sys.stderr.write(f"\r{text} {percent}% {time_str}   ")
+        sys.stderr.write(f"\r{self.text} {percent}% {time_str}   ")
         sys.stderr.flush()
-        if current >= count:
+        if current >= self.count:
             sys.stderr.write("\n")
             sys.stderr.flush()
-            break
-        yield current
-        current += 1
 
 
 def load_all_decks():
@@ -902,8 +901,8 @@ def main():
                     active_tasks[w_idx] = (opp_name, opp_type, opp_path)
                     games_sent += 1
 
-            pbar = progress(args.self_play_episodes, "Training Data Collecting... ")
-            next(pbar)
+            pbar = ProgressBar(args.self_play_episodes, "Training Data Collecting... ")
+            pbar.update(0)
             
             while games_received < args.self_play_episodes:
                 msg, data = result_queue.get()
@@ -911,7 +910,7 @@ def main():
                     w_idx, samples, result, final_turn, rc_worker, e_accum, e_count = data
                     games_received += 1
                     
-                    pbar.send(games_received)
+                    pbar.update(games_received)
                     
                     opp_name, opp_type, opp_path = active_tasks[w_idx]
                     
@@ -969,10 +968,7 @@ def main():
                         command_queues[w_idx].put(("PLAY_SELF", (s_deck, o_deck, opp_type, opp_path)))
                         active_tasks[w_idx] = (opp_name, opp_type, opp_path)
                         games_sent += 1
-            try:
-                pbar.send(args.self_play_episodes)
-            except StopIteration:
-                pass
+            pbar.update(args.self_play_episodes)
         else:
             print("Skipping self-play data collection (self-play-episodes=0).")
 

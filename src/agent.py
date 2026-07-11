@@ -312,6 +312,11 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     else:
         dynamic_search_count = search_count
 
+    # Caps simulations in the Kaggle runtime environment to avoid TIMEOUT (no GPU)
+    IS_KAGGLE = os.path.exists('/kaggle_simulations/agent') or 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
+    if IS_KAGGLE:
+        dynamic_search_count = min(dynamic_search_count, 15)
+
     # Search loop
     for _ in range(dynamic_search_count):
         current = root
@@ -441,12 +446,24 @@ def agent(obs_dict: dict) -> list[int]:
     # Determine adaptive search count budget based on current turn
     obs = to_observation_class(obs_dict)
     turn = obs.current.turn if (obs.current is not None) else 0
-    if turn <= 3:
-        search_count = 150
-    elif turn <= 8:
-        search_count = 100
+    
+    IS_KAGGLE = os.path.exists('/kaggle_simulations/agent') or 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
+    if IS_KAGGLE:
+        # Lower budget on Kaggle to prevent TIMEOUT on weak CPU
+        if turn <= 3:
+            search_count = 20
+        elif turn <= 8:
+            search_count = 15
+        else:
+            search_count = 10
     else:
-        search_count = 50
+        # Standard local/eval budget
+        if turn <= 3:
+            search_count = 150
+        elif turn <= 8:
+            search_count = 100
+        else:
+            search_count = 50
 
     with torch.inference_mode():
         action, _ = mcts_agent(obs_dict, _deck, _model, search_count=search_count)
