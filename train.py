@@ -737,6 +737,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs (default: 5)")
     parser.add_argument("--eval-episodes", type=int, default=50, help="Target evaluation games (default: 50)")
     parser.add_argument("--self-play-episodes", type=int, default=100, help="Number of self-play games for data collection (default: 100)")
+    parser.add_argument("--self-play-ratio", type=float, default=0.5, help="Ratio of games played against Current (Self) vs rule-based bots (default: 0.5)")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for model training (default: 128)")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate (default: 5e-5)")
     parser.add_argument("--patience", type=int, default=10, help="Patience for early stopping based on evaluation win rate (default: 10)")
@@ -762,10 +763,10 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
-    print(f"Hyperparameters: Epochs={args.epochs}, Eval-Episodes={args.eval_episodes}, Self-Play-Episodes={args.self_play_episodes}, Batch-Size={args.batch_size}, LR={args.lr}")
+    print(f"Hyperparameters: Epochs={args.epochs}, Eval-Episodes={args.eval_episodes}, Self-Play-Episodes={args.self_play_episodes}, Self-Play-Ratio={args.self_play_ratio}, Batch-Size={args.batch_size}, LR={args.lr}")
     print(f"Workers count: {args.num_workers}")
 
-    model = MyModel(256, 4, 512, 2, 2)
+    model = MyModel(128, 2, 256, 1, 1)
     
     checkpoint_path = "model.pth"
     if os.path.exists(checkpoint_path):
@@ -784,11 +785,14 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     
     def _lr_lambda(epoch):
-        warmup_epochs = 3
+        warmup_epochs = 5  # Increased from 3
+        min_lr_ratio = 0.1  # Do not decay below 10% of peak learning rate
         if epoch < warmup_epochs:
             return epoch / max(1, warmup_epochs)
         progress = (epoch - warmup_epochs) / max(1, args.epochs - warmup_epochs)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # Scale decay between min_lr_ratio and 1.0
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
     
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
@@ -899,6 +903,50 @@ def main():
     inference_server.start(device)
     print("GPU Inference Server started successfully.")
 
+    counter = 0
+
+    def handle_interrupt(signum, frame):
+        print("\nTraining interrupted by user (Ctrl+C). Cleaning up and saving progress...")
+        
+        print("Stopping worker processes...")
+        for q in command_queues:
+            q.put(("STOP", None))
+        for p in workers:
+            try:
+                p.join(timeout=2)
+            except Exception:
+                pass
+            
+        print("Stopping GPU inference server...")
+        try:
+            inference_server.stop()
+        except Exception:
+            pass
+            
+        with model_lock:
+            final_checkpoint = {
+                "epoch": counter,
+                "state_dict": model.state_dict(),
+                "optimizer_state": optimizer.state_dict()
+            }
+        torch.save(final_checkpoint, "model.pth")
+        torch.save(final_checkpoint, os.path.join(run_dir, "model.pth"))
+        
+        if tb_writer is not None:
+            tb_writer.close()
+            
+        print(f"\nSaved checkpoint (epoch {counter}) to model.pth and inside {run_dir}")
+        print("Generating learning curves...")
+        try:
+            plot_metrics(metrics_path, run_dir, deck_matchup_path, action_dist_path)
+        except Exception as e:
+            print(f"Error generating plots: {e}")
+        
+        sys.exit(0)
+
+    import signal
+    signal.signal(signal.SIGINT, handle_interrupt)
+
     for counter in range(1, args.epochs + 1):
         print(f"\n--- Epoch {counter}/{args.epochs} ---")
         
@@ -958,13 +1006,13 @@ def main():
             active_elo = league_elos.get("active", 1500.0)
             
             def get_next_self_play_args():
-                if not train_opponent_names:
+                if not train_opponent_names or random.random() < args.self_play_ratio:
                     opponent_name = "Current (Self)"
                     opponent_deck = sample_deck
                     opponent_type = "Current"
                     opponent_path = None
                 else:
-                    # Always select a rule-based opponent (0% self-play) to learn from structured strategies first
+                    # Select a rule-based opponent based on inverse win-rates
                     weights = []
                     for name in train_opponent_names:
                         g = rolling_games[name]
@@ -975,7 +1023,6 @@ def main():
                     probs = [w / w_sum for w in weights]
                     opponent_name = random.choices(train_opponent_names, weights=probs, k=1)[0]
                     opponent_deck = opponent_decks[opponent_name]
-                    
                     opponent_type = "Rulebased"
                     opponent_path = None
                             
@@ -1251,6 +1298,7 @@ def main():
         print(f"Epoch Metrics Logged -> Win Rate: {win_rate:.1f}%, Loss: {avg_loss:.4f}, Reward: {avg_reward:.4f}, Active Elo: {active_elo:.1f}")
         print(f"Current Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
 
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
     print("Stopping worker processes...")
     for q in command_queues:
         q.put(("STOP", None))

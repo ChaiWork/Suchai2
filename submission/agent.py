@@ -251,7 +251,7 @@ def agent(obs_dict: dict) -> list[int]:
 
     # Load model weights
     if _model is None:
-        _model = MyModel(256, 4, 512, 2, 2)
+        _model = MyModel(128, 2, 256, 1, 1)
         if "__file__" in globals():
             base_path = os.path.dirname(os.path.abspath(__file__))
         else:
