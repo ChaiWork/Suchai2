@@ -402,7 +402,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     }
     
                     if curr_player == 0:
-                        selected, sample = mcts_agent(obs, curr_deck, client)
+                        selected, sample = mcts_agent(obs, curr_deck, client, search_count=120)
                         sample.pred_val = sample.value
                         
                         opt_type_val = -1
@@ -443,7 +443,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             except Exception as e:
                                 selected = random_agent(obs)
                         elif opponent_type == "Current":
-                            selected, sample = mcts_agent(obs, curr_deck, client)
+                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=120)
                             sample.pred_val = sample.value
                             
                             opt_type_val = -1
@@ -456,7 +456,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             pre_metrics["action_type"] = opt_type_val
                             samples[1].append((sample, pre_metrics))
                         elif opp_model is not None:
-                            selected, sample = mcts_agent(obs, curr_deck, opp_model)
+                            selected, sample = mcts_agent(obs, curr_deck, opp_model, search_count=120)
                         else:
                             selected = random_agent(obs)
                     
@@ -907,6 +907,11 @@ def main():
         writer = csv.writer(f)
         writer.writerow(["epoch", "attack", "play", "attach", "evolve", "ability", "retreat", "end", "other"])
 
+    self_play_games_path = os.path.join(run_dir, "self_play_games.csv")
+    with open(self_play_games_path, mode="w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "opponent_name", "result", "turns", "attacks", "plays", "attaches", "evolves", "abilities", "retreats", "ends", "other"])
+
     try:
         from torch.utils.tensorboard import SummaryWriter
         tb_writer = SummaryWriter(log_dir=run_dir)
@@ -1124,6 +1129,24 @@ def main():
                             epoch_action_counts[act_k] += act_v
                             
                     opp_name, opp_type, opp_path = active_tasks[w_idx]
+                    
+                    # Append game outcome and action distribution to self_play_games.csv
+                    with open(self_play_games_path, mode="a", newline="", encoding="utf-8-sig") as f_sp:
+                        sp_writer = csv.writer(f_sp)
+                        sp_writer.writerow([
+                            counter,
+                            opp_name,
+                            result,
+                            final_turn,
+                            action_counts.get("attack", 0),
+                            action_counts.get("play", 0),
+                            action_counts.get("attach", 0),
+                            action_counts.get("evolve", 0),
+                            action_counts.get("ability", 0),
+                            action_counts.get("retreat", 0),
+                            action_counts.get("end", 0),
+                            action_counts.get("other", 0)
+                        ])
                     
                     if result >= 0:
                         if result == 0:

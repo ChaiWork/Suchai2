@@ -442,7 +442,7 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
         while True:
             value = -1e9
             # Dynamic PUCT Exploration
-            c = 0.4 * math.sqrt(current.visit)
+            c = 1.25 * math.sqrt(current.visit)
             next_child = None
             for child in current.children:
                 visit = 0

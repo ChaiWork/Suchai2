@@ -476,6 +476,8 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                     sv.add(9 + min(o.number, 4), 1)
                 case OptionType.ATTACK:
                     sv.add(decoder_attack_offset + o.attackId, 1)
+                    if len(ps.active) > 0 and ps.active[0] is not None:
+                        decoder_main(sv, 7, ps.active[0])
                 case OptionType.PLAY:
                     decoder_main(sv, 0, ps.hand[o.index])
                 case OptionType.ATTACH:
