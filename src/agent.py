@@ -31,6 +31,11 @@ from model import (
     get_encoder_input,
     get_decoder_input,
     eval_nn,
+    MODEL_D_MODEL,
+    MODEL_NUM_HEADS,
+    MODEL_D_FEEDFORWARD,
+    MODEL_NUM_LAYERS_ENCODER,
+    MODEL_NUM_LAYERS_DECODER,
 )
 
 # Resolve cg-lib path dynamically for Kaggle vs Local environments
@@ -46,6 +51,7 @@ from cg.api import (
     search_begin,
     search_step,
     search_end,
+    OptionType,
 )
 
 SEARCH_COUNT = 50  # MCTS Search count — need ≥50 for meaningful visit differentiation
@@ -129,20 +135,82 @@ def create_node(parent: Node | None,
         node.backprop(node.value)
         sample = None
     else:
-        # Enumerate up to 64 potential action combinations
+        # Enumerate up to 128 potential action combinations prioritizing high-value options
         actions = []
-        indices = list(range(obs.select.maxCount))
-        for _ in range(64):
-            actions.append(indices.copy())
-            for i in range(len(indices)):
-                index = len(indices) - i - 1
-                if indices[index] < len(obs.select.option) - i - 1:
-                    indices[index] += 1
-                    for j in range(index + 1, len(indices)):
-                        indices[j] = indices[j - 1] + 1
-                    break
+        options = obs.select.option
+        
+        high_priority = []
+        low_priority = []
+        
+        # High priority option types to guarantee evaluation
+        HIGH_PRIORITY_TYPES = {
+            OptionType.ATTACK,
+            OptionType.EVOLVE,
+            OptionType.ABILITY,
+            OptionType.ATTACH,
+            OptionType.RETREAT,
+            OptionType.PLAY,
+            OptionType.SPECIAL_CONDITION,
+            OptionType.YES,
+            OptionType.NO,
+            OptionType.NUMBER,
+            OptionType.SKILL,
+            OptionType.END
+        }
+        
+        for idx, opt in enumerate(options):
+            if opt.type in HIGH_PRIORITY_TYPES:
+                high_priority.append(idx)
             else:
-                break
+                low_priority.append(idx)
+                
+        sorted_indices = high_priority + low_priority
+        n = len(sorted_indices)
+        k = obs.select.maxCount
+        
+        # Generate combinations using sorted_indices
+        if k <= n:
+            comb_positions = list(range(k))
+            for _ in range(128):
+                # Map combination positions to sorted_indices
+                actions.append([sorted_indices[p] for p in comb_positions])
+                
+                # Standard next combination algorithm on positions [0, n-1]
+                for i in range(k):
+                    index = k - i - 1
+                    if comb_positions[index] < n - i - 1:
+                        comb_positions[index] += 1
+                        for j in range(index + 1, k):
+                            comb_positions[j] = comb_positions[j - 1] + 1
+                        break
+                else:
+                    break
+                    
+        # Instrumentation: check if any options were truncated
+        if len(options) > 128 and len(actions) == 128:
+            included_indices = set()
+            for act in actions:
+                for idx in act:
+                    included_indices.add(idx)
+            dropped_types = set()
+            for idx in range(len(options)):
+                if idx not in included_indices:
+                    dropped_types.add(options[idx].type)
+            if dropped_types:
+                dropped_type_names = []
+                for t in dropped_types:
+                    try:
+                        dropped_type_names.append(OptionType(t).name)
+                    except Exception:
+                        dropped_type_names.append(str(t))
+                try:
+                    os.makedirs("out", exist_ok=True)
+                    with open("out/truncated_options.log", "a", encoding="utf-8") as log_f:
+                        ctx_name = obs.select.context.name if hasattr(obs.select.context, 'name') else str(obs.select.context)
+                        log_f.write(f"Total: {len(options)}, Context: {ctx_name}, Dropped types: {dropped_type_names}\n")
+                except Exception:
+                    pass
+                print(f"[DEBUG] Truncated options. Total: {len(options)}. Dropped OptionTypes: {dropped_type_names}", file=sys.stderr)
             
         sv_enc = get_encoder_input(obs, your_deck)
         sv_dec = get_decoder_input(obs, actions)
@@ -246,7 +314,43 @@ def identify_opponent_deck(revealed_ids: list[int], opponent_decks: dict) -> lis
     return opponent_decks[best_name]
 
 
-def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_count: int = SEARCH_COUNT) -> tuple[list[int], LearnSample]:
+def get_own_visible_card_ids(obs, your_index: int) -> list[int]:
+    """Scans all visible own zones (active, bench, discard, hand) to find card IDs."""
+    visible = []
+    ps = obs.current.players[your_index]
+    
+    # Hand
+    for card in ps.hand:
+        if card is not None:
+            visible.append(card.id)
+            
+    # Active Pokémon + attached cards (energies, tools)
+    for poke in ps.active:
+        if poke is not None:
+            visible.append(poke.id)
+            if poke.tools:
+                visible.extend(t.id for t in poke.tools if t)
+            if poke.energyCards:
+                visible.extend(e.id for e in poke.energyCards if e)
+                
+    # Bench Pokémon + attached cards
+    for poke in ps.bench:
+        if poke is not None:
+            visible.append(poke.id)
+            if poke.tools:
+                visible.extend(t.id for t in poke.tools if t)
+            if poke.energyCards:
+                visible.extend(e.id for e in poke.energyCards if e)
+                
+    # Discard pile
+    for card in ps.discard:
+        if card is not None:
+            visible.append(card.id)
+            
+    return visible
+
+
+def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_count: int = None) -> tuple[list[int], LearnSample]:
     """Perform MCTS exploration and select the best action list, returning it and a training sample."""
     obs = to_observation_class(obs_dict)
     your_index = obs.current.yourIndex
@@ -258,13 +362,10 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     revealed_ids = get_opponent_revealed_card_ids(obs, opp_index)
     matched_deck = identify_opponent_deck(revealed_ids, OPPONENT_DECKS)
     
-    # Remove revealed cards from the matched deck list to find hidden cards
     remaining_cards = matched_deck.copy()
     for cid in revealed_ids:
         if cid in remaining_cards:
             remaining_cards.remove(cid)
-            
-    # Shuffle and sample to construct MCTS opponent beliefs
     random.shuffle(remaining_cards)
     
     deck_count = state.players[opp_index].deckCount
@@ -273,17 +374,36 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     
     total_needed = deck_count + prize_count + hand_count
     if len(remaining_cards) < total_needed:
-        # Fallback padding with Basic Water Energy (3) if deck mismatch occurs
+        # Fallback padding if deck mismatch occurs
         remaining_cards.extend([3] * (total_needed - len(remaining_cards)))
         
     opp_deck_sampled = remaining_cards[:deck_count]
     opp_prize_sampled = remaining_cards[deck_count:deck_count + prize_count]
     opp_hand_sampled = remaining_cards[deck_count + prize_count:deck_count + prize_count + hand_count]
     
+    # Sample own hidden zones correctly
+    own_remaining = your_deck.copy()
+    own_visible = get_own_visible_card_ids(obs, your_index)
+    for cid in own_visible:
+        if cid in own_remaining:
+            own_remaining.remove(cid)
+    random.shuffle(own_remaining)
+    
+    own_prize_count = len(state.players[your_index].prize)
+    own_deck_count = state.players[your_index].deckCount
+    
+    # Safe fallback if count mismatch
+    total_own_needed = own_prize_count + own_deck_count
+    if len(own_remaining) < total_own_needed:
+        own_remaining.extend([3] * (total_own_needed - len(own_remaining)))
+        
+    your_prize_sampled = own_remaining[:own_prize_count]
+    your_deck_sampled = own_remaining[own_prize_count:own_prize_count + own_deck_count]
+    
     search_state = search_begin(
         obs,
-        your_deck=random.sample(your_deck, state.players[your_index].deckCount),
-        your_prize=random.sample(your_deck, len(state.players[your_index].prize)),
+        your_deck=your_deck_sampled,
+        your_prize=your_prize_sampled,
         opponent_deck=opp_deck_sampled,
         opponent_prize=opp_prize_sampled,
         opponent_hand=opp_hand_sampled,
@@ -298,7 +418,7 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     if len(root.children) > 0:
         dir_alpha = 0.3  # TCG has moderate action space
         turn = state.turn if (state is not None) else 0
-        noise_frac = max(0.05, 0.25 - 0.02 * turn)
+        noise_frac = 0.25
         noise = [random.gammavariate(dir_alpha, 1.0) for _ in root.children]
         noise_sum = sum(noise) + 1e-8
         noise = [n / noise_sum for n in noise]
@@ -306,9 +426,8 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
             child.prob = (1.0 - noise_frac) * child.prob + noise_frac * noise[i]
 
     # Dynamic Simulation Count based on branch branching factor
-    if search_count == SEARCH_COUNT:
-        num_actions = len(root.children)
-        dynamic_search_count = max(20, min(150, num_actions * 10))
+    if search_count is None:
+        dynamic_search_count = SEARCH_COUNT
     else:
         dynamic_search_count = search_count
 
@@ -424,7 +543,13 @@ def agent(obs_dict: dict) -> list[int]:
 
     # Load model weights
     if _model is None:
-        _model = MyModel(256, 4, 512, 2, 2)
+        _model = MyModel(
+            MODEL_D_MODEL,
+            MODEL_NUM_HEADS,
+            MODEL_D_FEEDFORWARD,
+            MODEL_NUM_LAYERS_ENCODER,
+            MODEL_NUM_LAYERS_DECODER
+        )
         if "__file__" in globals():
             base_path = os.path.dirname(os.path.abspath(__file__))
         else:

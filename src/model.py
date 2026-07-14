@@ -34,6 +34,13 @@ all_attack_list = all_attack()
 attack_table = {a.attackId: a for a in all_attack_list}
 attack_count = max(all_attack_list, key=lambda a: a.attackId).attackId + 1
 
+# Model Architecture Hyperparameters (Single Source of Truth)
+MODEL_D_MODEL = 128
+MODEL_NUM_HEADS = 2
+MODEL_D_FEEDFORWARD = 256
+MODEL_NUM_LAYERS_ENCODER = 1
+MODEL_NUM_LAYERS_DECODER = 1
+
 num_words_encoder = 24
 encoder_size = 22000
 
@@ -487,10 +494,14 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                     decoder_card(sv, context, get_card(obs, o.area, o.index, o.playerIndex))
                 case OptionType.TOOL_CARD:
                     card = get_card(obs, o.area, o.index, o.playerIndex)
-                    decoder_card(sv, context, card.tools[o.toolIndex])
+                    tools = card.tools if (card is not None and card.tools is not None) else []
+                    tool_card = tools[o.toolIndex] if o.toolIndex < len(tools) else None
+                    decoder_card(sv, context, tool_card)
                 case OptionType.ENERGY_CARD | OptionType.ENERGY:
                     card = get_card(obs, o.area, o.index, o.playerIndex)
-                    decoder_card(sv, context, card.energyCards[o.energyIndex])
+                    energies = card.energyCards if (card is not None and card.energyCards is not None) else []
+                    energy_card = energies[o.energyIndex] if o.energyIndex < len(energies) else None
+                    decoder_card(sv, context, energy_card)
                 case OptionType.SKILL:
                     decoder_card_id(sv, context, o.cardId)
 

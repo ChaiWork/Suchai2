@@ -99,10 +99,10 @@ def create_node(parent: Node | None,
         node.backprop(node.value)
         sample = None
     else:
-        # Enumerate up to 64 potential action combinations
+        # Enumerate up to 256 potential action combinations
         actions = []
         indices = list(range(obs.select.maxCount))
-        for _ in range(64):
+        for _ in range(256):
             actions.append(indices.copy())
             for i in range(len(indices)):
                 index = len(indices) - i - 1

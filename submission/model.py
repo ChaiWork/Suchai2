@@ -332,10 +332,14 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                     decoder_card(sv, context, get_card(obs, o.area, o.index, o.playerIndex))
                 case OptionType.TOOL_CARD:
                     card = get_card(obs, o.area, o.index, o.playerIndex)
-                    decoder_card(sv, context, card.tools[o.toolIndex])
+                    tools = card.tools if (card is not None and card.tools is not None) else []
+                    tool_card = tools[o.toolIndex] if o.toolIndex < len(tools) else None
+                    decoder_card(sv, context, tool_card)
                 case OptionType.ENERGY_CARD | OptionType.ENERGY:
                     card = get_card(obs, o.area, o.index, o.playerIndex)
-                    decoder_card(sv, context, card.energyCards[o.energyIndex])
+                    energies = card.energyCards if (card is not None and card.energyCards is not None) else []
+                    energy_card = energies[o.energyIndex] if o.energyIndex < len(energies) else None
+                    decoder_card(sv, context, energy_card)
                 case OptionType.SKILL:
                     decoder_card_id(sv, context, o.cardId)
 

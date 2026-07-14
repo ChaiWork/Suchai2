@@ -39,7 +39,16 @@ src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
 if os.path.exists(src_dir) and src_dir not in sys.path:
     sys.path.append(src_dir)
 
-from model import MyModel, SparseVector, LearnInput
+from model import (
+    MyModel,
+    SparseVector,
+    LearnInput,
+    MODEL_D_MODEL,
+    MODEL_NUM_HEADS,
+    MODEL_D_FEEDFORWARD,
+    MODEL_NUM_LAYERS_ENCODER,
+    MODEL_NUM_LAYERS_DECODER,
+)
 from agent import LearnSample, mcts_agent, random_agent, GPUInferenceClient
 from plot_metrics import plot_metrics
 
@@ -207,8 +216,13 @@ _league_cache = {}  # {path: model}
 def get_league_model(path, device):
     """Load a league opponent model, caching recently used checkpoints."""
     if path not in _league_cache:
-        from model import MyModel
-        m = MyModel(256, 4, 512, 2, 2).to(device)
+        m = MyModel(
+            MODEL_D_MODEL,
+            MODEL_NUM_HEADS,
+            MODEL_D_FEEDFORWARD,
+            MODEL_NUM_LAYERS_ENCODER,
+            MODEL_NUM_LAYERS_DECODER
+        ).to(device)
         checkpoint = torch.load(path, map_location=device, weights_only=True)
         if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
             m.load_state_dict(checkpoint["state_dict"], strict=False)
@@ -264,7 +278,8 @@ class GPUInferenceServer:
                         batch_sv_enc.append(sv_enc)
                         batch_sv_dec.append(sv_dec)
                 except (EOFError, OSError):
-                    pass
+                    if conn in self.parent_conns:
+                        self.parent_conns.remove(conn)
 
             if not batch_conns:
                 continue
@@ -278,23 +293,29 @@ class GPUInferenceServer:
             for sv in batch_sv_dec:
                 orig_len = len(sv.offset)
                 orig_lens.append(orig_len)
-                if orig_len < 64:
-                    for _ in range(64 - orig_len):
+                if orig_len < 128:
+                    for _ in range(128 - orig_len):
                         sv.offset.append(len(sv.index))
                 input_dec.add(sv)
 
-            with self.model_lock:
-                with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')), torch.inference_mode():
-                    out_enc, out_dec = self.model(
-                        torch.tensor(input_enc.index, dtype=torch.int32, device=device),
-                        torch.tensor(input_enc.value, dtype=torch.float32, device=device),
-                        torch.tensor(input_enc.offset, dtype=torch.int32, device=device),
-                        torch.tensor(input_dec.index, dtype=torch.int32, device=device),
-                        torch.tensor(input_dec.value, dtype=torch.float32, device=device),
-                        torch.tensor(input_dec.offset, dtype=torch.int32, device=device)
-                    )
-                    values = out_enc.squeeze(-1).tolist()
-                    policies = out_dec.tolist()
+            try:
+                with self.model_lock:
+                    with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')), torch.inference_mode():
+                        out_enc, out_dec = self.model(
+                            torch.tensor(input_enc.index, dtype=torch.int32, device=device),
+                            torch.tensor(input_enc.value, dtype=torch.float32, device=device),
+                            torch.tensor(input_enc.offset, dtype=torch.int32, device=device),
+                            torch.tensor(input_dec.index, dtype=torch.int32, device=device),
+                            torch.tensor(input_dec.value, dtype=torch.float32, device=device),
+                            torch.tensor(input_dec.offset, dtype=torch.int32, device=device)
+                        )
+                        values = out_enc.squeeze(-1).tolist()
+                        policies = out_dec.tolist()
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                values = [0.0] * len(batch_conns)
+                policies = [[0.0] * 128] * len(batch_conns)
 
             for idx, conn in enumerate(batch_conns):
                 val = values[idx]
@@ -329,8 +350,13 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
             opp_model = None
             if opponent_path is not None:
                 try:
-                    from model import MyModel
-                    opp_model = MyModel(256, 4, 512, 2, 2).to(device)
+                    opp_model = MyModel(
+                        MODEL_D_MODEL,
+                        MODEL_NUM_HEADS,
+                        MODEL_D_FEEDFORWARD,
+                        MODEL_NUM_LAYERS_ENCODER,
+                        MODEL_NUM_LAYERS_DECODER
+                    ).to(device)
                     checkpoint = torch.load(opponent_path, map_location=device, weights_only=True)
                     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
                         opp_model.load_state_dict(checkpoint["state_dict"], strict=False)
@@ -349,75 +375,101 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {})))
                 continue
 
-            action_counts = {"attack": 0, "play": 0, "attach": 0, "evolve": 0, "ability": 0, "retreat": 0, "end": 0, "other": 0}
-            samples = [[], []]
-            while True:
-                if obs["current"]["result"] >= 0:
-                    break
-
-                curr_player = obs["current"]["yourIndex"]
-                curr_deck = sample_deck if curr_player == 0 else opponent_deck
-                
-                obs_class = to_observation_class(obs)
-                state_ps = obs_class.current.players[curr_player]
-                opp_ps = obs_class.current.players[1 - curr_player]
-                
-                pre_metrics = {
-                    "prizes": len(state_ps.prize),
-                    "opp_prizes": len(opp_ps.prize),
-                    "energy": count_attached_energy(state_ps),
-                    "active_energy": count_active_energy(state_ps),
-                    "pokemon": count_pokemon(state_ps),
-                    "opp_pokemon": count_pokemon(opp_ps),
-                    "bench_size": len([p for p in state_ps.bench if p is not None]),
-                    "deck_size": state_ps.deckCount,
-                    "energy_attached_flag": obs_class.current.energyAttached
-                }
-
-                if curr_player == 0:
-                    selected, sample = mcts_agent(obs, curr_deck, client)
-                    sample.pred_val = sample.value
-                    samples[0].append((sample, pre_metrics))
+            try:
+                action_counts = {"attack": 0, "play": 0, "attach": 0, "evolve": 0, "ability": 0, "retreat": 0, "end": 0, "other": 0}
+                samples = [[], []]
+                while True:
+                    if obs["current"]["result"] >= 0:
+                        break
+    
+                    curr_player = obs["current"]["yourIndex"]
+                    curr_deck = sample_deck if curr_player == 0 else opponent_deck
                     
-                    if selected and len(selected) > 0:
-                        sel_idx = selected[0]
-                        options = obs.get("select", {}).get("option", [])
-                        if sel_idx < len(options):
-                            opt_type = options[sel_idx].get("type")
-                            if opt_type == 13:
-                                action_counts["attack"] += 1
-                            elif opt_type == 7:
-                                action_counts["play"] += 1
-                            elif opt_type == 8:
-                                action_counts["attach"] += 1
-                            elif opt_type == 9:
-                                action_counts["evolve"] += 1
-                            elif opt_type == 10:
-                                action_counts["ability"] += 1
-                            elif opt_type == 12:
-                                action_counts["retreat"] += 1
-                            elif opt_type == 14:
-                                action_counts["end"] += 1
-                            else:
-                                action_counts["other"] += 1
-                else:
-                    if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult"]:
-                        try:
-                            selected = rule_based_opponent_agent(opponent_name, obs)
-                        except Exception as e:
-                            selected = random_agent(obs)
-                    elif opponent_type == "Current":
+                    obs_class = to_observation_class(obs)
+                    state_ps = obs_class.current.players[curr_player]
+                    opp_ps = obs_class.current.players[1 - curr_player]
+                    
+                    pre_metrics = {
+                        "prizes": len(state_ps.prize),
+                        "opp_prizes": len(opp_ps.prize),
+                        "energy": count_attached_energy(state_ps),
+                        "active_energy": count_active_energy(state_ps),
+                        "pokemon": count_pokemon(state_ps),
+                        "opp_pokemon": count_pokemon(opp_ps),
+                        "bench_size": len([p for p in state_ps.bench if p is not None]),
+                        "deck_size": state_ps.deckCount,
+                        "energy_attached_flag": obs_class.current.energyAttached
+                    }
+    
+                    if curr_player == 0:
                         selected, sample = mcts_agent(obs, curr_deck, client)
                         sample.pred_val = sample.value
-                        samples[1].append((sample, pre_metrics))
-                    elif opp_model is not None:
-                        selected, sample = mcts_agent(obs, curr_deck, opp_model)
+                        
+                        opt_type_val = -1
+                        if selected and len(selected) > 0:
+                            sel_idx = selected[0]
+                            options = obs.get("select", {}).get("option", [])
+                            if sel_idx < len(options):
+                                opt_type_val = options[sel_idx].get("type", -1)
+                                
+                        pre_metrics["action_type"] = opt_type_val
+                        samples[0].append((sample, pre_metrics))
+                        
+                        if selected and len(selected) > 0:
+                            sel_idx = selected[0]
+                            options = obs.get("select", {}).get("option", [])
+                            if sel_idx < len(options):
+                                opt_type = options[sel_idx].get("type")
+                                if opt_type == 13:
+                                    action_counts["attack"] += 1
+                                elif opt_type == 7:
+                                    action_counts["play"] += 1
+                                elif opt_type == 8:
+                                    action_counts["attach"] += 1
+                                elif opt_type == 9:
+                                    action_counts["evolve"] += 1
+                                elif opt_type == 10:
+                                    action_counts["ability"] += 1
+                                elif opt_type == 12:
+                                    action_counts["retreat"] += 1
+                                elif opt_type == 14:
+                                    action_counts["end"] += 1
+                                else:
+                                    action_counts["other"] += 1
                     else:
-                        selected = random_agent(obs)
-                
-                obs = battle_select(selected)
-                
-            battle_finish()
+                        if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult"]:
+                            try:
+                                selected = rule_based_opponent_agent(opponent_name, obs)
+                            except Exception as e:
+                                selected = random_agent(obs)
+                        elif opponent_type == "Current":
+                            selected, sample = mcts_agent(obs, curr_deck, client)
+                            sample.pred_val = sample.value
+                            
+                            opt_type_val = -1
+                            if selected and len(selected) > 0:
+                                sel_idx = selected[0]
+                                options = obs.get("select", {}).get("option", [])
+                                if sel_idx < len(options):
+                                    opt_type_val = options[sel_idx].get("type", -1)
+                                    
+                            pre_metrics["action_type"] = opt_type_val
+                            samples[1].append((sample, pre_metrics))
+                        elif opp_model is not None:
+                            selected, sample = mcts_agent(obs, curr_deck, opp_model)
+                        else:
+                            selected = random_agent(obs)
+                    
+                    obs = battle_select(selected)
+                    
+                battle_finish()
+            except Exception as e:
+                import traceback
+                print(f"Error in worker {worker_id} simulation:", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+                sys.stderr.flush()
+                result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {})))
+                continue
             
             result = obs["current"]["result"]
             obs_class = to_observation_class(obs)
@@ -434,10 +486,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 if n_steps == 0:
                     continue
                     
-                if result == 2:
-                    terminal_reward = 0.0
-                elif i == result:
+                if i == result:
                     terminal_reward = 1.0
+                elif result in [2, -1]:
+                    terminal_reward = -2.0  # Penalize draws/timeouts to prevent stalling collapse
                 else:
                     terminal_reward = -1.0
                     
@@ -471,8 +523,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     active_energy_attached = post.get("active_energy", 0) - pre.get("active_energy", 0)
                     bench_energy_attached = energy_attached - active_energy_attached
                     
-                    # Disable per-step action penalties to prevent policy collapse to "End Turn"
-                    r_stall = 0.0
+                    # Stall penalty to prevent endless pass cycles
+                    r_stall = -0.005
                         
                     r_prize_t = prizes_taken * 2.0 if prizes_taken > 0 else 0.0
                     r_prize_l = prizes_lost * 0.15 if prizes_lost > 0 else 0.0
@@ -481,11 +533,14 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     
                     r_en = 0.0
                     if active_energy_attached > 0:
-                        r_en += active_energy_attached * 0.50  # High reward for active energy attachment
+                        r_en += active_energy_attached * 0.10  # Reduced from 0.50 to prevent over-focus
                     if bench_energy_attached > 0:
-                        r_en += bench_energy_attached * 0.03   # Small reward for bench energy attachment
+                        r_en += bench_energy_attached * 0.02   # Reduced from 0.03
                     if energy_attached < 0:
                         r_en += energy_attached * 0.02         # Penalty for losing energy
+                        
+                    # Reward direct attack action type (13)
+                    r_attack = 0.15 if pre.get("action_type") == 13 else 0.0
                         
                     r_bench = 0.0
                     if post["bench_size"] <= 1:
@@ -499,7 +554,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     elif post["deck_size"] <= 5:
                         r_deck -= 0.04
                         
-                    step_reward = r_stall + r_prize_t - r_prize_l + r_ko - r_own_ko + r_en + r_bench + r_deck
+                    step_reward = r_stall + r_prize_t - r_prize_l + r_ko - r_own_ko + r_en + r_bench + r_deck + r_attack
                     
                     if i == 0:
                         rc_worker["prize_taken"] += r_prize_t
@@ -524,10 +579,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 for step_idx in reversed(range(n_steps)):
                     step_rew = rewards[step_idx]
                     if step_idx == n_steps - 1:
-                        next_val = terminal_reward
+                        delta = (step_rew + terminal_reward) - pred_values[step_idx]
                     else:
-                        next_val = pred_values[step_idx + 1]
-                    delta = step_rew + GAMMA * next_val - pred_values[step_idx]
+                        delta = step_rew + GAMMA * pred_values[step_idx + 1] - pred_values[step_idx]
                     gae = delta + GAMMA * LAMBDA * gae
                     returns[step_idx] = gae + pred_values[step_idx]
                     
@@ -766,7 +820,13 @@ def main():
     print(f"Hyperparameters: Epochs={args.epochs}, Eval-Episodes={args.eval_episodes}, Self-Play-Episodes={args.self_play_episodes}, Self-Play-Ratio={args.self_play_ratio}, Batch-Size={args.batch_size}, LR={args.lr}")
     print(f"Workers count: {args.num_workers}")
 
-    model = MyModel(128, 2, 256, 1, 1)
+    model = MyModel(
+        MODEL_D_MODEL,
+        MODEL_NUM_HEADS,
+        MODEL_D_FEEDFORWARD,
+        MODEL_NUM_LAYERS_ENCODER,
+        MODEL_NUM_LAYERS_DECODER
+    )
     
     checkpoint_path = "model.pth"
     if os.path.exists(checkpoint_path):
@@ -1005,12 +1065,23 @@ def main():
             active_tasks = {}
             active_elo = league_elos.get("active", 1500.0)
             
+            league_checkpoints = [
+                os.path.join(league_dir, f) for f in os.listdir(league_dir) if f.endswith(".pth")
+            ]
+            
             def get_next_self_play_args():
                 if not train_opponent_names or random.random() < args.self_play_ratio:
-                    opponent_name = "Current (Self)"
-                    opponent_deck = sample_deck
-                    opponent_type = "Current"
-                    opponent_path = None
+                    if league_checkpoints and random.random() < 0.5:
+                        opp_path = sample_league_opponent(active_elo, league_checkpoints, league_elos)
+                        opponent_name = os.path.basename(opp_path)
+                        opponent_deck = sample_deck
+                        opponent_type = "League"
+                        opponent_path = opp_path
+                    else:
+                        opponent_name = "Current (Self)"
+                        opponent_deck = sample_deck
+                        opponent_type = "Current"
+                        opponent_path = None
                 else:
                     # Select a rule-based opponent based on inverse win-rates
                     weights = []
@@ -1065,15 +1136,16 @@ def main():
                             epoch_self_play_games += 1.0
 
                     if opp_name != "Current (Self)" and result >= 0:
-                        rolling_games[opp_name] += 1
-                        if result == 0:
-                            rolling_wins[opp_name] += 1
-                        elif result == 2:
-                            rolling_wins[opp_name] += 0.5
-                            
-                        for name in train_opponent_names:
-                            rolling_wins[name] *= 0.95
-                            rolling_games[name] *= 0.95
+                        if opp_name in rolling_games:
+                            rolling_games[opp_name] += 1
+                            if result == 0:
+                                rolling_wins[opp_name] += 1
+                            elif result == 2:
+                                rolling_wins[opp_name] += 0.5
+                                
+                            for name in train_opponent_names:
+                                rolling_wins[name] *= 0.95
+                                rolling_games[name] *= 0.95
 
                     if opp_path is not None and "model" in os.path.basename(opp_path) and result >= 0:
                         opp_name_file = os.path.basename(opp_path)
@@ -1156,7 +1228,7 @@ def main():
                     label_dec.extend(sample.policy)
                     for _ in range(len(sample.policy)):
                         mask.append(1.0)
-                    for _ in range(64 - len(sample.policy)):
+                    for _ in range(128 - len(sample.policy)):
                         mask.append(0.0)
                         label_dec.append(0.0)
                         input_dec.offset.append(len(input_dec.index))
@@ -1183,7 +1255,9 @@ def main():
                         loss_enc_elem = torch.nn.functional.huber_loss(out_enc, label_tensor_enc, reduction="none", delta=0.2)
                         loss_enc = (loss_enc_elem * is_weight_tensor).mean()
 
-                        masked_logits = out_dec + (1.0 - mask_tensor) * (-1e9)
+                        # Cast decoder output to float32 explicitly for safe log_softmax computation under autocast
+                        out_dec_fp32 = out_dec.float()
+                        masked_logits = out_dec_fp32 + (1.0 - mask_tensor) * (-1e4)
                         log_probs = torch.nn.functional.log_softmax(masked_logits, dim=-1)
                         loss_dec_ce = -(label_tensor_dec * log_probs * mask_tensor)
                         loss_dec_ce = (loss_dec_ce.sum(dim=-1, keepdim=True) * is_weight_tensor).mean()
