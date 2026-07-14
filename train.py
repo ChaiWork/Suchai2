@@ -807,7 +807,7 @@ def main():
 
     opponent_decks = load_all_decks()
     # Filter opponent decks to exclude inefficient random agent models
-    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)", "Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult"]}
+    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Mewtwo",]}
     if not opponent_decks:
         raise ValueError("No valid deck.csv found in root or subdirectories.")
         
