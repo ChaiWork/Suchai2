@@ -171,6 +171,9 @@ def rule_based_opponent_agent(opponent_name, obs):
     elif opponent_name == "Rulebasedmodel_Dragapult":
         from Rulebasedmodel.dragapult_agent import agent
         return agent(obs)
+    elif opponent_name == "Rulebasedmodel_Mewtwo":
+        from Rulebasedmodel.mewtwo_agent import agent
+        return agent(obs)
     raise ValueError(f"Unknown rule-based opponent: {opponent_name}")
 
 
@@ -418,7 +421,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     }
     
                     if curr_player == 0:
-                        selected, sample = mcts_agent(obs, curr_deck, client, search_count=120)
+                        selected, sample = mcts_agent(obs, curr_deck, client, search_count=200)
                         sample.pred_val = sample.value
                         
                         opt_type_val = -1
@@ -490,13 +493,13 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 else:
                                     action_counts["other"] += 1
                     else:
-                        if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult"]:
+                        if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo"]:
                             try:
                                 selected = rule_based_opponent_agent(opponent_name, obs)
                             except Exception as e:
                                 selected = random_agent(obs)
                         elif opponent_type == "Current":
-                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=120)
+                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=200)
                             sample.pred_val = sample.value
                             
                             opt_type_val = -1
@@ -576,8 +579,12 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 if n_steps == 0:
                     continue
                     
+                num_attacks = sum(1 for _, pre in player_samples if pre.get("action_type") == 13)
                 if i == result:
-                    terminal_reward = 2.0
+                    if num_attacks == 0:
+                        terminal_reward = 0.0  # Mild penalty (neutral reward) to preserve the reward gradient
+                    else:
+                        terminal_reward = 2.0
                 elif result in [2, -1]:
                     terminal_reward = -5.0  # Neutral reward for draws/timeouts (anti-stall is handled by r_stall)
                 else:
@@ -628,7 +635,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     bench_energy_attached = energy_attached - active_energy_attached
                     
                     # Stall penalty to prevent endless pass cycles
-                    r_stall = -0.005
+                    r_stall = -0.02
                         
                     r_prize_t = prizes_taken * 2.0 if prizes_taken > 0 else 0.0
                     r_prize_l = prizes_lost * 0.15 if prizes_lost > 0 else 0.0
@@ -664,18 +671,18 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             if hand_diff >= expected_min_diff:
                                 r_strategic += 0.15  # Successful search
                             else:
-                                r_strategic -= 0.15  # Dead supporter or failed search penalty
+                                r_strategic -= 0.02  # Relaxed: Dead supporter or failed search penalty
                         # Correct use of Energy Switch (1116)
                         elif played_id == 1116:
                             if post["active_energies"] > pre["active_energies"]:
                                 r_strategic += 0.15
                             else:
-                                r_strategic -= 0.10  # Wasteful Energy Switch usage
+                                r_strategic -= 0.02  # Relaxed: Wasteful Energy Switch usage
                         # General Supporter dead usage penalty
                         elif played_id in [1217, 1218, 1219, 1220, 1227]:
                             hand_diff = post["hand_size"] - pre["hand_size"]
                             if hand_diff < 0:
-                                r_strategic -= 0.10  # Spent supporter but gained nothing
+                                r_strategic -= 0.02  # Relaxed: Spent supporter but gained nothing
                         else:
                             r_strategic += 0.02  # General play card reward
                             
@@ -687,7 +694,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             if target_id in [431, 401]:  # Mewtwo ex or Spidops
                                 r_strategic += 0.20  # High efficiency reward
                             elif target_id in [414, 272]:  # Articuno or Clefairy (non-Rocket or utility)
-                                r_strategic -= 0.15  # Penalty for wasting Rocket Energy
+                                r_strategic -= 0.02  # Relaxed: Penalty for wasting Rocket Energy
                         # Proper basic energy attachment
                         elif attached_id == 5:  # Psychic Energy
                             if target_id == 431:  # Mewtwo ex
@@ -713,14 +720,14 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     elif action_type == 12:  # RETREAT
                         # Unnecessary retreat penalty (retreating a healthy, fully-charged Mewtwo)
                         if pre.get("active_id") == 431 and pre.get("active_energies", 0) >= 3:
-                            r_strategic -= 0.15
+                            r_strategic -= 0.02  # Relaxed
                             
                     elif action_type == 13:  # ATTACK
                         att_id = pre.get("attack_id", -1)
                         if att_id == 608:  # Erasure Ball
                             # Premature Mewtwo attack penalty
                             if pre.get("active_energies", 0) < 3:
-                                r_strategic -= 0.10
+                                r_strategic -= 0.02  # Relaxed
                             else:
                                 r_strategic += 0.25
                         elif att_id == 560:  # Rocket Rush
@@ -731,16 +738,16 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     # 3. Bench Quality & Overextension Management
                     r_bench = 0.0
                     if post["bench_size"] == 0:
-                        r_bench -= 0.10  # Empty bench penalty (high risk of bench-out KO)
+                        r_bench -= 0.02  # Relaxed: Empty bench penalty
                     elif 2 <= post["bench_size"] <= 4:
                         r_bench += 0.05  # Optimal board development reward
                     elif post["bench_size"] == 5:
-                        r_bench -= 0.02  # Overextension penalty (leaves no room for utility/finishers)
+                        r_bench -= 0.02  # Overextension penalty
                         
                     # 4. Proper Mewtwo Timing & Charging
                     if post.get("active_id") == 431:
                         if post.get("active_energies", 0) < 2:
-                            r_strategic -= 0.15  # Penalty for having a weak/undercharged Mewtwo active
+                            r_strategic -= 0.02  # Relaxed: Penalty for having a weak/undercharged Mewtwo active
                         elif post.get("active_energies", 0) >= 3:
                             r_strategic += 0.10  # Reward for maintaining a fully charged Mewtwo active
                             
@@ -832,7 +839,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 if obs["current"]["yourIndex"] == your_index:
                     selected, _ = mcts_agent(obs, sample_deck, client)
                 else:
-                    if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult"]:
+                    if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo"]:
                         try:
                             selected = rule_based_opponent_agent(opponent_name, obs)
                         except Exception as e:
@@ -1000,6 +1007,7 @@ def main():
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate (default: 5e-5)")
     parser.add_argument("--patience", type=int, default=10, help="Patience for early stopping based on evaluation win rate (default: 10)")
     parser.add_argument("--num-workers", type=int, default=max(1, mp.cpu_count() - 1), help="Number of parallel worker processes")
+    parser.add_argument("--disable-league", action="store_true", help="Disable league play and checkpoint saving in league directory")
     args = parser.parse_args()
 
     # Reproducibility
@@ -1073,7 +1081,7 @@ def main():
     league_dir = "out/league"
     os.makedirs(league_dir, exist_ok=True)
 
-    if os.path.exists("model.pth"):
+    if not args.disable_league and os.path.exists("model.pth"):
         import shutil
         shutil.copy("model.pth", os.path.join(league_dir, f"model_epoch_0_run_{version}.pth"))
         print(f"Seeded league with initial model checkpoint as model_epoch_0_run_{version}.pth")
@@ -1276,9 +1284,11 @@ def main():
             league_completed = 0
             league_failed = 0
             
-            league_checkpoints = [
-                os.path.join(league_dir, f) for f in os.listdir(league_dir) if f.endswith(".pth")
-            ]
+            league_checkpoints = []
+            if not args.disable_league:
+                league_checkpoints = [
+                    os.path.join(league_dir, f) for f in os.listdir(league_dir) if f.endswith(".pth")
+                ]
             
             def get_next_self_play_args():
                 if not train_opponent_names or random.random() < args.self_play_ratio:
@@ -1543,9 +1553,12 @@ def main():
         torch.save(checkpoint, epoch_model_path)
         torch.save(checkpoint, "model.pth")
         
-        league_model_path = os.path.join(league_dir, f"model_epoch_{counter}_run_{version}.pth")
-        torch.save(checkpoint, league_model_path)
-        print(f"Saved checkpoint: {epoch_model_path}, model.pth, and {league_model_path}")
+        if not args.disable_league:
+            league_model_path = os.path.join(league_dir, f"model_epoch_{counter}_run_{version}.pth")
+            torch.save(checkpoint, league_model_path)
+            print(f"Saved checkpoint: {epoch_model_path}, model.pth, and {league_model_path}")
+        else:
+            print(f"Saved checkpoint: {epoch_model_path} and model.pth (League saving disabled)")
 
         # Prune league directory — keep only the most recent 10 checkpoints to
         # prevent the league candidate list from growing unbounded each epoch.
