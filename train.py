@@ -53,7 +53,7 @@ from agent import LearnSample, mcts_agent, random_agent, GPUInferenceClient
 from plot_metrics import plot_metrics
 
 from cg.game import battle_start, battle_finish, battle_select
-from cg.api import to_observation_class, OptionType
+from cg.api import to_observation_class, OptionType, AreaType, SelectContext
 
 
 def count_attached_energy(ps):
@@ -389,6 +389,15 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     state_ps = obs_class.current.players[curr_player]
                     opp_ps = obs_class.current.players[1 - curr_player]
                     
+                    active_pk = state_ps.active[0] if (len(state_ps.active) > 0 and state_ps.active[0] is not None) else None
+                    active_id = active_pk.id if active_pk else -1
+                    active_energies = len(active_pk.energyCards) if active_pk else 0
+                    
+                    bench_list = [p for p in state_ps.bench if p is not None]
+                    bench_ids = [p.id for p in bench_list]
+                    
+                    stadium_id = obs_class.current.stadium[0].id if (len(obs_class.current.stadium) > 0 and obs_class.current.stadium[0] is not None) else -1
+                    
                     pre_metrics = {
                         "prizes": len(state_ps.prize),
                         "opp_prizes": len(opp_ps.prize),
@@ -396,9 +405,16 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         "active_energy": count_active_energy(state_ps),
                         "pokemon": count_pokemon(state_ps),
                         "opp_pokemon": count_pokemon(opp_ps),
-                        "bench_size": len([p for p in state_ps.bench if p is not None]),
+                        "bench_size": len(bench_list),
                         "deck_size": state_ps.deckCount,
-                        "energy_attached_flag": obs_class.current.energyAttached
+                        "energy_attached_flag": obs_class.current.energyAttached,
+                        "active_id": active_id,
+                        "active_energies": active_energies,
+                        "stadium_id": stadium_id,
+                        "bench_ids": bench_ids,
+                        "hand_size": len(state_ps.hand) if state_ps.hand is not None else 0,
+                        "discard_size": len(state_ps.discard) if state_ps.discard is not None else 0,
+                        "turn": obs_class.current.turn
                     }
     
                     if curr_player == 0:
@@ -406,13 +422,50 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         sample.pred_val = sample.value
                         
                         opt_type_val = -1
+                        played_card_id = -1
+                        attached_card_id = -1
+                        attached_target_id = -1
+                        evolved_card_id = -1
+                        attack_id = -1
                         if selected and len(selected) > 0:
                             sel_idx = selected[0]
                             options = obs.get("select", {}).get("option", [])
                             if sel_idx < len(options):
-                                opt_type_val = options[sel_idx].get("type", -1)
-                                
+                                opt = options[sel_idx]
+                                opt_type_val = opt.get("type", -1)
+                                if opt_type_val == 7: # PLAY
+                                    hand = state_ps.hand
+                                    card_idx = opt.get("index", -1)
+                                    if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
+                                        played_card_id = hand[card_idx].id
+                                elif opt_type_val == 8: # ATTACH
+                                    hand = state_ps.hand
+                                    card_idx = opt.get("index", -1)
+                                    if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
+                                        attached_card_id = hand[card_idx].id
+                                    # Get target pokemon ID
+                                    target_area = opt.get("inPlayArea", -1)
+                                    target_idx = opt.get("inPlayIndex", -1)
+                                    if target_area == 4: # ACTIVE
+                                        if len(state_ps.active) > 0 and state_ps.active[0] is not None:
+                                            attached_target_id = state_ps.active[0].id
+                                    elif target_area == 5: # BENCH
+                                        if 0 <= target_idx < len(state_ps.bench) and state_ps.bench[target_idx] is not None:
+                                            attached_target_id = state_ps.bench[target_idx].id
+                                elif opt_type_val == 9: # EVOLVE
+                                    hand = state_ps.hand
+                                    card_idx = opt.get("index", -1)
+                                    if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
+                                        evolved_card_id = hand[card_idx].id
+                                elif opt_type_val == 13: # ATTACK
+                                    attack_id = opt.get("attackId", -1)
+                                    
                         pre_metrics["action_type"] = opt_type_val
+                        pre_metrics["played_card_id"] = played_card_id
+                        pre_metrics["attached_card_id"] = attached_card_id
+                        pre_metrics["attached_target_id"] = attached_target_id
+                        pre_metrics["evolved_card_id"] = evolved_card_id
+                        pre_metrics["attack_id"] = attack_id
                         samples[0].append((sample, pre_metrics))
                         
                         if selected and len(selected) > 0:
@@ -447,13 +500,50 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             sample.pred_val = sample.value
                             
                             opt_type_val = -1
+                            played_card_id = -1
+                            attached_card_id = -1
+                            attached_target_id = -1
+                            evolved_card_id = -1
+                            attack_id = -1
                             if selected and len(selected) > 0:
                                 sel_idx = selected[0]
                                 options = obs.get("select", {}).get("option", [])
                                 if sel_idx < len(options):
-                                    opt_type_val = options[sel_idx].get("type", -1)
-                                    
+                                    opt = options[sel_idx]
+                                    opt_type_val = opt.get("type", -1)
+                                    if opt_type_val == 7: # PLAY
+                                        hand = state_ps.hand
+                                        card_idx = opt.get("index", -1)
+                                        if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
+                                            played_card_id = hand[card_idx].id
+                                    elif opt_type_val == 8: # ATTACH
+                                        hand = state_ps.hand
+                                        card_idx = opt.get("index", -1)
+                                        if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
+                                            attached_card_id = hand[card_idx].id
+                                        # Get target pokemon ID
+                                        target_area = opt.get("inPlayArea", -1)
+                                        target_idx = opt.get("inPlayIndex", -1)
+                                        if target_area == 4: # ACTIVE
+                                            if len(state_ps.active) > 0 and state_ps.active[0] is not None:
+                                                attached_target_id = state_ps.active[0].id
+                                        elif target_area == 5: # BENCH
+                                            if 0 <= target_idx < len(state_ps.bench) and state_ps.bench[target_idx] is not None:
+                                                attached_target_id = state_ps.bench[target_idx].id
+                                    elif opt_type_val == 9: # EVOLVE
+                                        hand = state_ps.hand
+                                        card_idx = opt.get("index", -1)
+                                        if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
+                                            evolved_card_id = hand[card_idx].id
+                                    elif opt_type_val == 13: # ATTACK
+                                        attack_id = opt.get("attackId", -1)
+                                        
                             pre_metrics["action_type"] = opt_type_val
+                            pre_metrics["played_card_id"] = played_card_id
+                            pre_metrics["attached_card_id"] = attached_card_id
+                            pre_metrics["attached_target_id"] = attached_target_id
+                            pre_metrics["evolved_card_id"] = evolved_card_id
+                            pre_metrics["attack_id"] = attack_id
                             samples[1].append((sample, pre_metrics))
                         elif opp_model is not None:
                             selected, sample = mcts_agent(obs, curr_deck, opp_model, search_count=120)
@@ -478,7 +568,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
             processed_samples = []
             rc_worker = {"prize_taken": 0.0, "prize_lost": 0.0, "kos": 0.0, "own_kos": 0.0,
                          "energy": 0.0, "bench": 0.0, "deckout": 0.0, "terminal": 0.0, "stall": 0.0,
-                         "no_energy": 0.0}
+                         "no_energy": 0.0, "strategic": 0.0}
             
             for i in range(2):
                 player_samples = samples[i]
@@ -487,11 +577,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     continue
                     
                 if i == result:
-                    terminal_reward = 1.0
+                    terminal_reward = 2.0
                 elif result in [2, -1]:
-                    terminal_reward = -2.0  # Penalize draws/timeouts to prevent stalling collapse
+                    terminal_reward = -5.0  # Neutral reward for draws/timeouts (anti-stall is handled by r_stall)
                 else:
-                    terminal_reward = -1.0
+                    terminal_reward = -5.0
                     
                 rewards = []
                 for step_idx in range(n_steps):
@@ -503,6 +593,13 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         final_obs = to_observation_class(obs)
                         final_ps = final_obs.current.players[i]
                         final_opp_ps = final_obs.current.players[1 - i]
+                        final_active_pk = final_ps.active[0] if (len(final_ps.active) > 0 and final_ps.active[0] is not None) else None
+                        final_active_id = final_active_pk.id if final_active_pk else -1
+                        final_active_energies = len(final_active_pk.energyCards) if final_active_pk else 0
+                        final_bench_list = [p for p in final_ps.bench if p is not None]
+                        final_bench_ids = [p.id for p in final_bench_list]
+                        final_stadium_id = final_obs.current.stadium[0].id if (len(final_obs.current.stadium) > 0 and final_obs.current.stadium[0] is not None) else -1
+                        
                         post = {
                             "prizes": len(final_ps.prize),
                             "opp_prizes": len(final_opp_ps.prize),
@@ -510,9 +607,16 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             "active_energy": count_active_energy(final_ps),
                             "pokemon": count_pokemon(final_ps),
                             "opp_pokemon": count_pokemon(final_opp_ps),
-                            "bench_size": len([p for p in final_ps.bench if p is not None]),
+                            "bench_size": len(final_bench_list),
                             "deck_size": final_ps.deckCount,
-                            "energy_attached_flag": True
+                            "energy_attached_flag": True,
+                            "active_id": final_active_id,
+                            "active_energies": final_active_energies,
+                            "stadium_id": final_stadium_id,
+                            "bench_ids": final_bench_ids,
+                            "hand_size": len(final_ps.hand) if final_ps.hand is not None else 0,
+                            "discard_size": len(final_ps.discard) if final_ps.discard is not None else 0,
+                            "turn": final_obs.current.turn
                         }
                     
                     prizes_taken = pre["prizes"] - post["prizes"]
@@ -536,25 +640,124 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         r_en += active_energy_attached * 0.10  # Reduced from 0.50 to prevent over-focus
                     if bench_energy_attached > 0:
                         r_en += bench_energy_attached * 0.02   # Reduced from 0.03
-                    if energy_attached < 0:
-                        r_en += energy_attached * 0.02         # Penalty for losing energy
                         
-                    # Reward direct attack action type (13)
-                    r_attack = 0.15 if pre.get("action_type") == 13 else 0.0
+                    # Principal RL Scientist - Optimized Mewtwo ex Reward Shaping
+                    r_strategic = 0.0
+                    action_type = pre.get("action_type", -1)
+                    
+                    # 1. Stadium Establishment
+                    if pre.get("stadium_id") != 1257 and post.get("stadium_id") == 1257:
+                        r_strategic += 0.20  # Encourage establishing Team Rocket's Factory
+                    
+                    # 2. Action Heuristics & Search Efficiency & Sequencing
+                    if action_type == 7:  # PLAY
+                        played_id = pre.get("played_card_id", -1)
+                        # Board development: play Tarountula or Mewtwo ex to bench
+                        if played_id in [400, 431]:
+                            r_strategic += 0.10
+                        # Search efficiency: playing Transceiver (1134), Ariana (1216), or Ultra Ball (1121)
+                        elif played_id in [1134, 1216, 1121]:
+                            # Playing search cards should recover/increase hand size via the search
+                            # Ultra Ball costs 3 cards (ball + 2 discards). Net hand change if successful should be >= -1 (discards 2, adds 1)
+                            expected_min_diff = -1 if played_id == 1121 else 0
+                            hand_diff = post["hand_size"] - pre["hand_size"]
+                            if hand_diff >= expected_min_diff:
+                                r_strategic += 0.15  # Successful search
+                            else:
+                                r_strategic -= 0.15  # Dead supporter or failed search penalty
+                        # Correct use of Energy Switch (1116)
+                        elif played_id == 1116:
+                            if post["active_energies"] > pre["active_energies"]:
+                                r_strategic += 0.15
+                            else:
+                                r_strategic -= 0.10  # Wasteful Energy Switch usage
+                        # General Supporter dead usage penalty
+                        elif played_id in [1217, 1218, 1219, 1220, 1227]:
+                            hand_diff = post["hand_size"] - pre["hand_size"]
+                            if hand_diff < 0:
+                                r_strategic -= 0.10  # Spent supporter but gained nothing
+                        else:
+                            r_strategic += 0.02  # General play card reward
+                            
+                    elif action_type == 8:  # ATTACH
+                        attached_id = pre.get("attached_card_id", -1)
+                        target_id = pre.get("attached_target_id", -1)
+                        # Efficient Team Rocket Energy usage
+                        if attached_id == 15:  # Team Rocket's Energy
+                            if target_id in [431, 401]:  # Mewtwo ex or Spidops
+                                r_strategic += 0.20  # High efficiency reward
+                            elif target_id in [414, 272]:  # Articuno or Clefairy (non-Rocket or utility)
+                                r_strategic -= 0.15  # Penalty for wasting Rocket Energy
+                        # Proper basic energy attachment
+                        elif attached_id == 5:  # Psychic Energy
+                            if target_id == 431:  # Mewtwo ex
+                                r_strategic += 0.15
+                            else:
+                                r_strategic += 0.05
+                        elif attached_id == 1:  # Grass Energy
+                            if target_id in [400, 401]:  # Tarountula or Spidops
+                                r_strategic += 0.15
+                            else:
+                                r_strategic += 0.05
+                                
+                    elif action_type == 9:  # EVOLVE
+                        evolved_id = pre.get("evolved_card_id", -1)
+                        if evolved_id == 401:  # Spidops
+                            r_strategic += 0.25  # Evolving Spidops is crucial mid-game
+                        else:
+                            r_strategic += 0.15
+                            
+                    elif action_type == 10:  # ABILITY
+                        r_strategic += 0.05  # Encourage using abilities (e.g. Spidops or Factory)
                         
+                    elif action_type == 12:  # RETREAT
+                        # Unnecessary retreat penalty (retreating a healthy, fully-charged Mewtwo)
+                        if pre.get("active_id") == 431 and pre.get("active_energies", 0) >= 3:
+                            r_strategic -= 0.15
+                            
+                    elif action_type == 13:  # ATTACK
+                        att_id = pre.get("attack_id", -1)
+                        if att_id == 608:  # Erasure Ball
+                            # Premature Mewtwo attack penalty
+                            if pre.get("active_energies", 0) < 3:
+                                r_strategic -= 0.10
+                            else:
+                                r_strategic += 0.25
+                        elif att_id == 560:  # Rocket Rush
+                            r_strategic += 0.20
+                        else:
+                            r_strategic += 0.15
+                            
+                    # 3. Bench Quality & Overextension Management
                     r_bench = 0.0
-                    if post["bench_size"] <= 1:
-                        r_bench -= 0.02
-                    if pre["bench_size"] <= 1 and (post["bench_size"] > pre["bench_size"]):
-                        r_bench += 0.10
+                    if post["bench_size"] == 0:
+                        r_bench -= 0.10  # Empty bench penalty (high risk of bench-out KO)
+                    elif 2 <= post["bench_size"] <= 4:
+                        r_bench += 0.05  # Optimal board development reward
+                    elif post["bench_size"] == 5:
+                        r_bench -= 0.02  # Overextension penalty (leaves no room for utility/finishers)
+                        
+                    # 4. Proper Mewtwo Timing & Charging
+                    if post.get("active_id") == 431:
+                        if post.get("active_energies", 0) < 2:
+                            r_strategic -= 0.15  # Penalty for having a weak/undercharged Mewtwo active
+                        elif post.get("active_energies", 0) >= 3:
+                            r_strategic += 0.10  # Reward for maintaining a fully charged Mewtwo active
+                            
+                    # 5. Maintaining Multiple Attackers (Backup Attacker)
+                    has_backup_attacker = False
+                    for b_id in post.get("bench_ids", []):
+                        if b_id in [431, 401]:  # Benched Mewtwo ex or Spidops
+                            has_backup_attacker = True
+                            break
+                    if has_backup_attacker and (post["energy"] - post.get("active_energies", 0)) >= 2:
+                        r_strategic += 0.08  # Reward for backup attacker development
                         
                     r_deck = 0.0
-                    if post["deck_size"] <= 3:
-                        r_deck -= 0.10
-                    elif post["deck_size"] <= 5:
-                        r_deck -= 0.04
+                    if post["deck_size"] == 0:
+                        r_deck -= 0.50  # Penalize imminent deckout only
                         
-                    step_reward = r_stall + r_prize_t - r_prize_l + r_ko - r_own_ko + r_en + r_bench + r_deck + r_attack
+                    step_reward = r_stall + r_prize_t - r_prize_l + r_ko - r_own_ko + r_en + r_bench + r_deck + r_strategic
                     
                     if i == 0:
                         rc_worker["prize_taken"] += r_prize_t
@@ -565,6 +768,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         rc_worker["bench"] += r_bench
                         rc_worker["deckout"] += r_deck
                         rc_worker["stall"] += r_stall
+                        rc_worker["strategic"] += r_strategic
                         
                     rewards.append(step_reward)
                     
@@ -894,7 +1098,7 @@ def main():
         writer = csv.writer(f)
         writer.writerow(["epoch", "win_rate", "avg_loss", "avg_reward",
                          "r_prize_taken", "r_prize_lost", "r_kos", "r_own_kos",
-                         "r_energy", "r_bench", "r_deckout", "r_terminal", "r_stall", "r_no_energy",
+                         "r_energy", "r_bench", "r_deckout", "r_terminal", "r_stall", "r_no_energy", "r_strategic",
                          "avg_game_length", "policy_entropy"])
 
     deck_matchup_path = os.path.join(run_dir, "deck_matchup.csv")
@@ -1019,7 +1223,7 @@ def main():
         epoch_action_counts = {"attack": 0, "play": 0, "attach": 0, "evolve": 0, "ability": 0, "retreat": 0, "end": 0, "other": 0}
         rc = {"prize_taken": 0.0, "prize_lost": 0.0, "kos": 0.0, "own_kos": 0.0,
               "energy": 0.0, "bench": 0.0, "deckout": 0.0, "terminal": 0.0, "stall": 0.0,
-              "no_energy": 0.0}
+              "no_energy": 0.0, "strategic": 0.0}
         rc_count = 0
         total_game_length = 0
         total_games = 0
@@ -1069,6 +1273,8 @@ def main():
             games_received = 0
             active_tasks = {}
             active_elo = league_elos.get("active", 1500.0)
+            league_completed = 0
+            league_failed = 0
             
             league_checkpoints = [
                 os.path.join(league_dir, f) for f in os.listdir(league_dir) if f.endswith(".pth")
@@ -1130,6 +1336,12 @@ def main():
                             
                     opp_name, opp_type, opp_path = active_tasks[w_idx]
                     
+                    if opp_type == "League":
+                        if result >= 0:
+                            league_completed += 1
+                        else:
+                            league_failed += 1
+                    
                     # Append game outcome and action distribution to self_play_games.csv
                     with open(self_play_games_path, mode="a", newline="", encoding="utf-8-sig") as f_sp:
                         sp_writer = csv.writer(f_sp)
@@ -1188,6 +1400,7 @@ def main():
                         league_elos["active"] = active_elo
                         league_elos[opp_name_file] = opp_elo
                         
+                        os.makedirs(os.path.dirname(elo_path), exist_ok=True)
                         with open(elo_path, "w", newline="", encoding="utf-8") as f:
                             writer = csv.writer(f)
                             writer.writerow(["checkpoint", "elo"])
@@ -1221,6 +1434,8 @@ def main():
             wr = (epoch_self_play_wins / epoch_self_play_games * 100.0) if epoch_self_play_games > 0 else 0.0
             avg_turns = (total_game_length / total_games) if total_games > 0 else 0.0
             pbar.update(args.self_play_episodes, suffix=f"WinRate: {wr:.1f}% | AvgTurns: {avg_turns:.1f}")
+            if league_completed > 0 or league_failed > 0:
+                print(f"\n  -> League self-play stats: {league_completed} games completed successfully, {league_failed} games failed.")
         else:
             print("Skipping self-play data collection (self-play-episodes=0).")
 
@@ -1360,7 +1575,7 @@ def main():
                              rc["kos"] / rc_div, rc["own_kos"] / rc_div,
                              rc["energy"] / rc_div, rc["bench"] / rc_div,
                              rc["deckout"] / rc_div, rc["terminal"] / max(1, total_games),
-                             rc["stall"] / rc_div, rc["no_energy"] / rc_div, avg_gl,
+                             rc["stall"] / rc_div, rc["no_energy"] / rc_div, rc["strategic"] / rc_div, avg_gl,
                              avg_entropy])
         
         with open(deck_matchup_path, mode="a", newline="", encoding="utf-8-sig") as f:

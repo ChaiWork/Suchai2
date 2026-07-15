@@ -231,7 +231,7 @@ class MyModel(torch.nn.Module):
         device = index_encoder.device
 
         # Project card features
-        proj_features = self.feature_projection(self.card_features)  # (card_count, d_model)
+        proj_features = self.feature_projection(self.card_features.to(device))  # (card_count, d_model)
         # Pad with zero features at index card_count for -1 mapping
         proj_features_padded = torch.cat([
             proj_features,
@@ -239,8 +239,8 @@ class MyModel(torch.nn.Module):
         ], dim=0)
 
         # Map to vocabulary spaces
-        enc_feat = proj_features_padded[self.encoder_card_map]  # (encoder_size, d_model)
-        dec_feat = proj_features_padded[self.decoder_card_map]  # (decoder_size, d_model)
+        enc_feat = proj_features_padded[self.encoder_card_map.to(device)]  # (encoder_size, d_model)
+        dec_feat = proj_features_padded[self.decoder_card_map.to(device)]  # (decoder_size, d_model)
 
         # Combine learnable embeddings and card features
         enc_weight = self.encoder_bag.weight + enc_feat

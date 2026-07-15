@@ -418,7 +418,7 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     if len(root.children) > 0:
         dir_alpha = 0.3  # TCG has moderate action space
         turn = state.turn if (state is not None) else 0
-        noise_frac = 0.25
+        noise_frac = 0.40
         noise = [random.gammavariate(dir_alpha, 1.0) for _ in root.children]
         noise_sum = sum(noise) + 1e-8
         noise = [n / noise_sum for n in noise]

@@ -142,6 +142,9 @@ def plot_reward_breakdown(data, output_dir):
         "Energy": ("r_energy", ACCENT_COLORS[3]),
         "Bench": ("r_bench", ACCENT_COLORS[1]),
         "Deck-Out": ("r_deckout", ACCENT_COLORS[6]),
+        "Stall": ("r_stall", "#4ecdc4"),
+        "No Energy": ("r_no_energy", "#a29bfe"),
+        "Strategic": ("r_strategic", "#fd79a8"),
     }
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7), gridspec_kw={"width_ratios": [2, 1]})
@@ -414,6 +417,9 @@ def plot_strategy_report(data, deck_data, action_data, output_dir):
         ("r_own_kos", "KOs-", ACCENT_COLORS[5]),
         ("r_energy", "Energy", ACCENT_COLORS[3]),
         ("r_bench", "Bench", ACCENT_COLORS[6]),
+        ("r_strategic", "Strategic", "#fd79a8"),
+        ("r_stall", "Stall", "#4ecdc4"),
+        ("r_no_energy", "No Energy", "#a29bfe"),
     ]
     for key, label, color in step_components:
         vals = data.get(key, [])
