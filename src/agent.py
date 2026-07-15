@@ -221,11 +221,59 @@ def create_node(parent: Node | None,
         node.value = v
         node.backprop(v)
 
+        # Apply a prior bias to guide MCTS exploration towards constructive actions
+        has_constructive = False
+        for opt in options:
+            if opt.type in [OptionType.ATTACK, OptionType.ATTACH, OptionType.EVOLVE, OptionType.PLAY, OptionType.ABILITY]:
+                has_constructive = True
+                break
+
+        policy_biased = list(policy)
+        for i in range(len(policy_biased)):
+            bias = 0.0
+            has_attack = False
+            has_attach = False
+            has_evolve = False
+            has_play = False
+            has_ability = False
+            has_end = False
+            
+            for opt_idx in actions[i]:
+                if opt_idx < len(options):
+                    opt = options[opt_idx]
+                    if opt.type == OptionType.ATTACK:
+                        has_attack = True
+                    elif opt.type == OptionType.ATTACH:
+                        has_attach = True
+                    elif opt.type == OptionType.EVOLVE:
+                        has_evolve = True
+                    elif opt.type == OptionType.PLAY:
+                        has_play = True
+                    elif opt.type == OptionType.ABILITY:
+                        has_ability = True
+                    elif opt.type == OptionType.END:
+                        has_end = True
+            
+            if has_attack:
+                bias += 2.0
+            if has_evolve:
+                bias += 1.5
+            if has_attach:
+                bias += 1.2
+            if has_ability:
+                bias += 0.8
+            if has_play:
+                bias += 0.5
+            if has_end and has_constructive:
+                bias -= 1.0  # Penalize passing turn if constructive actions are possible
+                
+            policy_biased[i] += bias
+
         # Convert raw logits to probabilities via numerically stable softmax
-        max_logit = max(policy)
+        max_logit = max(policy_biased)
         prob_sum = 0.0
-        for i in range(len(policy)):
-            p = math.exp(policy[i] - max_logit)  # Numerically stable softmax
+        for i in range(len(policy_biased)):
+            p = math.exp(policy_biased[i] - max_logit)  # Numerically stable softmax
             node.children.append(Child(actions[i], p))
             prob_sum += p
         for c in node.children:
