@@ -177,6 +177,9 @@ def rule_based_opponent_agent(opponent_name, obs):
     elif opponent_name == "Rulebasedmodel_Mewtwo_Easy":
         from Rulebasedmodel.mewtwo_agent_easy import agent
         return agent(obs)
+    elif opponent_name == "Rulebasedmodel_Abomasnow":
+        from Rulebasedmodel.abomasnow_agent import agent
+        return agent(obs)
     raise ValueError(f"Unknown rule-based opponent: {opponent_name}")
 
 
@@ -511,7 +514,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 else:
                                     action_counts["other"] += 1
                     else:
-                        if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Easy"]:
+                        if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Abomasnow"]:
                             try:
                                 selected = rule_based_opponent_agent(opponent_name, obs)
                             except Exception as e:
@@ -707,10 +710,25 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             else:
                                 r_strategic -= 0.05
                         # General Supporter dead usage penalty
-                        elif played_id in [1217, 1218, 1219, 1227]:
+                        elif played_id in [1217, 1219, 1227]:  # Exclude Giovanni (1218)
                             hand_diff = post["hand_size"] - pre["hand_size"]
                             if hand_diff < 0:
                                 r_strategic -= 0.05
+                        elif played_id == 1218:  # Giovanni
+                            # Reward using Giovanni to switch to a fully charged benched Mewtwo ex or Spidops
+                            # if active is currently weak or a non-attacker (e.g. Articuno/Mimikyu or Mewtwo ex undercharged).
+                            benched_ids = pre.get("bench_ids", [])
+                            bench_energy = pre.get("energy", 0) - pre.get("active_energy", 0)
+                            active_charged = (pre.get("active_id") == 431 and pre.get("active_energy", 0) >= 3) or (pre.get("active_id") == 401 and pre.get("active_energy", 0) >= 2)
+                            
+                            has_bench_attacker = False
+                            for bid in benched_ids:
+                                if bid in [431, 401]:
+                                    has_bench_attacker = True
+                                    break
+                            
+                            if has_bench_attacker and bench_energy >= 2 and not active_charged:
+                                r_strategic += 0.25  # Strategic Giovanni play reward!
                         else:
                             r_strategic += 0.02
                             
@@ -718,12 +736,20 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         attached_id = pre.get("attached_card_id", -1)
                         target_id = pre.get("attached_target_id", -1)
                         
+                        # Articuno and Mimikyu are defensive/barrier blockers and should not get energy attachments
+                        if target_id in [414, 434] and attached_id in [1, 5, 15]:
+                            if attached_id == 15:
+                                r_strategic -= 0.25  # Severe penalty for wasting Special Energy on blockers
+                            else:
+                                r_strategic -= 0.15  # Penalty for attaching basic energy to blockers
+                                
                         # Efficient Team Rocket Energy usage
-                        if attached_id == 15:  # Team Rocket's Energy
+                        elif attached_id == 15:  # Team Rocket's Energy
                             if target_id in [431, 401]:  # Mewtwo ex or Spidops
                                 r_strategic += 0.25  # Boosted efficiency
                             elif target_id in [414, 272]:
                                 r_strategic -= 0.05  # Wasting Special Energy
+                                
                         # Proper basic energy attachment
                         elif attached_id == 5:  # Psychic Energy
                             if target_id == 431:  # Mewtwo ex
@@ -735,6 +761,20 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 r_strategic += 0.20
                             else:
                                 r_strategic += 0.05
+                                
+                        # Tool Optimizations
+                        elif attached_id == 1175:  # Brave Bangle
+                            # Reward attaching to Active Spidops facing an ex opponent
+                            if target_id == 401 and pre.get("opp_active_id") in [431, 272] and target_id == pre.get("active_id"):
+                                r_strategic += 0.20
+                            else:
+                                r_strategic -= 0.05
+                        elif attached_id == 1158:  # Maximum Belt
+                            # Reward attaching to Active Mewtwo ex facing an ex opponent
+                            if target_id == 431 and pre.get("opp_active_id") in [431, 272] and target_id == pre.get("active_id"):
+                                r_strategic += 0.25
+                            else:
+                                r_strategic -= 0.05
                                 
                     elif action_type == 9:  # EVOLVE
                         evolved_id = pre.get("evolved_card_id", -1)
@@ -751,6 +791,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         # Strategic retreat from Mimikyu ex-immunity
                         if pre.get("opp_active_id") == 434 and pre.get("active_id") in [431, 272] and post.get("active_id") not in [431, 272]:
                             r_strategic += 0.30  # Excellent retreat to non-ex attacker against Mimikyu!
+                        # Defensive retreat to Mimikyu barrier to stall and set up
+                        elif post.get("active_id") == 434:
+                            if pre.get("active_id") in [431, 401] and pre.get("active_energies", 0) < 3:
+                                r_strategic += 0.20
                         elif pre.get("active_id") == 431 and pre.get("active_energies", 0) >= 3:
                             r_strategic -= 0.05
                             
@@ -764,12 +808,13 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         opp_immune = (pre.get("opp_active_id") == 434 and pre.get("active_id") in [431, 272])
                         
                         if has_attack and not opp_immune:
-                            r_strategic -= 2.0  # Heavy penalty for not attacking when we have active energy
+                            r_strategic -= 5.0  # Massive penalty for stalling when we can attack!
                         elif has_attach and not energy_already_attached:
-                            r_strategic -= 1.0  # Penalty for leaving energy in hand unattached
+                            r_strategic -= 3.0  # Big penalty for leaving energy in hand unattached
                         else:
                             # Good decision: we ended the turn because we had no constructive moves remaining
-                            r_strategic += 0.2  # Reward for good pass, offsetting the stall penalty
+                            # We can stall/pass until we find the suitable cards to win
+                            r_strategic += 0.3  # Reward for good pass, offsetting flat stall penalty
                             
                     elif action_type == 13:  # ATTACK
                         att_id = pre.get("attack_id", -1)
@@ -892,7 +937,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 if obs["current"]["yourIndex"] == your_index:
                     selected, _ = mcts_agent(obs, sample_deck, client)
                 else:
-                    if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Easy"]:
+                    if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Abomasnow"]:
                         try:
                             selected = rule_based_opponent_agent(opponent_name, obs)
                         except Exception as e:
@@ -1072,7 +1117,7 @@ def main():
 
     opponent_decks = load_all_decks()
     # Filter opponent decks to exclude inefficient random agent models
-    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo"]}
+    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo","Rulebasedmodel_Abomasnow"]}
     if not opponent_decks:
         raise ValueError("No valid deck.csv found in root or subdirectories.")
         
