@@ -4,6 +4,7 @@ import os
 import random
 import sys
 import torch
+from collections import Counter
 
 """
 RL Strategy: Pokémon TCG AI Agent
@@ -410,10 +411,14 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     revealed_ids = get_opponent_revealed_card_ids(obs, opp_index)
     matched_deck = identify_opponent_deck(revealed_ids, OPPONENT_DECKS)
     
-    remaining_cards = matched_deck.copy()
+    # Use Counter for O(1) per-card removal instead of O(n) list.remove()
+    remaining_counter = Counter(matched_deck)
     for cid in revealed_ids:
-        if cid in remaining_cards:
-            remaining_cards.remove(cid)
+        if remaining_counter.get(cid, 0) > 0:
+            remaining_counter[cid] -= 1
+    remaining_cards = []
+    for cid, cnt in remaining_counter.items():
+        remaining_cards.extend([cid] * cnt)
     random.shuffle(remaining_cards)
     
     deck_count = state.players[opp_index].deckCount
@@ -429,12 +434,15 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     opp_prize_sampled = remaining_cards[deck_count:deck_count + prize_count]
     opp_hand_sampled = remaining_cards[deck_count + prize_count:deck_count + prize_count + hand_count]
     
-    # Sample own hidden zones correctly
-    own_remaining = your_deck.copy()
+    # Sample own hidden zones correctly — Counter for O(1) per-card removal
+    own_counter = Counter(your_deck)
     own_visible = get_own_visible_card_ids(obs, your_index)
     for cid in own_visible:
-        if cid in own_remaining:
-            own_remaining.remove(cid)
+        if own_counter.get(cid, 0) > 0:
+            own_counter[cid] -= 1
+    own_remaining = []
+    for cid, cnt in own_counter.items():
+        own_remaining.extend([cid] * cnt)
     random.shuffle(own_remaining)
     
     own_prize_count = len(state.players[your_index].prize)
@@ -489,15 +497,15 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
         current = root
         while True:
             value = -1e9
-            # Dynamic PUCT Exploration
-            c = 1.25 * math.sqrt(current.visit)
+            # Dynamic PUCT Exploration — guard against visit=0 on freshly created nodes
+            c = 1.25 * math.sqrt(max(1, current.visit))
             next_child = None
             for child in current.children:
                 visit = 0
                 if child.node is None:
-                    v = current.total / current.visit
+                    v = current.total / max(1, current.visit)
                 else:
-                    v = child.node.total / child.node.visit
+                    v = child.node.total / max(1, child.node.visit)
                     visit = child.node.visit
                 
                 if current.state.observation.current.yourIndex != your_index:
@@ -526,9 +534,19 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
             if max_visit < child.node.visit:
                 max_child = child
                 max_visit = child.node.visit
-            v = child.node.total / child.node.visit
+            v = child.node.total / max(1, child.node.visit)
             if min_value > v:
                 min_value = v
+
+    # Fallback: if no children were visited (e.g. search_count=0), pick highest-prior child
+    if max_child is None and root.children:
+        max_child = max(root.children, key=lambda c: c.prob)
+
+    # Handle terminal root state — sample is None when the game is already over at root
+    if sample is None:
+        search_end()
+        sel = max_child.select if max_child is not None else []
+        return (sel, LearnSample(0.0, [], SparseVector(), SparseVector()))
 
     # Generate targets/labels for training
     # Value target: root mean value

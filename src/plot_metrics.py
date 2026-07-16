@@ -86,7 +86,7 @@ def plot_training_curves(data, output_dir):
     # Win Rate
     axs[0].plot(epochs, win_rates, color=ACCENT_COLORS[0], alpha=0.3, linewidth=1)
     axs[0].plot(epochs, smooth(win_rates), color=ACCENT_COLORS[0], linewidth=2.5, label="Win Rate (smoothed)")
-    if win_rates:
+    if win_rates and len(epochs) > 1:
         best_idx = win_rates.index(max(win_rates))
         axs[0].annotate(f"Best: {win_rates[best_idx]:.1f}%",
                         xy=(epochs[best_idx], win_rates[best_idx]),

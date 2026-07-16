@@ -603,13 +603,19 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 num_attacks = sum(1 for _, pre in player_samples if pre.get("action_type") == 13)
                 if i == result:
                     if num_attacks == 0:
-                        terminal_reward = 0.0  # Mild penalty (neutral reward) to preserve the reward gradient
+                        # Still reward a win even without attacks (e.g. deck-out, prize KO via ability).
+                        # 0.0 was silencing the win signal entirely — agent never learned winning is good.
+                        # 2.0 keeps a positive gradient while reserving the full +5 bonus for attack-led wins.
+                        terminal_reward = 2.0
                     else:
                         terminal_reward = 5.0
-                elif result in [2, -1]:
-                    terminal_reward = -5.0  # Neutral reward for draws/timeouts (anti-stall is handled by r_stall)
+                elif result == 2:
+                    terminal_reward = 0.0   # Draw: neutral outcome — not penalised like a loss
+                elif result == -1:
+                    terminal_reward = -5.0  # Error/invalid game — treat as loss
                 else:
                     terminal_reward = -5.0
+
                     
                 rewards = []
                 for step_idx in range(n_steps):
@@ -896,7 +902,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     
                 for step_idx in range(n_steps):
                     sample_obj, _ = player_samples[step_idx]
-                    sample_obj.value = max(-1.0, min(1.0, returns[step_idx]))
+                    # Widen clip to ±5 so terminal reward (±5.0) signal survives the GAE return
+                    sample_obj.value = max(-5.0, min(5.0, returns[step_idx]))
                     td_error = returns[step_idx] - sample_obj.pred_val
                     processed_samples.append((sample_obj, td_error))
 
@@ -1116,8 +1123,8 @@ def main():
         torch.cuda.manual_seed_all(SEED)
 
     opponent_decks = load_all_decks()
-    # Filter opponent decks to exclude inefficient random agent models
-    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo","Rulebasedmodel_Abomasnow"]}
+    # Filter opponent decks to exclude inefficient random agent models ,"Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo",
+    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Abomasnow"]}
     if not opponent_decks:
         raise ValueError("No valid deck.csv found in root or subdirectories.")
         
@@ -1139,13 +1146,15 @@ def main():
     )
     
     checkpoint_path = "model.pth"
+    start_epoch = 0  # Tracks loaded checkpoint epoch for LR schedule resume
     if os.path.exists(checkpoint_path):
         print(f"Loading existing model weights from {checkpoint_path}")
         try:
             checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
             if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
                 model.load_state_dict(checkpoint["state_dict"], strict=False)
-                print(f"  -> Successfully loaded checkpoint from epoch {checkpoint.get('epoch', 0)}")
+                start_epoch = checkpoint.get('epoch', 0)
+                print(f"  -> Successfully loaded checkpoint from epoch {start_epoch}")
             else:
                 model.load_state_dict(checkpoint, strict=False)
         except Exception as e:
@@ -1163,7 +1172,13 @@ def main():
         cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
         # Scale decay between min_lr_ratio and 1.0
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+    # When resuming from a checkpoint (start_epoch > 0), PyTorch requires 'initial_lr'
+    # to already exist in param_groups before LambdaLR can apply its multiplier.
+    # Seed it from the current optimizer lr so the schedule resumes correctly.
+    if start_epoch > 0:
+        for group in optimizer.param_groups:
+            group.setdefault('initial_lr', group['lr'])
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda, last_epoch=start_epoch)
     
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     
@@ -1486,9 +1501,10 @@ def main():
                             elif result == 2:
                                 rolling_wins[opp_name] += 0.5
                                 
-                            for name in train_opponent_names:
-                                rolling_wins[name] *= 0.95
-                                rolling_games[name] *= 0.95
+                            # Decay only the current opponent's rolling stats — not all opponents
+                            # (global decay was incorrectly pushing all win-rates toward 0.5)
+                            rolling_wins[opp_name] *= 0.95
+                            rolling_games[opp_name] *= 0.95
 
                     if opp_path is not None and "model" in os.path.basename(opp_path) and result >= 0:
                         opp_name_file = os.path.basename(opp_path)
@@ -1522,7 +1538,7 @@ def main():
                     for k in rc:
                         if k in rc_worker:
                             rc[k] += rc_worker[k]
-                    rc_count += len(samples) // 2 if len(samples) > 0 else 1
+                    rc_count += len(samples) if len(samples) > 0 else 1
                     total_game_length += final_turn
                     total_games += 1
                     
@@ -1548,12 +1564,14 @@ def main():
             print("Skipping self-play data collection (self-play-episodes=0).")
 
         avg_loss = 0.0
+        last_loss_enc_val = 0.0      # Captured per-batch; used for TensorBoard after tensor del
+        last_loss_dec_ce_val = 0.0
         trained_this_epoch = False
         if len(replay_buffer) >= args.batch_size:
             trained_this_epoch = True
             print("Training Start.")
             model.train()
-            batch_count = min(30, len(replay_buffer) // args.batch_size)
+            batch_count = min(50, len(replay_buffer) // args.batch_size)
             print(f"Total training buffer size: {len(replay_buffer)}, Batch Count: {batch_count}")
             
             epoch_losses = []
@@ -1598,7 +1616,7 @@ def main():
                         
                         is_weight_tensor = torch.tensor(is_weights, dtype=torch.float32, device=device).view(args.batch_size, 1)
 
-                        loss_enc_elem = torch.nn.functional.huber_loss(out_enc, label_tensor_enc, reduction="none", delta=0.2)
+                        loss_enc_elem = torch.nn.functional.huber_loss(out_enc, label_tensor_enc, reduction="none", delta=1.0)
                         loss_enc = (loss_enc_elem * is_weight_tensor).mean()
 
                         # Cast decoder output to float32 explicitly for safe log_softmax computation under autocast
@@ -1613,12 +1631,12 @@ def main():
                     if scaler is not None:
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
                         
                 epoch_losses.append(loss.item())
@@ -1627,6 +1645,10 @@ def main():
                 if isinstance(errors, float):
                     errors = [errors]
                 replay_buffer.update_priorities(indices, errors)
+
+                # Capture scalar values before freeing tensors — TensorBoard logging uses these below
+                last_loss_enc_val = loss_enc.item()
+                last_loss_dec_ce_val = loss_dec_ce.item()
 
                 # Explicitly free training tensors each step to avoid
                 # accumulating GPU/CPU memory across batch iterations.
@@ -1711,8 +1733,8 @@ def main():
         
         active_elo = league_elos.get("active", 1500.0)
         if tb_writer is not None:
-            tb_writer.add_scalar("Loss/Policy", loss_dec_ce.item() if 'loss_dec_ce' in locals() else 0.0, counter)
-            tb_writer.add_scalar("Loss/Value", loss_enc.item() if 'loss_enc' in locals() else 0.0, counter)
+            tb_writer.add_scalar("Loss/Policy", last_loss_dec_ce_val, counter)  # last training batch value
+            tb_writer.add_scalar("Loss/Value",  last_loss_enc_val,    counter)  # last training batch value
             tb_writer.add_scalar("MCTS/AverageDepth", avg_gl, counter)
             tb_writer.add_scalar("MCTS/Entropy", avg_entropy, counter)
             tb_writer.add_scalar("League/ActiveElo", active_elo, counter)
