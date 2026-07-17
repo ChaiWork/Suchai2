@@ -968,27 +968,93 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                     
                             # Special energy attachment logic
                             elif attached_card.cardType == CardType.SPECIAL_ENERGY:
+                                current_energy = 0
+                                if pre.get("active_id") == target_card.cardId:
+                                    current_energy = pre.get("active_energy", 0)
+                                else:
+                                    benched_ids = pre.get("bench_ids", [])
+                                    benched_energies = pre.get("bench_energies", [])
+                                    try:
+                                        b_idx = benched_ids.index(target_card.cardId)
+                                        if b_idx < len(benched_energies):
+                                            current_energy = benched_energies[b_idx]
+                                    except ValueError:
+                                        pass
+
+                                max_attack_cost = 0
+                                for aid in target_card.attacks:
+                                    att = attack_table.get(aid)
+                                    if att is not None:
+                                        max_attack_cost = max(max_attack_cost, len(att.energies))
+
+                                is_fully_charged = current_energy >= max_attack_cost
+
                                 if target_card.cardId in [431, 401]:
-                                    r_strategic += 0.50  # High reward for attaching Special/Double Energy to Mewtwo ex or Spidops ex!
-                                    if pre.get("active_id") != target_card.cardId:
-                                        r_strategic += 0.15  # Extra reward for charging benched attacker
+                                    if is_fully_charged:
+                                        r_strategic -= 1.00  # Penalty for wasting Special Energy on already charged Pokémon!
+                                    else:
+                                        r_strategic += 0.50  # High reward for attaching Special/Double Energy to Mewtwo ex or Spidops ex!
+                                        if pre.get("active_id") != target_card.cardId:
+                                            r_strategic += 0.15  # Extra reward for charging benched attacker
                                 else:
                                     r_strategic -= 2.50  # Severe penalty for wasting Special Energy on non-key attackers
                                     
                             # Basic energy attachment logic
                             elif attached_card.cardType == CardType.BASIC_ENERGY:
-                                if target_card.cardId == 431:
-                                    r_strategic += 0.50  # Strongly encourage manual attachments to Mewtwo ex!
-                                    if pre.get("active_id") != target_card.cardId:
-                                        r_strategic += 0.10  # Charging Mewtwo ex on bench is also good
+                                current_energy = 0
+                                if pre.get("active_id") == target_card.cardId:
+                                    current_energy = pre.get("active_energy", 0)
                                 else:
-                                    target_is_attacker = target_card.ex or target_card.stage1 or target_card.stage2
-                                    if target_is_attacker:
-                                        r_strategic += 0.20
-                                        if pre.get("active_id") != target_card.cardId:
-                                            r_strategic += 0.15
+                                    benched_ids = pre.get("bench_ids", [])
+                                    benched_energies = pre.get("bench_energies", [])
+                                    try:
+                                        b_idx = benched_ids.index(target_card.cardId)
+                                        if b_idx < len(benched_energies):
+                                            current_energy = benched_energies[b_idx]
+                                    except ValueError:
+                                        pass
+
+                                max_attack_cost = 0
+                                for aid in target_card.attacks:
+                                    att = attack_table.get(aid)
+                                    if att is not None:
+                                        max_attack_cost = max(max_attack_cost, len(att.energies))
+
+                                is_fully_charged = current_energy >= max_attack_cost
+
+                                # Mewtwo ex (431) uses Psychic (5) or Special (15) energy. Grass energy (1) is wasted on it.
+                                if target_card.cardId == 431:
+                                    if attached_card.cardId == 5: # Psychic
+                                        if is_fully_charged:
+                                            r_strategic -= 0.50  # Penalty for overcharging Mewtwo ex!
+                                        else:
+                                            r_strategic += 0.50
+                                            if pre.get("active_id") != target_card.cardId:
+                                                r_strategic += 0.10  # Charging Mewtwo ex on bench is also good
+                                    elif attached_card.cardId == 1: # Grass
+                                        r_strategic -= 1.00 # Penalty for wasting Grass energy on Mewtwo ex!
+                                # Spidops/Tarountula (401/400) requires Grass energy (1)
+                                elif target_card.cardId in [401, 400]:
+                                    if attached_card.cardId == 1: # Grass
+                                        if is_fully_charged:
+                                            r_strategic -= 0.50  # Penalty for overcharging Spidops/Tarountula!
+                                        else:
+                                            r_strategic += 0.50
+                                            if pre.get("active_id") != target_card.cardId:
+                                                r_strategic += 0.10  # Charging on bench is also good
+                                    elif attached_card.cardId == 5: # Psychic
+                                        r_strategic -= 0.50
+                                else:
+                                    if is_fully_charged:
+                                        r_strategic -= 0.30
                                     else:
-                                        r_strategic += 0.05
+                                        target_is_attacker = target_card.ex or target_card.stage1 or target_card.stage2
+                                        if target_is_attacker:
+                                            r_strategic += 0.20
+                                            if pre.get("active_id") != target_card.cardId:
+                                                r_strategic += 0.15
+                                        else:
+                                            r_strategic += 0.05
                                     
                             # Tool attachments
                             elif attached_card.cardType == CardType.TOOL:

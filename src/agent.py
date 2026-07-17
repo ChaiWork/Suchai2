@@ -53,6 +53,7 @@ from cg.api import (
     search_step,
     search_end,
     OptionType,
+    SelectContext,
 )
 
 SEARCH_COUNT = 50  # MCTS Search count — need ≥50 for meaningful visit differentiation
@@ -638,10 +639,32 @@ def agent(obs_dict: dict) -> list[int]:
     obs = to_observation_class(obs_dict)
     turn = obs.current.turn if (obs.current is not None) else 0
     
+    # Check if active is walled (Mewtwo ex active against opponent Mimikyu)
+    active_is_walled = False
+    try:
+        your_index = obs.current.yourIndex
+        my_active = obs.current.players[your_index].active
+        opp_active = obs.current.players[1 - your_index].active
+        if my_active and opp_active:
+            if my_active[0].id == 431 and opp_active[0].id == 434:
+                active_is_walled = True
+    except Exception:
+        pass
+
+    # Check if context is MAIN (critical turn-beginning choice)
+    is_main_context = False
+    try:
+        if obs.select is not None and obs.select.context == SelectContext.MAIN:
+            is_main_context = True
+    except Exception:
+        pass
+
     IS_KAGGLE = os.path.exists('/kaggle_simulations/agent') or 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
     if IS_KAGGLE:
         # Lower budget on Kaggle to prevent TIMEOUT on weak CPU
-        if turn <= 3:
+        if active_is_walled or is_main_context:
+            search_count = 35  # Boost budget for critical decisions on Kaggle
+        elif turn <= 3:
             search_count = 20
         elif turn <= 8:
             search_count = 15
@@ -649,7 +672,9 @@ def agent(obs_dict: dict) -> list[int]:
             search_count = 10
     else:
         # Standard local/eval budget
-        if turn <= 3:
+        if active_is_walled or is_main_context:
+            search_count = 180  # Boost budget to 150-200 for critical/walled decisions
+        elif turn <= 3:
             search_count = 150
         elif turn <= 8:
             search_count = 100
