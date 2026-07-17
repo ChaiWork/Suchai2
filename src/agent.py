@@ -256,7 +256,7 @@ def create_node(parent: Node | None,
                         has_end = True
             
             if has_attack:
-                bias += 2.0
+                bias += 5.0
             if has_evolve:
                 bias += 1.5
             if has_attach:
@@ -266,7 +266,7 @@ def create_node(parent: Node | None,
             if has_play:
                 bias += 0.5
             if has_end and has_constructive:
-                bias -= 1.0  # Penalize passing turn if constructive actions are possible
+                bias -= 10.0  # Penalize passing turn if constructive actions are possible
                 
             policy_biased[i] += bias
 

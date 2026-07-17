@@ -476,6 +476,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         "opp_pokemon": count_pokemon(opp_ps),
                         "bench_size": len(bench_list),
                         "deck_size": state_ps.deckCount,
+                        "opp_deck_size": opp_ps.deckCount,
                         "energy_attached_flag": obs_class.current.energyAttached,
                         "active_id": active_id,
                         "active_energies": active_energies,
@@ -710,6 +711,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             "opp_pokemon": count_pokemon(final_opp_ps),
                             "bench_size": len(final_bench_list),
                             "deck_size": final_ps.deckCount,
+                            "opp_deck_size": final_opp_ps.deckCount,
                             "energy_attached_flag": True,
                             "active_id": final_active_id,
                             "active_energies": final_active_energies,
@@ -739,9 +741,14 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     lockout_turns = pre.get("lockout_turns", 0)
                         
                     # Stall penalty to prevent endless pass cycles
-                    r_stall = -0.02
-                    if lockout_turns > 3:
-                        r_stall -= min(0.20, 0.02 * (lockout_turns - 3))
+                    # If opponent is close to deckout, do NOT penalise stalling
+                    opp_deck_size = pre.get("opp_deck_size", 40)
+                    if opp_deck_size <= 5:
+                        r_stall = 0.05  # Reward for stalling for deckout
+                    else:
+                        r_stall = -0.02
+                        if lockout_turns > 3:
+                            r_stall -= min(0.20, 0.02 * (lockout_turns - 3))
                         
                     r_prize_t = prizes_taken * 5.0 if prizes_taken > 0 else 0.0
                     r_prize_l = prizes_lost * 0.15 if prizes_lost > 0 else 0.0
@@ -819,10 +826,15 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 kw in played_card.name.lower() or kw in getattr(played_card, "text", "").lower() 
                                 for kw in ["search", "draw", "look", "put"]
                             ):
-                                expected_min_diff = -2 if "Ultra Ball" in played_card.name else 0
-                                hand_diff = post["hand_size"] - pre["hand_size"]
-                                if hand_diff >= expected_min_diff:
-                                    r_strategic += 0.20  # Boosted search/draw success
+                                # If our deck size is dangerously low, penalise draw/search cards to avoid self-deckout
+                                my_deck_size = pre.get("deck_size", 40)
+                                if my_deck_size <= 5:
+                                    r_strategic -= 1.5  # Heavy penalty for draw/search when low on deck!
+                                else:
+                                    expected_min_diff = -2 if "Ultra Ball" in played_card.name else 0
+                                    hand_diff = post["hand_size"] - pre["hand_size"]
+                                    if hand_diff >= expected_min_diff:
+                                        r_strategic += 0.20  # Boosted search/draw success
                                     
                                     # Ultra Ball Overall Resource Efficiency Evaluation
                                     if "Ultra Ball" in played_card.name:
@@ -857,8 +869,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                                 elif dc.cardType in [CardType.SUPPORTER, CardType.TOOL]:
                                                     efficiency_score -= 0.10  # Penalize unique Supporter/Tool discard
                                         r_strategic += efficiency_score
-                                else:
-                                    r_strategic -= 0.05
+                                    else:
+                                        r_strategic -= 0.05
                                     
                             # Correct use of Energy Switch
                             elif played_card.cardType == CardType.ITEM and "Energy Switch" in played_card.name:
@@ -872,7 +884,37 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                         r_strategic += 0.10
                                     else:
                                         r_strategic -= 0.05
-                                        
+                                                       # Team Rocket's Transceiver play logic
+                            elif "Transceiver" in played_card.name:
+                                hand_diff = post["hand_size"] - pre["hand_size"]
+                                if hand_diff >= 0:
+                                    r_strategic += 0.25  # Excellent Transceiver search!
+                                else:
+                                    r_strategic -= 0.05
+                                    
+                            # Bug Catching Set / Night Stretcher play logic
+                            elif "Bug Catching Set" in played_card.name or "Night Stretcher" in played_card.name:
+                                hand_diff = post["hand_size"] - pre["hand_size"]
+                                if hand_diff >= 0:
+                                    r_strategic += 0.25  # Excellent item search/retrieval!
+                                else:
+                                    r_strategic -= 0.05
+                                    
+                            # Team Rocket's Archer play logic
+                            elif "Archer" in played_card.name:
+                                if post["energy"] > pre["energy"]:
+                                    r_strategic += 0.35  # Great energy acceleration!
+                                else:
+                                    r_strategic -= 0.10
+                                    
+                            # Lillie's Determination / Team Rocket's Ariana / Proton draw logic
+                            elif any(name in played_card.name for name in ["Lillie", "Ariana", "Proton"]):
+                                hand_diff = post["hand_size"] - pre["hand_size"]
+                                if hand_diff > 1:
+                                    r_strategic += 0.20  # Successful draw supporter play!
+                                else:
+                                    r_strategic -= 0.05
+                                    
                             # General Supporter dead usage penalty
                             elif played_card.cardType == CardType.SUPPORTER and "Giovanni" not in played_card.name:
                                 hand_diff = post["hand_size"] - pre["hand_size"]
@@ -926,23 +968,27 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                     
                             # Special energy attachment logic
                             elif attached_card.cardType == CardType.SPECIAL_ENERGY:
-                                target_is_attacker = target_card.ex or target_card.stage1 or target_card.stage2
-                                if target_is_attacker:
-                                    r_strategic += 0.25
-                                    if pre.get("active_id") != target_card.cardId or pre.get("active_energies", 0) >= 3:
+                                if target_card.cardId in [431, 401]:
+                                    r_strategic += 0.50  # High reward for attaching Special/Double Energy to Mewtwo ex or Spidops ex!
+                                    if pre.get("active_id") != target_card.cardId:
                                         r_strategic += 0.15  # Extra reward for charging benched attacker
                                 else:
-                                    r_strategic -= 1.50  # Severe penalty for wasting Special Energy
+                                    r_strategic -= 2.50  # Severe penalty for wasting Special Energy on non-key attackers
                                     
                             # Basic energy attachment logic
                             elif attached_card.cardType == CardType.BASIC_ENERGY:
-                                target_is_attacker = target_card.ex or target_card.stage1 or target_card.stage2
-                                if target_is_attacker:
-                                    r_strategic += 0.20
+                                if target_card.cardId == 431:
+                                    r_strategic += 0.50  # Strongly encourage manual attachments to Mewtwo ex!
                                     if pre.get("active_id") != target_card.cardId:
-                                        r_strategic += 0.15
+                                        r_strategic += 0.10  # Charging Mewtwo ex on bench is also good
                                 else:
-                                    r_strategic += 0.05
+                                    target_is_attacker = target_card.ex or target_card.stage1 or target_card.stage2
+                                    if target_is_attacker:
+                                        r_strategic += 0.20
+                                        if pre.get("active_id") != target_card.cardId:
+                                            r_strategic += 0.15
+                                    else:
+                                        r_strategic += 0.05
                                     
                             # Tool attachments
                             elif attached_card.cardType == CardType.TOOL:
@@ -1013,7 +1059,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         if opp_immune:
                             r_strategic -= 0.20  # Wastes turn to attack immune opponent
                         else:
-                            r_strategic += 0.25
+                            if active_card is not None and active_card.cardId == 431:
+                                r_strategic += 0.60  # Extra high reward for attacking with Mewtwo ex!
+                            else:
+                                r_strategic += 0.25
                             
                     # 3. Bench Quality & Overextension Management
                     r_bench = 0.0
@@ -1028,11 +1077,17 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         
                     # 4. Proper Attacker Timing & Charging
                     active_card = get_card_data(post.get("active_id"))
-                    if active_card is not None and (active_card.ex or active_card.stage1 or active_card.stage2):
-                        if post.get("active_energies", 0) < 2:
-                            r_strategic -= 0.02  # Penalty for having a weak/undercharged attacker active
-                        elif post.get("active_energies", 0) >= 3:
-                            r_strategic += 0.10  # Reward for maintaining a fully charged attacker active
+                    if active_card is not None:
+                        if active_card.cardId == 431:  # Mewtwo ex
+                            if post.get("active_energies", 0) >= 2:
+                                r_strategic += 0.40  # Strongly reward having a charged Mewtwo ex in the active spot!
+                            else:
+                                r_strategic -= 0.10  # Penalize having an uncharged Mewtwo ex active (charge on bench first)
+                        elif active_card.ex or active_card.stage1 or active_card.stage2:
+                            if post.get("active_energies", 0) < 2:
+                                r_strategic -= 0.02  # Penalty for having a weak/undercharged attacker active
+                            elif post.get("active_energies", 0) >= 3:
+                                r_strategic += 0.10  # Reward for maintaining a fully charged attacker active
                             
                     # 5. Maintaining Multiple Attackers (Backup Attacker)
                     has_backup_attacker = False
@@ -1189,11 +1244,11 @@ def draw_sprt_slider(llr, A, B, width=20):
     slider_chars = []
     for i in range(width + 1):
         if i == pos:
-            slider_chars.append("●")
+            slider_chars.append("o")
         elif i == center_pos:
-            slider_chars.append("┼")
+            slider_chars.append("+")
         else:
-            slider_chars.append("─")
+            slider_chars.append("-")
             
     slider_str = "".join(slider_chars)
     return f"REJECT [{A:.2f}] {slider_str} [{B:+.2f}] ACCEPT"
