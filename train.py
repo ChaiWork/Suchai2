@@ -434,11 +434,15 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         "opp_active_id": opp_active_id,
                         "stadium_id": stadium_id,
                         "bench_ids": bench_ids,
+                        "bench_energies": [len(p.energyCards) for p in state_ps.bench if p is not None],
                         "hand_size": len(state_ps.hand) if state_ps.hand is not None else 0,
+                        "hand_ids": [c.id for c in state_ps.hand if c is not None] if state_ps.hand is not None else [],
                         "discard_size": len(state_ps.discard) if state_ps.discard is not None else 0,
+                        "discard_energy": sum(1 for c in state_ps.discard if c is not None and c.id in [1, 5, 15]),
                         "turn": obs_class.current.turn,
                         "has_attack_option": has_attack_option,
-                        "has_attach_option": has_attach_option
+                        "has_attach_option": has_attach_option,
+                        "context": obs_class.select.context if (obs_class.select is not None) else None
                     }
     
                     if curr_player == 0:
@@ -618,6 +622,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
 
                     
                 rewards = []
+                lockout_turns = 0
                 for step_idx in range(n_steps):
                     sample_obj, pre = player_samples[step_idx]
                     
@@ -653,8 +658,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             "opp_active_id": final_opp_active_id,
                             "stadium_id": final_stadium_id,
                             "bench_ids": final_bench_ids,
+                            "bench_energies": [len(p.energyCards) for p in final_ps.bench if p is not None],
                             "hand_size": len(final_ps.hand) if final_ps.hand is not None else 0,
+                            "hand_ids": [c.id for c in final_ps.hand if c is not None] if final_ps.hand is not None else [],
                             "discard_size": len(final_ps.discard) if final_ps.discard is not None else 0,
+                            "discard_energy": sum(1 for c in final_ps.discard if c is not None and c.id in [1, 5, 15]),
                             "turn": final_obs.current.turn,
                             "has_attack_option": False,
                             "has_attach_option": False
@@ -668,8 +676,17 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     active_energy_attached = post.get("active_energy", 0) - pre.get("active_energy", 0)
                     bench_energy_attached = energy_attached - active_energy_attached
                     
+                    # Calculate active spot lockout
+                    attacked = (pre.get("action_type") == 13)
+                    if pre.get("active_id") == post.get("active_id") and not attacked:
+                        lockout_turns += 1
+                    else:
+                        lockout_turns = 0
+                        
                     # Stall penalty to prevent endless pass cycles
                     r_stall = -0.02
+                    if lockout_turns > 3:
+                        r_stall -= min(0.20, 0.02 * (lockout_turns - 3))
                         
                     r_prize_t = prizes_taken * 5.0 if prizes_taken > 0 else 0.0
                     r_prize_l = prizes_lost * 0.15 if prizes_lost > 0 else 0.0
@@ -685,6 +702,27 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     # Principal RL Scientist - Optimized Mewtwo ex Reward Shaping
                     r_strategic = 0.0
                     action_type = pre.get("action_type", -1)
+                    
+                    # 0. Active Spot Promotion Guard (SelectContext.TO_ACTIVE = 4)
+                    if pre.get("context") == 4:
+                        promoted_id = post.get("active_id", -1)
+                        promoted_energy = post.get("active_energies", 0)
+                        
+                        # Identify benched attackers and their energies before promotion
+                        benched_attackers_energies = []
+                        for idx, bid in enumerate(pre.get("bench_ids", [])):
+                            if bid in [431, 401]:  # Mewtwo ex or Spidops
+                                b_energy = pre.get("bench_energies", [])[idx] if idx < len(pre.get("bench_energies", [])) else 0
+                                benched_attackers_energies.append(b_energy)
+                        
+                        if len(benched_attackers_energies) > 0:
+                            max_bench_energy = max(benched_attackers_energies)
+                            # Penalize promoting an uncharged Mewtwo/Spidops when a charged one was on the bench
+                            if promoted_id in [431, 401] and promoted_energy < max_bench_energy and promoted_energy == 0:
+                                r_strategic -= 0.50
+                            # Reward promoting defensive blockers (Articuno/Mimikyu) to stall if attackers are still charging
+                            elif promoted_id in [414, 434] and max_bench_energy >= 2:
+                                r_strategic += 0.20
                     
                     # 1. Stadium Establishment
                     if pre.get("stadium_id") != 1257 and post.get("stadium_id") == 1257:
@@ -704,6 +742,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             hand_diff = post["hand_size"] - pre["hand_size"]
                             if hand_diff >= expected_min_diff:
                                 r_strategic += 0.20  # Boosted search/draw success
+                                if played_id == 1121:
+                                    discarded_energy = post.get("discard_energy", 0) - pre.get("discard_energy", 0)
+                                    has_recovery = (1097 in pre.get("hand_ids", [])) or (1129 in pre.get("hand_ids", []))
+                                    if discarded_energy > 0 and has_recovery:
+                                        r_strategic += 0.15  # Synergistic discard reward
                             else:
                                 r_strategic -= 0.05  # Penalize dead supporter/failed search
                         # Correct use of Energy Switch (1116)
