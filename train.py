@@ -700,7 +700,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             r_strategic += 0.10
                         # Search efficiency: playing Transceiver (1134), Ariana (1216), or Ultra Ball (1121)
                         elif played_id in [1134, 1216, 1121, 1220]:
-                            expected_min_diff = -1 if played_id == 1121 else 0
+                            expected_min_diff = -2 if played_id == 1121 else 0
                             hand_diff = post["hand_size"] - pre["hand_size"]
                             if hand_diff >= expected_min_diff:
                                 r_strategic += 0.20  # Boosted search/draw success
@@ -742,29 +742,35 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         attached_id = pre.get("attached_card_id", -1)
                         target_id = pre.get("attached_target_id", -1)
                         
-                        # Articuno and Mimikyu are defensive/barrier blockers and should not get energy attachments
+                        # Articuno and Mimikyu are defensive/barrier blockers and should never get energy attachments
                         if target_id in [414, 434] and attached_id in [1, 5, 15]:
                             if attached_id == 15:
-                                r_strategic -= 0.25  # Severe penalty for wasting Special Energy on blockers
+                                r_strategic -= 3.0  # Massive penalty for wasting Special Energy on blockers!
                             else:
-                                r_strategic -= 0.15  # Penalty for attaching basic energy to blockers
+                                r_strategic -= 2.0  # Very high penalty for attaching basic energy to blockers!
                                 
                         # Efficient Team Rocket Energy usage
                         elif attached_id == 15:  # Team Rocket's Energy
                             if target_id in [431, 401]:  # Mewtwo ex or Spidops
                                 r_strategic += 0.25  # Boosted efficiency
+                                if pre.get("active_id") != target_id or pre.get("active_energies", 0) >= 3:
+                                    r_strategic += 0.15  # Extra reward for charging benched Mewtwo ex/Spidops to fuel Erasure Ball!
                             elif target_id in [414, 272]:
-                                r_strategic -= 0.05  # Wasting Special Energy
+                                r_strategic -= 1.50  # Severe penalty for wasting Special Energy on Clefairy/Articuno
                                 
                         # Proper basic energy attachment
                         elif attached_id == 5:  # Psychic Energy
                             if target_id == 431:  # Mewtwo ex
                                 r_strategic += 0.20
+                                if pre.get("active_id") != 431 or pre.get("active_energies", 0) >= 3:
+                                    r_strategic += 0.15  # Extra reward for charging benched Mewtwo ex to build resources for Erasure Ball!
                             else:
                                 r_strategic += 0.05
                         elif attached_id == 1:  # Grass Energy
                             if target_id in [400, 401]:  # Tarountula or Spidops
                                 r_strategic += 0.20
+                                if pre.get("active_id") != target_id or pre.get("active_energies", 0) >= 2:
+                                    r_strategic += 0.10  # Extra reward for charging benched Spidops!
                             else:
                                 r_strategic += 0.05
                                 
@@ -794,6 +800,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         r_strategic += 0.10
                         
                     elif action_type == 12:  # RETREAT
+                        # Base penalty for retreating to prevent infinite retreat loops and energy waste
+                        r_strategic -= 0.15
                         # Strategic retreat from Mimikyu ex-immunity
                         if pre.get("opp_active_id") == 434 and pre.get("active_id") in [431, 272] and post.get("active_id") not in [431, 272]:
                             r_strategic += 0.30  # Excellent retreat to non-ex attacker against Mimikyu!
@@ -822,6 +830,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             # We can stall/pass until we find the suitable cards to win
                             r_strategic += 0.3  # Reward for good pass, offsetting flat stall penalty
                             
+                        # Extra penalty for ending the turn with an empty bench (high bench-out risk!)
+                        if post.get("bench_size", 0) == 0:
+                            r_strategic -= 1.0  # Big penalty for ending turn with 0 bench backup!
+                            
                     elif action_type == 13:  # ATTACK
                         att_id = pre.get("attack_id", -1)
                         
@@ -842,7 +854,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     # 3. Bench Quality & Overextension Management
                     r_bench = 0.0
                     if post["bench_size"] == 0:
-                        r_bench -= 0.02  # Relaxed: Empty bench penalty
+                        r_bench -= 0.50  # Strongly penalise having no backup Pokemon!
+                        if post.get("turn", 0) <= 2:
+                            r_bench -= 0.50  # Extra -0.50 penalty during early turns (turn <= 2) to prevent turn 1 bench-out!
                     elif 2 <= post["bench_size"] <= 4:
                         r_bench += 0.05  # Optimal board development reward
                     elif post["bench_size"] == 5:
