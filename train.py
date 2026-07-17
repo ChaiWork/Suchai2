@@ -53,7 +53,33 @@ from agent import LearnSample, mcts_agent, random_agent, GPUInferenceClient
 from plot_metrics import plot_metrics
 
 from cg.game import battle_start, battle_finish, battle_select
-from cg.api import to_observation_class, OptionType, AreaType, SelectContext
+from cg.api import (
+    to_observation_class, OptionType, AreaType, SelectContext,
+    CardType, EnergyType, all_card_data, all_attack
+)
+
+# Global Card Database and Helpers
+card_table = {c.cardId: c for c in all_card_data()}
+attack_table = {a.attackId: a for a in all_attack()}
+evolves_from_set = {c.evolvesFrom for c in all_card_data() if c.evolvesFrom}
+
+def get_card_data(card_id: int):
+    return card_table.get(card_id)
+
+def is_defensive_blocker(c):
+    if c is None or c.cardType != CardType.POKEMON:
+        return False
+    return c.basic and not c.ex and (c.name not in evolves_from_set)
+
+def can_attack(card_id: int, energy_count: int):
+    c = get_card_data(card_id)
+    if c is None or c.cardType != CardType.POKEMON:
+        return False
+    for aid in c.attacks:
+        att = attack_table.get(aid)
+        if att is not None and energy_count >= len(att.energies):
+            return True
+    return False
 
 
 def count_attached_energy(ps):
@@ -387,6 +413,13 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
             try:
                 action_counts = {"attack": 0, "play": 0, "attach": 0, "evolve": 0, "ability": 0, "retreat": 0, "end": 0, "other": 0}
                 samples = [[], []]
+                
+                # Episode-state active spot lockout trackers
+                episode_lockouts = [0, 0]
+                episode_active_serials = [None, None]
+                episode_attacked = [False, False]
+                episode_last_turns = [None, None]
+                
                 while True:
                     if obs["current"]["result"] >= 0:
                         break
@@ -401,6 +434,21 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     active_pk = state_ps.active[0] if (len(state_ps.active) > 0 and state_ps.active[0] is not None) else None
                     active_id = active_pk.id if active_pk else -1
                     active_energies = len(active_pk.energyCards) if active_pk else 0
+                    
+                    # Track active spot lockout at the episode level
+                    active_serial = active_pk.serial if active_pk else None
+                    turn_num = obs_class.current.turn
+                    
+                    if episode_active_serials[curr_player] != active_serial:
+                        episode_active_serials[curr_player] = active_serial
+                        episode_lockouts[curr_player] = 0
+                        episode_attacked[curr_player] = False
+                        
+                    if episode_last_turns[curr_player] is not None and turn_num != episode_last_turns[curr_player]:
+                        if not episode_attacked[curr_player]:
+                            episode_lockouts[curr_player] += 1
+                        episode_attacked[curr_player] = False
+                    episode_last_turns[curr_player] = turn_num
                     
                     opp_active_pk = opp_ps.active[0] if (len(opp_ps.active) > 0 and opp_ps.active[0] is not None) else None
                     opp_active_id = opp_active_pk.id if opp_active_pk else -1
@@ -442,7 +490,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         "turn": obs_class.current.turn,
                         "has_attack_option": has_attack_option,
                         "has_attach_option": has_attach_option,
-                        "context": obs_class.select.context if (obs_class.select is not None) else None
+                        "context": obs_class.select.context if (obs_class.select is not None) else None,
+                        "lockout_turns": episode_lockouts[curr_player]
                     }
     
                     if curr_player == 0:
@@ -578,6 +627,16 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         else:
                             selected = random_agent(obs)
                     
+                    # Record if active player attacked in this step
+                    if selected and len(selected) > 0:
+                        sel_idx = selected[0]
+                        options = obs.get("select", {}).get("option", [])
+                        if sel_idx < len(options):
+                            opt = options[sel_idx]
+                            opt_type = opt.get("type", -1)
+                            if opt_type == 13 or opt_type == OptionType.ATTACK:
+                                episode_attacked[curr_player] = True
+                                
                     obs = battle_select(selected)
                     
                 battle_finish()
@@ -622,7 +681,6 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
 
                     
                 rewards = []
-                lockout_turns = 0
                 for step_idx in range(n_steps):
                     sample_obj, pre = player_samples[step_idx]
                     
@@ -665,7 +723,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             "discard_energy": sum(1 for c in final_ps.discard if c is not None and c.id in [1, 5, 15]),
                             "turn": final_obs.current.turn,
                             "has_attack_option": False,
-                            "has_attach_option": False
+                            "has_attach_option": False,
+                            "lockout_turns": episode_lockouts[i]
                         }
                     
                     prizes_taken = pre["prizes"] - post["prizes"]
@@ -676,12 +735,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     active_energy_attached = post.get("active_energy", 0) - pre.get("active_energy", 0)
                     bench_energy_attached = energy_attached - active_energy_attached
                     
-                    # Calculate active spot lockout
-                    attacked = (pre.get("action_type") == 13)
-                    if pre.get("active_id") == post.get("active_id") and not attacked:
-                        lockout_turns += 1
-                    else:
-                        lockout_turns = 0
+                    # Read active spot lockout from pre state
+                    lockout_turns = pre.get("lockout_turns", 0)
                         
                     # Stall penalty to prevent endless pass cycles
                     r_stall = -0.02
@@ -703,197 +758,263 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     r_strategic = 0.0
                     action_type = pre.get("action_type", -1)
                     
-                    # 0. Active Spot Promotion Guard (SelectContext.TO_ACTIVE = 4)
-                    if pre.get("context") == 4:
+                    # 0. Active Spot Promotion Guard (SelectContext.TO_ACTIVE)
+                    if pre.get("context") == SelectContext.TO_ACTIVE:
                         promoted_id = post.get("active_id", -1)
                         promoted_energy = post.get("active_energies", 0)
                         
-                        # Identify benched attackers and their energies before promotion
-                        benched_attackers_energies = []
-                        for idx, bid in enumerate(pre.get("bench_ids", [])):
-                            if bid in [431, 401]:  # Mewtwo ex or Spidops
-                                b_energy = pre.get("bench_energies", [])[idx] if idx < len(pre.get("bench_energies", [])) else 0
-                                benched_attackers_energies.append(b_energy)
+                        promoted_c = get_card_data(promoted_id)
+                        promoted_can_attack = can_attack(promoted_id, promoted_energy)
+                        promoted_is_blocker = is_defensive_blocker(promoted_c)
                         
-                        if len(benched_attackers_energies) > 0:
-                            max_bench_energy = max(benched_attackers_energies)
-                            # Penalize promoting an uncharged Mewtwo/Spidops when a charged one was on the bench
-                            if promoted_id in [431, 401] and promoted_energy < max_bench_energy and promoted_energy == 0:
+                        # Identify benched options before promotion
+                        benched_options = []
+                        for idx, bid in enumerate(pre.get("bench_ids", [])):
+                            b_c = get_card_data(bid)
+                            if b_c is not None and b_c.cardType == CardType.POKEMON:
+                                b_energy = pre.get("bench_energies", [])[idx] if idx < len(pre.get("bench_energies", [])) else 0
+                                b_can_attack = can_attack(bid, b_energy)
+                                b_is_blocker = is_defensive_blocker(b_c)
+                                benched_options.append((bid, b_energy, b_can_attack, b_is_blocker))
+                                
+                        if len(benched_options) > 0:
+                            is_meaningful = promoted_can_attack or promoted_is_blocker
+                            bench_has_ready_attacker = any(opt[2] for opt in benched_options)
+                            
+                            if bench_has_ready_attacker and not promoted_can_attack:
+                                # Left a ready attacker on bench!
                                 r_strategic -= 0.50
-                            # Reward promoting defensive blockers (Articuno/Mimikyu) to stall if attackers are still charging
-                            elif promoted_id in [414, 434] and max_bench_energy >= 2:
+                            elif not is_meaningful:
+                                # Promoted a non-blocker, non-attacker when we had other options
+                                r_strategic -= 0.20
+                            elif promoted_is_blocker:
+                                # Promoted a blocker (meaningful play to stall/protect bench)
                                 r_strategic += 0.20
                     
                     # 1. Stadium Establishment
-                    if pre.get("stadium_id") != 1257 and post.get("stadium_id") == 1257:
-                        r_strategic += 0.25  # Prioritize establishing Team Rocket's Factory (+0.25)
+                    if pre.get("stadium_id") != post.get("stadium_id") and post.get("stadium_id") != -1:
+                        stadium_card = get_card_data(post.get("stadium_id"))
+                        if stadium_card is not None and stadium_card.cardType == CardType.STADIUM:
+                            if action_type == 7:  # PLAY
+                                r_strategic += 0.25
                     
                     # 2. Action Heuristics & Search Efficiency & Sequencing
                     if action_type == 7:  # PLAY
                         played_id = pre.get("played_card_id", -1)
-                        # Board development: play Tarountula or Mewtwo ex to bench
-                        if played_id == 400: # Tarountula
-                            r_strategic += 0.15  # Target setup
-                        elif played_id == 431: # Mewtwo ex
-                            r_strategic += 0.10
-                        # Search efficiency: playing Transceiver (1134), Ariana (1216), or Ultra Ball (1121)
-                        elif played_id in [1134, 1216, 1121, 1220]:
-                            expected_min_diff = -2 if played_id == 1121 else 0
-                            hand_diff = post["hand_size"] - pre["hand_size"]
-                            if hand_diff >= expected_min_diff:
-                                r_strategic += 0.20  # Boosted search/draw success
-                                if played_id == 1121:
-                                    discarded_energy = post.get("discard_energy", 0) - pre.get("discard_energy", 0)
-                                    has_recovery = (1097 in pre.get("hand_ids", [])) or (1129 in pre.get("hand_ids", []))
-                                    if discarded_energy > 0 and has_recovery:
-                                        r_strategic += 0.15  # Synergistic discard reward
+                        played_card = get_card_data(played_id)
+                        
+                        if played_card is not None:
+                            # Board development: play basic Pokemon to bench
+                            if played_card.cardType == CardType.POKEMON:
+                                if played_card.basic:
+                                    if played_card.ex:
+                                        r_strategic += 0.10  # Basic ex setup reward
+                                    elif played_card.name in evolves_from_set:
+                                        r_strategic += 0.15  # Basic evolvable setup reward
+                                    else:
+                                        r_strategic += 0.05  # Other basic setup reward
+                                        
+                            # Search efficiency: playing item/supporter with search/draw text
+                            elif played_card.cardType in [CardType.ITEM, CardType.SUPPORTER] and any(
+                                kw in played_card.name.lower() or kw in getattr(played_card, "text", "").lower() 
+                                for kw in ["search", "draw", "look", "put"]
+                            ):
+                                expected_min_diff = -2 if "Ultra Ball" in played_card.name else 0
+                                hand_diff = post["hand_size"] - pre["hand_size"]
+                                if hand_diff >= expected_min_diff:
+                                    r_strategic += 0.20  # Boosted search/draw success
+                                    
+                                    # Ultra Ball Overall Resource Efficiency Evaluation
+                                    if "Ultra Ball" in played_card.name:
+                                        pre_hand = list(pre.get("hand_ids", []))
+                                        post_hand = list(post.get("hand_ids", []))
+                                        if played_id in pre_hand:
+                                            pre_hand.remove(played_id)
+                                            
+                                        from collections import Counter
+                                        pre_counts = Counter(pre_hand)
+                                        post_counts = Counter(post_hand)
+                                        discarded_ids = []
+                                        for cid, count in pre_counts.items():
+                                            diff = count - post_counts.get(cid, 0)
+                                            if diff > 0:
+                                                discarded_ids.extend([cid] * diff)
+                                                
+                                        efficiency_score = 0.0
+                                        for dcid in discarded_ids:
+                                            dc = get_card_data(dcid)
+                                            if dc is not None:
+                                                if dc.cardType == CardType.BASIC_ENERGY:
+                                                    # Check if we have Spidops in play to charge or Night Stretcher in hand
+                                                    has_spidops = any(bid == 401 for bid in pre.get("bench_ids", [])) or pre.get("active_id") == 401
+                                                    has_stretcher = 1097 in post_hand
+                                                    if has_spidops or has_stretcher:
+                                                        efficiency_score += 0.10
+                                                elif post_counts.get(dcid, 0) > 0:
+                                                    efficiency_score += 0.05  # Duplicate card discard
+                                                elif dc.cardType == CardType.STADIUM and pre.get("stadium_id") == dcid:
+                                                    efficiency_score += 0.08  # Duplicate stadium discard
+                                                elif dc.cardType in [CardType.SUPPORTER, CardType.TOOL]:
+                                                    efficiency_score -= 0.10  # Penalize unique Supporter/Tool discard
+                                        r_strategic += efficiency_score
+                                else:
+                                    r_strategic -= 0.05
+                                    
+                            # Correct use of Energy Switch
+                            elif played_card.cardType == CardType.ITEM and "Energy Switch" in played_card.name:
+                                active_c = get_card_data(post["active_id"])
+                                if active_c is not None:
+                                    active_att_costs = [len(attack_table.get(aid).energies) for aid in active_c.attacks if attack_table.get(aid)]
+                                    min_att_cost = min(active_att_costs) if active_att_costs else 99
+                                    if post["active_energies"] >= min_att_cost and pre["active_energies"] < min_att_cost:
+                                        r_strategic += 0.25  # High swing turn reward
+                                    elif post["active_energies"] > pre["active_energies"]:
+                                        r_strategic += 0.10
+                                    else:
+                                        r_strategic -= 0.05
+                                        
+                            # General Supporter dead usage penalty
+                            elif played_card.cardType == CardType.SUPPORTER and "Giovanni" not in played_card.name:
+                                hand_diff = post["hand_size"] - pre["hand_size"]
+                                if hand_diff < 0:
+                                    r_strategic -= 0.05
+                                    
+                            # Giovanni switch logic
+                            elif played_card.cardType == CardType.SUPPORTER and "Giovanni" in played_card.name:
+                                benched_ids = pre.get("bench_ids", [])
+                                active_c = get_card_data(pre.get("active_id"))
+                                active_charged = False
+                                if active_c is not None:
+                                    active_att_costs = [len(attack_table.get(aid).energies) for aid in active_c.attacks if attack_table.get(aid)]
+                                    min_cost = min(active_att_costs) if active_att_costs else 99
+                                    active_charged = pre.get("active_energy", 0) >= min_cost
+                                    
+                                has_bench_attacker = False
+                                bench_ready = False
+                                for idx, bid in enumerate(benched_ids):
+                                    bc = get_card_data(bid)
+                                    if bc is not None and bc.cardType == CardType.POKEMON:
+                                        b_energy = pre.get("bench_energies", [])[idx] if idx < len(pre.get("bench_energies", [])) else 0
+                                        bc_att_costs = [len(attack_table.get(aid).energies) for aid in bc.attacks if attack_table.get(aid)]
+                                        bc_min_cost = min(bc_att_costs) if bc_att_costs else 99
+                                        if b_energy >= bc_min_cost:
+                                            bench_ready = True
+                                        if bc.ex or bc.stage1 or bc.stage2:
+                                            has_bench_attacker = True
+                                            
+                                if has_bench_attacker and bench_ready and not active_charged:
+                                    r_strategic += 0.25  # Strategic Giovanni play reward!
                             else:
-                                r_strategic -= 0.05  # Penalize dead supporter/failed search
-                        # Correct use of Energy Switch (1116)
-                        elif played_id == 1116:
-                            # Verify if Energy Switch enabled an active Mewtwo ex to attack (reach 3 energies)
-                            if post["active_id"] == 431 and post["active_energies"] >= 3 and pre["active_energies"] < 3:
-                                r_strategic += 0.25  # High swing turn reward
-                            elif post["active_energies"] > pre["active_energies"]:
-                                r_strategic += 0.10
-                            else:
-                                r_strategic -= 0.05
-                        # General Supporter dead usage penalty
-                        elif played_id in [1217, 1219, 1227]:  # Exclude Giovanni (1218)
-                            hand_diff = post["hand_size"] - pre["hand_size"]
-                            if hand_diff < 0:
-                                r_strategic -= 0.05
-                        elif played_id == 1218:  # Giovanni
-                            # Reward using Giovanni to switch to a fully charged benched Mewtwo ex or Spidops
-                            # if active is currently weak or a non-attacker (e.g. Articuno/Mimikyu or Mewtwo ex undercharged).
-                            benched_ids = pre.get("bench_ids", [])
-                            bench_energy = pre.get("energy", 0) - pre.get("active_energy", 0)
-                            active_charged = (pre.get("active_id") == 431 and pre.get("active_energy", 0) >= 3) or (pre.get("active_id") == 401 and pre.get("active_energy", 0) >= 2)
-                            
-                            has_bench_attacker = False
-                            for bid in benched_ids:
-                                if bid in [431, 401]:
-                                    has_bench_attacker = True
-                                    break
-                            
-                            if has_bench_attacker and bench_energy >= 2 and not active_charged:
-                                r_strategic += 0.25  # Strategic Giovanni play reward!
-                        else:
-                            r_strategic += 0.02
+                                r_strategic += 0.02
                             
                     elif action_type == 8:  # ATTACH
                         attached_id = pre.get("attached_card_id", -1)
                         target_id = pre.get("attached_target_id", -1)
                         
-                        # Articuno and Mimikyu are defensive/barrier blockers and should never get energy attachments
-                        if target_id in [414, 434] and attached_id in [1, 5, 15]:
-                            if attached_id == 15:
-                                r_strategic -= 3.0  # Massive penalty for wasting Special Energy on blockers!
-                            else:
-                                r_strategic -= 2.0  # Very high penalty for attaching basic energy to blockers!
+                        attached_card = get_card_data(attached_id)
+                        target_card = get_card_data(target_id)
+                        
+                        if attached_card is not None and target_card is not None:
+                            target_is_blocker = is_defensive_blocker(target_card)
+                            
+                            # Defensive/barrier blockers should never get energy attachments
+                            if target_is_blocker:
+                                if attached_card.cardType == CardType.SPECIAL_ENERGY:
+                                    r_strategic -= 3.0  # Massive penalty for wasting Special Energy on blockers!
+                                else:
+                                    r_strategic -= 2.0  # Very high penalty for attaching basic energy to blockers!
+                                    
+                            # Special energy attachment logic
+                            elif attached_card.cardType == CardType.SPECIAL_ENERGY:
+                                target_is_attacker = target_card.ex or target_card.stage1 or target_card.stage2
+                                if target_is_attacker:
+                                    r_strategic += 0.25
+                                    if pre.get("active_id") != target_card.cardId or pre.get("active_energies", 0) >= 3:
+                                        r_strategic += 0.15  # Extra reward for charging benched attacker
+                                else:
+                                    r_strategic -= 1.50  # Severe penalty for wasting Special Energy
+                                    
+                            # Basic energy attachment logic
+                            elif attached_card.cardType == CardType.BASIC_ENERGY:
+                                target_is_attacker = target_card.ex or target_card.stage1 or target_card.stage2
+                                if target_is_attacker:
+                                    r_strategic += 0.20
+                                    if pre.get("active_id") != target_card.cardId:
+                                        r_strategic += 0.15
+                                else:
+                                    r_strategic += 0.05
+                                    
+                            # Tool attachments
+                            elif attached_card.cardType == CardType.TOOL:
+                                opp_active_card = get_card_data(pre.get("opp_active_id"))
+                                is_opp_ex = opp_active_card is not None and opp_active_card.ex
                                 
-                        # Efficient Team Rocket Energy usage
-                        elif attached_id == 15:  # Team Rocket's Energy
-                            if target_id in [431, 401]:  # Mewtwo ex or Spidops
-                                r_strategic += 0.25  # Boosted efficiency
-                                if pre.get("active_id") != target_id or pre.get("active_energies", 0) >= 3:
-                                    r_strategic += 0.15  # Extra reward for charging benched Mewtwo ex/Spidops to fuel Erasure Ball!
-                            elif target_id in [414, 272]:
-                                r_strategic -= 1.50  # Severe penalty for wasting Special Energy on Clefairy/Articuno
-                                
-                        # Proper basic energy attachment
-                        elif attached_id == 5:  # Psychic Energy
-                            if target_id == 431:  # Mewtwo ex
-                                r_strategic += 0.20
-                                if pre.get("active_id") != 431 or pre.get("active_energies", 0) >= 3:
-                                    r_strategic += 0.15  # Extra reward for charging benched Mewtwo ex to build resources for Erasure Ball!
-                            else:
-                                r_strategic += 0.05
-                        elif attached_id == 1:  # Grass Energy
-                            if target_id in [400, 401]:  # Tarountula or Spidops
-                                r_strategic += 0.20
-                                if pre.get("active_id") != target_id or pre.get("active_energies", 0) >= 2:
-                                    r_strategic += 0.10  # Extra reward for charging benched Spidops!
-                            else:
-                                r_strategic += 0.05
-                                
-                        # Tool Optimizations
-                        elif attached_id == 1175:  # Brave Bangle
-                            # Reward attaching to Active Spidops facing an ex opponent
-                            if target_id == 401 and pre.get("opp_active_id") in [431, 272] and target_id == pre.get("active_id"):
-                                r_strategic += 0.20
-                            else:
-                                r_strategic -= 0.05
-                        elif attached_id == 1158:  # Maximum Belt
-                            # Reward attaching to Active Mewtwo ex facing an ex opponent
-                            if target_id == 431 and pre.get("opp_active_id") in [431, 272] and target_id == pre.get("active_id"):
-                                r_strategic += 0.25
-                            else:
-                                r_strategic -= 0.05
-                                
+                                if "Brave Bangle" in attached_card.name or "Maximum Belt" in attached_card.name:
+                                    if is_opp_ex and pre.get("active_id") == target_card.cardId:
+                                        r_strategic += 0.20
+                                    else:
+                                        r_strategic -= 0.05
+                                        
                     elif action_type == 9:  # EVOLVE
                         evolved_id = pre.get("evolved_card_id", -1)
-                        if evolved_id == 401:  # Spidops
-                            r_strategic += 0.30  # Crucial evolution setup
-                        else:
-                            r_strategic += 0.15
-                            
+                        evolved_card = get_card_data(evolved_id)
+                        if evolved_card is not None:
+                            if evolved_card.stage1 or evolved_card.stage2:
+                                r_strategic += 0.30  # Crucial evolution setup
+                            else:
+                                r_strategic += 0.15
+                                
                     elif action_type == 10:  # ABILITY
-                        # Encourage using Rocket's Factory ability to draw cards
                         r_strategic += 0.10
                         
                     elif action_type == 12:  # RETREAT
-                        # Base penalty for retreating to prevent infinite retreat loops and energy waste
                         r_strategic -= 0.15
-                        # Strategic retreat from Mimikyu ex-immunity
-                        if pre.get("opp_active_id") == 434 and pre.get("active_id") in [431, 272] and post.get("active_id") not in [431, 272]:
-                            r_strategic += 0.30  # Excellent retreat to non-ex attacker against Mimikyu!
-                        # Defensive retreat to Mimikyu barrier to stall and set up
-                        elif post.get("active_id") == 434:
-                            if pre.get("active_id") in [431, 401] and pre.get("active_energies", 0) < 3:
-                                r_strategic += 0.20
-                        elif pre.get("active_id") == 431 and pre.get("active_energies", 0) >= 3:
+                        opp_active_card = get_card_data(pre.get("opp_active_id"))
+                        active_card = get_card_data(pre.get("active_id"))
+                        post_active_card = get_card_data(post.get("active_id"))
+                        
+                        # Strategic retreat from ex-immunity (e.g. Safeguard)
+                        opp_has_immunity = opp_active_card is not None and any(s.name == "Safeguard" or "ex" in s.text.lower() for s in getattr(opp_active_card, "skills", []))
+                        
+                        if opp_has_immunity:
+                            if active_card is not None and active_card.ex and post_active_card is not None and not post_active_card.ex:
+                                r_strategic += 0.30  # Excellent retreat to non-ex attacker against immune opponent!
+                            elif post_active_card is not None and is_defensive_blocker(post_active_card):
+                                r_strategic += 0.20  # Defensive retreat to blocker to stall
+                        elif active_card is not None and active_card.ex and pre.get("active_energies", 0) >= 3:
                             r_strategic -= 0.05
                             
                     elif action_type == 14:  # END (Turn Stall Decisions)
-                        # Check if ending the turn was a bad decision (stalling) or a good decision
                         has_attack = pre.get("has_attack_option", False)
                         has_attach = pre.get("has_attach_option", False)
                         energy_already_attached = pre.get("energy_attached_flag", False)
                         
-                        # Active Mewtwo ex / Clefairy ex facing a Mimikyu is immune, so attacking is bad anyway.
-                        opp_immune = (pre.get("opp_active_id") == 434 and pre.get("active_id") in [431, 272])
+                        opp_active_card = get_card_data(pre.get("opp_active_id"))
+                        active_card = get_card_data(pre.get("active_id"))
+                        opp_immune = (opp_active_card is not None and active_card is not None and active_card.ex and 
+                                      any(s.name == "Safeguard" or "ex" in s.text.lower() for s in getattr(opp_active_card, "skills", [])))
                         
                         if has_attack and not opp_immune:
                             r_strategic -= 5.0  # Massive penalty for stalling when we can attack!
                         elif has_attach and not energy_already_attached:
                             r_strategic -= 3.0  # Big penalty for leaving energy in hand unattached
                         else:
-                            # Good decision: we ended the turn because we had no constructive moves remaining
-                            # We can stall/pass until we find the suitable cards to win
                             r_strategic += 0.3  # Reward for good pass, offsetting flat stall penalty
                             
-                        # Extra penalty for ending the turn with an empty bench (high bench-out risk!)
                         if post.get("bench_size", 0) == 0:
                             r_strategic -= 1.0  # Big penalty for ending turn with 0 bench backup!
                             
                     elif action_type == 13:  # ATTACK
-                        att_id = pre.get("attack_id", -1)
+                        opp_active_card = get_card_data(pre.get("opp_active_id"))
+                        active_card = get_card_data(pre.get("active_id"))
+                        opp_immune = (opp_active_card is not None and active_card is not None and active_card.ex and 
+                                      any(s.name == "Safeguard" or "ex" in s.text.lower() for s in getattr(opp_active_card, "skills", [])))
                         
-                        # Mimikyu ex-immunity check: attacking Mimikyu active with an ex active is useless
-                        if pre.get("opp_active_id") == 434 and pre.get("active_id") in [431, 272]:
-                            r_strategic -= 0.20  # Wastes turn to attack immune Mimikyu
+                        if opp_immune:
+                            r_strategic -= 0.20  # Wastes turn to attack immune opponent
                         else:
-                            if att_id == 608:  # Erasure Ball
-                                if pre.get("active_energies", 0) < 3:
-                                    r_strategic -= 0.05
-                                else:
-                                    r_strategic += 0.25
-                            elif att_id == 560:  # Rocket Rush
-                                r_strategic += 0.20
-                            else:
-                                r_strategic += 0.15
-                                
+                            r_strategic += 0.25
+                            
                     # 3. Bench Quality & Overextension Management
                     r_bench = 0.0
                     if post["bench_size"] == 0:
@@ -905,17 +1026,19 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     elif post["bench_size"] == 5:
                         r_bench -= 0.02  # Overextension penalty
                         
-                    # 4. Proper Mewtwo Timing & Charging
-                    if post.get("active_id") == 431:
+                    # 4. Proper Attacker Timing & Charging
+                    active_card = get_card_data(post.get("active_id"))
+                    if active_card is not None and (active_card.ex or active_card.stage1 or active_card.stage2):
                         if post.get("active_energies", 0) < 2:
-                            r_strategic -= 0.02  # Relaxed: Penalty for having a weak/undercharged Mewtwo active
+                            r_strategic -= 0.02  # Penalty for having a weak/undercharged attacker active
                         elif post.get("active_energies", 0) >= 3:
-                            r_strategic += 0.10  # Reward for maintaining a fully charged Mewtwo active
+                            r_strategic += 0.10  # Reward for maintaining a fully charged attacker active
                             
                     # 5. Maintaining Multiple Attackers (Backup Attacker)
                     has_backup_attacker = False
                     for b_id in post.get("bench_ids", []):
-                        if b_id in [431, 401]:  # Benched Mewtwo ex or Spidops
+                        bc = get_card_data(b_id)
+                        if bc is not None and (bc.ex or bc.stage1 or bc.stage2):
                             has_backup_attacker = True
                             break
                     if has_backup_attacker and (post["energy"] - post.get("active_energies", 0)) >= 2:
@@ -1180,8 +1303,8 @@ def main():
         torch.cuda.manual_seed_all(SEED)
 
     opponent_decks = load_all_decks()
-    # Filter opponent decks to exclude inefficient random agent models ,"Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo",
-    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Abomasnow"]}
+    # Filter opponent decks to exclude inefficient random agent models ,,,
+    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Abomasnow","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo"]}
     if not opponent_decks:
         raise ValueError("No valid deck.csv found in root or subdirectories.")
         

@@ -656,7 +656,13 @@ def agent(obs_dict: dict) -> list[int]:
         else:
             search_count = 50
 
-    with torch.inference_mode():
-        action, _ = mcts_agent(obs_dict, _deck, _model, search_count=search_count)
-        
-    return action
+    try:
+        with torch.inference_mode():
+            action, _ = mcts_agent(obs_dict, _deck, _model, search_count=search_count)
+        return action
+    except Exception as e:
+        print(f"MCTS Agent crashed: {e}. Falling back to default action.", file=sys.stderr)
+        obs = to_observation_class(obs_dict)
+        if obs.select and obs.select.option:
+            return random.sample(list(range(len(obs.select.option))), obs.select.maxCount)
+        return []
