@@ -35,10 +35,10 @@ attack_table = {a.attackId: a for a in all_attack_list}
 attack_count = max(all_attack_list, key=lambda a: a.attackId).attackId + 1
 
 # Model Architecture Hyperparameters (Single Source of Truth)
-MODEL_D_MODEL = 128
-MODEL_NUM_HEADS = 2
-MODEL_D_FEEDFORWARD = 256
-MODEL_NUM_LAYERS_ENCODER = 1
+MODEL_D_MODEL = 256
+MODEL_NUM_HEADS = 4
+MODEL_D_FEEDFORWARD = 512
+MODEL_NUM_LAYERS_ENCODER = 3
 MODEL_NUM_LAYERS_DECODER = 1
 
 num_words_encoder = 24
@@ -51,7 +51,7 @@ decoder_size = decoder_card_offset + (1 + decoder_main_feature + SelectContext.R
 
 
 def extract_card_features(card: Card | None) -> list[float]:
-    features = [0.0] * 32
+    features = [0.0] * 36  # 32 original + 4 energy-cost features
     if card is None:
         return features
     
@@ -105,6 +105,29 @@ def extract_card_features(card: Card | None) -> list[float]:
     if skills:
         features[30] = 1.0
         features[31] = min(1.0, len(skills) / 2.0)
+
+    # 8. Attack energy cost features (4 dims) — critical for energy management decisions
+    # Encodes the cheapest attack's requirements by energy type, normalized by 4.
+    # This allows the network to natively understand which energy is needed for each card.
+    attacks = getattr(card, "attacks", None)
+    if attacks:
+        min_cost = 999
+        cheapest_att = None
+        for aid in attacks:
+            att = attack_table.get(aid)
+            if att is not None:
+                cost = len(getattr(att, "energies", []))
+                if cost < min_cost:
+                    min_cost = cost
+                    cheapest_att = att
+        if cheapest_att is not None:
+            energies = getattr(cheapest_att, "energies", [])
+            features[32] = min(1.0, min_cost / 4.0)               # Total cost (normalized)
+            features[33] = min(1.0, energies.count(1) / 4.0)      # Grass energy requirement
+            features[34] = min(1.0, energies.count(5) / 4.0)      # Psychic energy requirement
+            # Colorless/Special = any energy type not Grass or Psychic
+            colorless = sum(1 for e in energies if e not in (1, 5))
+            features[35] = min(1.0, colorless / 4.0)               # Colorless requirement
         
     return features
 
@@ -217,8 +240,8 @@ class MyModel(torch.nn.Module):
         self.register_buffer("encoder_card_map", get_encoder_card_map())
         self.register_buffer("decoder_card_map", get_decoder_card_map())
 
-        # Feature projection layer
-        self.feature_projection = torch.nn.Linear(32, d_model)
+        # Feature projection layer: 36 dims (32 base + 4 energy-cost features)
+        self.feature_projection = torch.nn.Linear(36, d_model)
 
     def forward(self,
                 index_encoder: torch.Tensor,
@@ -255,7 +278,7 @@ class MyModel(torch.nn.Module):
         batch_size = v.size(1)
         encoder_out = self.encoder(v)
         v = self.encoder_fc(encoder_out)
-        v = torch.tanh(v.mean(0))
+        v = torch.tanh(v.max(0).values)  # Max-pooling: better than mean at preserving high-signal tokens
 
         p = torch.nn.functional.embedding_bag(
             index_decoder, dec_weight, offset_decoder,
@@ -409,6 +432,10 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
     sv.add_single(1)
     sv.add_single(state.turn / 10)
     sv.add_single(state.firstPlayer == your_index)
+    # Explicit prize differential: positive = we are ahead, negative = opponent is ahead
+    my_prizes = len(state.players[your_index].prize)
+    opp_prizes = len(state.players[1 - your_index].prize)
+    sv.add_single((opp_prizes - my_prizes) / 6.0)
     return sv
 
 

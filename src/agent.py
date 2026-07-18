@@ -56,7 +56,8 @@ from cg.api import (
     SelectContext,
 )
 
-SEARCH_COUNT = 50  # MCTS Search count — need ≥50 for meaningful visit differentiation
+SEARCH_COUNT = 50   # MCTS Search count — need ≥50 for meaningful visit differentiation
+C_PUCT = 1.25       # AlphaZero PUCT exploration constant (fixed, per original paper)
 
 
 class LearnSample:
@@ -223,63 +224,20 @@ def create_node(parent: Node | None,
         node.value = v
         node.backprop(v)
 
-        # Apply a prior bias to guide MCTS exploration towards constructive actions
-        has_constructive = False
-        for opt in options:
-            if opt.type in [OptionType.ATTACK, OptionType.ATTACH, OptionType.EVOLVE, OptionType.PLAY, OptionType.ABILITY]:
-                has_constructive = True
-                break
-
-        policy_biased = list(policy)
-        for i in range(len(policy_biased)):
-            bias = 0.0
-            has_attack = False
-            has_attach = False
-            has_evolve = False
-            has_play = False
-            has_ability = False
-            has_end = False
-            
-            for opt_idx in actions[i]:
-                if opt_idx < len(options):
-                    opt = options[opt_idx]
-                    if opt.type == OptionType.ATTACK:
-                        has_attack = True
-                    elif opt.type == OptionType.ATTACH:
-                        has_attach = True
-                    elif opt.type == OptionType.EVOLVE:
-                        has_evolve = True
-                    elif opt.type == OptionType.PLAY:
-                        has_play = True
-                    elif opt.type == OptionType.ABILITY:
-                        has_ability = True
-                    elif opt.type == OptionType.END:
-                        has_end = True
-            
-            if has_attack:
-                bias += 5.0
-            if has_evolve:
-                bias += 1.5
-            if has_attach:
-                bias += 1.2
-            if has_ability:
-                bias += 0.8
-            if has_play:
-                bias += 0.5
-            if has_end and has_constructive:
-                bias -= 10.0  # Penalize passing turn if constructive actions are possible
-                
-            policy_biased[i] += bias
-
-        # Convert raw logits to probabilities via numerically stable softmax
-        max_logit = max(policy_biased)
+        # Convert raw policy logits to probabilities via numerically stable softmax.
+        # Prior bias removed: reward shaping trains the network to prefer constructive
+        # actions. Hardcoded biases prevent the network from ever learning this itself.
+        n_actions = len(actions)
+        policy_slice = policy[:n_actions]
+        max_logit = max(policy_slice) if policy_slice else 0.0
         prob_sum = 0.0
-        for i in range(len(policy_biased)):
-            p = math.exp(policy_biased[i] - max_logit)  # Numerically stable softmax
+        for i in range(n_actions):
+            p = math.exp(policy_slice[i] - max_logit)
             node.children.append(Child(actions[i], p))
             prob_sum += p
-        for c in node.children:
-            c.prob /= prob_sum
+        if prob_sum > 0.0:
+            for c in node.children:
+                c.prob /= prob_sum
         sample = LearnSample(value, policy, sv_enc, sv_dec)
 
     return (node, sample)
@@ -400,7 +358,7 @@ def get_own_visible_card_ids(obs, your_index: int) -> list[int]:
     return visible
 
 
-def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_count: int = None) -> tuple[list[int], LearnSample]:
+def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_count: int = None, temperature: float = 0.0) -> tuple[list[int], LearnSample]:
     """Perform MCTS exploration and select the best action list, returning it and a training sample."""
     obs = to_observation_class(obs_dict)
     your_index = obs.current.yourIndex
@@ -498,8 +456,9 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
         current = root
         while True:
             value = -1e9
-            # Dynamic PUCT Exploration — guard against visit=0 on freshly created nodes
-            c = 1.25 * math.sqrt(max(1, current.visit))
+            # PUCT: Q(s,a) + C_PUCT * P(s,a) * sqrt(N(parent)) / (1 + N(s,a))
+            # C_PUCT is a fixed constant per AlphaZero (not scaled by parent visits).
+            puct_scale = C_PUCT * math.sqrt(max(1, current.visit))
             next_child = None
             for child in current.children:
                 visit = 0
@@ -511,7 +470,7 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
                 
                 if current.state.observation.current.yourIndex != your_index:
                     v = -v
-                v += c * child.prob / (1 + visit)
+                v += puct_scale * child.prob / (1 + visit)
                 if value < v:
                     value = v
                     next_child = child
@@ -526,18 +485,28 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
                     current.backprop(current.value)
                     break
 
-    # Select the child with the highest visit count
-    max_child = None
-    max_visit = -1
-    min_value = 10.0
-    for child in root.children:
-        if child.node is not None:
-            if max_visit < child.node.visit:
+    # Select action according to temperature:
+    #   temperature=0.0 → argmax on visit counts (deterministic / evaluation mode)
+    #   temperature=1.0 → sample proportional to visit counts (AlphaZero training mode)
+    visited_children = [c for c in root.children if c.node is not None]
+    
+    if temperature > 0.0 and visited_children:
+        # AlphaZero-style: sample proportional to N(s,a)^(1/τ)
+        visits = [c.node.visit ** (1.0 / temperature) for c in visited_children]
+        total_v = sum(visits)
+        if total_v > 0:
+            weights = [v / total_v for v in visits]
+            max_child = random.choices(visited_children, weights=weights, k=1)[0]
+        else:
+            max_child = visited_children[0]
+    else:
+        # Argmax (evaluation / greedy mode)
+        max_child = None
+        max_visit = -1
+        for child in visited_children:
+            if child.node.visit > max_visit:
                 max_child = child
                 max_visit = child.node.visit
-            v = child.node.total / max(1, child.node.visit)
-            if min_value > v:
-                min_value = v
 
     # Fallback: if no children were visited (e.g. search_count=0), pick highest-prior child
     if max_child is None and root.children:
