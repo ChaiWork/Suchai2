@@ -278,7 +278,7 @@ class MyModel(torch.nn.Module):
         batch_size = v.size(1)
         encoder_out = self.encoder(v)
         v = self.encoder_fc(encoder_out)
-        v = torch.tanh(v.max(0).values)  # Max-pooling: better than mean at preserving high-signal tokens
+        v = v.max(0).values  # Max-pooling over sequence tokens; tanh removed — targets normalised to [-1,1] in train.py
 
         p = torch.nn.functional.embedding_bag(
             index_decoder, dec_weight, offset_decoder,

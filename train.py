@@ -328,8 +328,8 @@ class GPUInferenceServer:
             for sv in batch_sv_dec:
                 orig_len = len(sv.offset)
                 orig_lens.append(orig_len)
-                if orig_len < 128:
-                    for _ in range(128 - orig_len):
+                if orig_len < 256:
+                    for _ in range(256 - orig_len):
                         sv.offset.append(len(sv.index))
                 input_dec.add(sv)
 
@@ -350,7 +350,7 @@ class GPUInferenceServer:
                 import traceback
                 traceback.print_exc()
                 values = [0.0] * len(batch_conns)
-                policies = [[0.0] * 128] * len(batch_conns)
+                policies = [[0.0] * 256] * len(batch_conns)
 
             for idx, conn in enumerate(batch_conns):
                 val = values[idx]
@@ -381,6 +381,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
         elif cmd == "PLAY_SELF":
             sample_deck, opponent_deck, opponent_type, opponent_path = args[:4]
             opponent_name = args[4] if len(args) > 4 else "Current (Self)"
+            current_epoch = args[5] if len(args) > 5 else 0  # epoch counter for warmup schedule
             
             opp_model = None
             if opponent_path is not None:
@@ -502,13 +503,17 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         use_warmup = (turn <= warmup_threshold)
                         if use_warmup:
                             try:
-                                selected = rule_based_opponent_agent("Rulebasedmodel_Mewtwo", obs)
-                                sample = None
+                                rb_selected = rule_based_opponent_agent("Rulebasedmodel_Mewtwo", obs)
+                                # Run MCTS with force_action to collect Behavioral Cloning data
+                                temperature = 1.0 if turn <= 15 else 0.1
+                                selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature, force_action=rb_selected)
                             except Exception as e:
                                 use_warmup = False
                                 
                         if not use_warmup:
-                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=1.0)
+                            # Temperature decay: explore fully early, exploit late-game
+                            temperature = 1.0 if turn <= 15 else 0.1
+                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature)
                             sample.pred_val = sample.value
                             
                             opt_type_val = -1
@@ -587,7 +592,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             except Exception as e:
                                 selected = random_agent(obs)
                         elif opponent_type == "Current":
-                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=1.0)
+                            # Temperature decay mirrors player-0 for consistent training distribution
+                            opp_temperature = 1.0 if turn_num <= 15 else 0.1
+                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=opp_temperature)
                             sample.pred_val = sample.value
                             
                             opt_type_val = -1
@@ -764,8 +771,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             r_stall -= min(0.20, 0.02 * (lockout_turns - 3))
                         
                     r_prize_t = prizes_taken * 0.5 if prizes_taken > 0 else 0.0
-                    r_prize_l = prizes_lost * 0.10 if prizes_lost > 0 else 0.0
-                    r_ko = opp_kos * 0.10 if opp_kos > 0 else 0.0
+                    r_prize_l = prizes_lost * 0.35 if prizes_lost > 0 else 0.0  # Raised from 0.10 — symmetric with prize-taken to teach defensive play
+                    r_ko = 0.0  # Removed: KO double-counts with r_prize_t (same game event triggers both)
                     r_own_ko = own_kos * 0.08 if own_kos > 0 else 0.0
                     
                     r_en = 0.0
@@ -1706,12 +1713,13 @@ def main():
                 ]
             
             def get_next_self_play_args():
-                # 60% league self-play (historical opponents), 40% rule-based.
-                # Current-self games removed: playing the current model vs itself
-                # creates a non-stationary training distribution. Historical league
-                # opponents are fixed and produce stable gradient targets.
+                # League scheduling: start with mostly rule-based opponents so the model
+                # learns real strategy before facing league models. Early league checkpoints
+                # are nearly random -- 60% league in epoch 1 = 60% random opponents, which stalls.
+                # Ramp from 0% to 50% league over the first 10 epochs, then hold at 50%.
                 can_use_league = bool(league_checkpoints)
-                use_league = can_use_league and (not train_opponent_names or random.random() < 0.60)
+                league_prob = min(0.50, 0.05 * counter)  # 0% at epoch 0, 50% at epoch 10+
+                use_league = can_use_league and bool(train_opponent_names) and (random.random() < league_prob)
 
                 if use_league:
                     opp_path = sample_league_opponent(active_elo, league_checkpoints, league_elos)
@@ -1895,13 +1903,14 @@ def main():
                     label_dec.extend(sample.policy)
                     for _ in range(len(sample.policy)):
                         mask.append(1.0)
-                    for _ in range(128 - len(sample.policy)):
+                    for _ in range(256 - len(sample.policy)):
                         mask.append(0.0)
                         label_dec.append(0.0)
                         input_dec.offset.append(len(input_dec.index))
 
                 mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device).view(args.batch_size, -1)
                 label_tensor_enc = torch.tensor(label_enc, dtype=torch.float32, device=device).view(args.batch_size, -1)
+                label_tensor_enc = label_tensor_enc / 5.0  # Normalise GAE returns [-5,5] to [-1,1] for unbounded value head (audit fix)
                 label_tensor_dec = torch.tensor(label_dec, dtype=torch.float32, device=device).view(args.batch_size, -1)
 
                 with model_lock:

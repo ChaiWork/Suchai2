@@ -56,7 +56,7 @@ from cg.api import (
     SelectContext,
 )
 
-SEARCH_COUNT = 50   # MCTS Search count — need ≥50 for meaningful visit differentiation
+SEARCH_COUNT = 200  # MCTS Search count — ≥200 needed for meaningful visit differentiation (audit: was 50, policy targets were noise)
 C_PUCT = 1.25       # AlphaZero PUCT exploration constant (fixed, per original paper)
 
 
@@ -174,7 +174,7 @@ def create_node(parent: Node | None,
         # Generate combinations using sorted_indices
         if k <= n:
             comb_positions = list(range(k))
-            for _ in range(128):
+            for _ in range(256):
                 # Map combination positions to sorted_indices
                 actions.append([sorted_indices[p] for p in comb_positions])
                 
@@ -190,7 +190,7 @@ def create_node(parent: Node | None,
                     break
                     
         # Instrumentation: check if any options were truncated
-        if len(options) > 128 and len(actions) == 128:
+        if len(options) > 256 and len(actions) == 256:
             included_indices = set()
             for act in actions:
                 for idx in act:
@@ -358,7 +358,7 @@ def get_own_visible_card_ids(obs, your_index: int) -> list[int]:
     return visible
 
 
-def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_count: int = None, temperature: float = 0.0) -> tuple[list[int], LearnSample]:
+def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_count: int = None, temperature: float = 0.0, force_action: list[int] = None) -> tuple[list[int], LearnSample]:
     """Perform MCTS exploration and select the best action list, returning it and a training sample."""
     obs = to_observation_class(obs_dict)
     your_index = obs.current.yourIndex
@@ -433,7 +433,7 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     if len(root.children) > 0:
         dir_alpha = 0.3  # TCG has moderate action space
         turn = state.turn if (state is not None) else 0
-        noise_frac = 0.40
+        noise_frac = 0.25  # AlphaZero standard; 0.40 was over-randomising with only 50 sims
         noise = [random.gammavariate(dir_alpha, 1.0) for _ in root.children]
         noise_sum = sum(noise) + 1e-8
         noise = [n / noise_sum for n in noise]
@@ -527,7 +527,18 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     total_child_visits = sum(
         child.node.visit for child in root.children if child.node is not None
     )
-    if total_child_visits > 0:
+    if force_action is not None:
+        found = False
+        for i in range(len(root.children)):
+            child = root.children[i]
+            if child.select == force_action:
+                sample.policy[i] = 1.0
+                found = True
+            else:
+                sample.policy[i] = 0.0
+        if not found and len(root.children) > 0:
+            sample.policy[0] = 1.0
+    elif total_child_visits > 0:
         for i in range(len(root.children)):
             child = root.children[i]
             if child.node is not None:
@@ -541,7 +552,8 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
             sample.policy[i] = 1.0 / n
 
     search_end()
-    return (max_child.select, sample)
+    final_selected = force_action if force_action is not None else (max_child.select if max_child is not None else [])
+    return (final_selected, sample)
 
 
 def random_agent(obs_dict: dict) -> list[int]:
