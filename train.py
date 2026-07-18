@@ -405,14 +405,15 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
             try:
                 obs, start_data = battle_start(sample_deck, opponent_deck)
                 if start_data.errorPlayer >= 0:
-                    result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {})))
+                    result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {})))
                     continue
             except Exception as e:
-                result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {})))
+                result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {})))
                 continue
 
             try:
                 action_counts = {"attack": 0, "play": 0, "attach": 0, "evolve": 0, "ability": 0, "retreat": 0, "end": 0, "other": 0}
+                played_cards = {}
                 samples = [[], []]
                 
                 # Episode-state active spot lockout trackers
@@ -533,6 +534,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                         card_idx = opt.get("index", -1)
                                         if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
                                             played_card_id = hand[card_idx].id
+                                            played_cards[played_card_id] = played_cards.get(played_card_id, 0) + 1
                                     elif opt_type_val == 8: # ATTACH
                                         hand = state_ps.hand
                                         card_idx = opt.get("index", -1)
@@ -666,7 +668,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 print(f"Error in worker {worker_id} simulation:", file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)
                 sys.stderr.flush()
-                result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {})))
+                result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {})))
                 continue
             
             result = obs["current"]["result"]
@@ -687,10 +689,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 num_attacks = sum(1 for _, pre in player_samples if pre.get("action_type") == 13)
                 if i == result:
                     if num_attacks == 0:
-                        # Still reward a win even without attacks (e.g. deck-out, prize KO via ability).
-                        # 0.0 was silencing the win signal entirely — agent never learned winning is good.
-                        # 2.0 keeps a positive gradient while reserving the full +5 bonus for attack-led wins.
-                        terminal_reward = 2.0
+                        # Zero reward for wins without attacking to prevent passive stall exploits.
+                        # Force the model to learn that active attacking is the path to win.
+                        terminal_reward = 0.0
                     else:
                         terminal_reward = 5.0
                 elif result == 2:
@@ -848,7 +849,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 # If our deck size is dangerously low, penalise draw/search cards to avoid self-deckout
                                 my_deck_size = pre.get("deck_size", 40)
                                 if my_deck_size <= 5:
-                                    r_strategic -= 1.5  # Heavy penalty for draw/search when low on deck!
+                                    r_strategic -= 0.10  # Heavy penalty for draw/search when low on deck!
                                 else:
                                     expected_min_diff = -2 if "Ultra Ball" in played_card.name else 0
                                     hand_diff = post["hand_size"] - pre["hand_size"]
@@ -981,9 +982,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             # Defensive/barrier blockers should never get energy attachments
                             if target_is_blocker:
                                 if attached_card.cardType == CardType.SPECIAL_ENERGY:
-                                    r_strategic -= 3.0  # Massive penalty for wasting Special Energy on blockers!
+                                    r_strategic -= 0.15  # Massive penalty for wasting Special Energy on blockers!
                                 else:
-                                    r_strategic -= 2.0  # Very high penalty for attaching basic energy to blockers!
+                                    r_strategic -= 0.10  # Very high penalty for attaching basic energy to blockers!
                                     
                             # Special energy attachment logic
                             elif attached_card.cardType == CardType.SPECIAL_ENERGY:
@@ -1010,13 +1011,13 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
 
                                 if target_card.cardId in [431, 401]:
                                     if is_fully_charged:
-                                        r_strategic -= 1.00  # Penalty for wasting Special Energy on already charged Pokémon!
+                                        r_strategic -= 0.05  # Penalty for wasting Special Energy on already charged Pokémon!
                                     else:
                                         r_strategic += 0.50  # High reward for attaching Special/Double Energy to Mewtwo ex or Spidops ex!
                                         if pre.get("active_id") != target_card.cardId:
                                             r_strategic += 0.15  # Extra reward for charging benched attacker
                                 else:
-                                    r_strategic -= 2.50  # Severe penalty for wasting Special Energy on non-key attackers
+                                    r_strategic -= 0.10  # Severe penalty for wasting Special Energy on non-key attackers
                                     
                             # Basic energy attachment logic
                             elif attached_card.cardType == CardType.BASIC_ENERGY:
@@ -1045,27 +1046,27 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 if target_card.cardId == 431:
                                     if attached_card.cardId == 5: # Psychic
                                         if is_fully_charged:
-                                            r_strategic -= 0.50  # Penalty for overcharging Mewtwo ex!
+                                            r_strategic -= 0.05  # Penalty for overcharging Mewtwo ex!
                                         else:
                                             r_strategic += 0.50
                                             if pre.get("active_id") != target_card.cardId:
                                                 r_strategic += 0.10  # Charging Mewtwo ex on bench is also good
                                     elif attached_card.cardId == 1: # Grass
-                                        r_strategic -= 1.00 # Penalty for wasting Grass energy on Mewtwo ex!
+                                        r_strategic -= 0.10 # Penalty for wasting Grass energy on Mewtwo ex!
                                 # Spidops/Tarountula (401/400) requires Grass energy (1)
                                 elif target_card.cardId in [401, 400]:
                                     if attached_card.cardId == 1: # Grass
                                         if is_fully_charged:
-                                            r_strategic -= 0.50  # Penalty for overcharging Spidops/Tarountula!
+                                            r_strategic -= 0.05  # Penalty for overcharging Spidops/Tarountula!
                                         else:
                                             r_strategic += 0.50
                                             if pre.get("active_id") != target_card.cardId:
                                                 r_strategic += 0.10  # Charging on bench is also good
                                     elif attached_card.cardId == 5: # Psychic
-                                        r_strategic -= 0.50
+                                        r_strategic -= 0.05
                                 else:
                                     if is_fully_charged:
-                                        r_strategic -= 0.30
+                                        r_strategic -= 0.03
                                     else:
                                         target_is_attacker = target_card.ex or target_card.stage1 or target_card.stage2
                                         if target_is_attacker:
@@ -1126,14 +1127,14 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                       any(s.name == "Safeguard" or "ex" in s.text.lower() for s in getattr(opp_active_card, "skills", [])))
                         
                         if has_attack and not opp_immune:
-                            r_strategic -= 1.0  # Penalty for passing when we can attack (was -5.0, scaled down to avoid gradient explosion)
+                            r_strategic -= 0.10  # Penalty for passing when we can attack
                         elif has_attach and not energy_already_attached:
-                            r_strategic -= 3.0  # Big penalty for leaving energy in hand unattached
+                            r_strategic -= 0.15  # Big penalty for leaving energy in hand unattached
                         else:
                             r_strategic += 0.3  # Reward for good pass, offsetting flat stall penalty
                             
                         if post.get("bench_size", 0) == 0:
-                            r_strategic -= 1.0  # Big penalty for ending turn with 0 bench backup!
+                            r_strategic -= 0.10  # Big penalty for ending turn with 0 bench backup!
                             
                     elif action_type == 13:  # ATTACK
                         opp_active_card = get_card_data(pre.get("opp_active_id"))
@@ -1145,16 +1146,16 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             r_strategic -= 0.20  # Wastes turn to attack immune opponent
                         else:
                             if active_card is not None and active_card.cardId == 431:
-                                r_strategic += 0.60  # Extra high reward for attacking with Mewtwo ex!
+                                r_strategic += 1.50  # Boosted: reward attacking with Mewtwo ex
                             else:
-                                r_strategic += 0.25
+                                r_strategic += 0.75  # Boosted: reward standard attacks
                             
                     # 3. Bench Quality & Overextension Management
                     r_bench = 0.0
                     if post["bench_size"] == 0:
-                        r_bench -= 0.50  # Strongly penalise having no backup Pokemon!
+                        r_bench -= 0.05  # Strongly penalise having no backup Pokemon!
                         if post.get("turn", 0) <= 2:
-                            r_bench -= 0.50  # Extra -0.50 penalty during early turns (turn <= 2) to prevent turn 1 bench-out!
+                            r_bench -= 0.05  # Extra -0.05 penalty during early turns (turn <= 2)
 
                     elif post["bench_size"] == 5:
                         r_bench -= 0.02  # Overextension penalty
@@ -1164,7 +1165,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     if active_card is not None:
                         if active_card.cardId == 431:  # Mewtwo ex
                             if post.get("active_energies", 0) < 2:
-                                r_strategic -= 0.10  # Penalize having an uncharged Mewtwo ex active (charge on bench first)
+                                r_strategic -= 0.02  # Penalize having an uncharged Mewtwo ex active
                         elif active_card.ex or active_card.stage1 or active_card.stage2:
                             if post.get("active_energies", 0) < 2:
                                 r_strategic -= 0.02  # Penalty for having a weak/undercharged attacker active
@@ -1181,8 +1182,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     if i == 0:
                         rc_worker["prize_taken"] += r_prize_t
                         rc_worker["prize_lost"] += r_prize_l
-                        rc_worker["kos"] += r_ko
-                        rc_worker["own_kos"] += r_own_ko
+                        rc_worker["kos"] += prizes_taken
+                        rc_worker["own_kos"] += prizes_lost
                         rc_worker["energy"] += r_en
                         rc_worker["bench"] += r_bench
                         rc_worker["deckout"] += r_deck
@@ -1227,7 +1228,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         entropy_accum += entropy
                         entropy_count += 1
                         
-            result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, processed_samples, result, final_turn, rc_worker, entropy_accum, entropy_count, action_counts)))
+            result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, processed_samples, result, final_turn, rc_worker, entropy_accum, entropy_count, action_counts, played_cards)))
             
         elif cmd == "EVAL":
             sample_deck, opponent_deck, opponent_name = args
@@ -1651,6 +1652,8 @@ def main():
         
         epoch_rewards = []
         epoch_action_counts = {"attack": 0, "play": 0, "attach": 0, "evolve": 0, "ability": 0, "retreat": 0, "end": 0, "other": 0}
+        from collections import defaultdict
+        epoch_card_plays = defaultdict(int)
         rc = {"prize_taken": 0.0, "prize_lost": 0.0, "kos": 0.0, "own_kos": 0.0,
               "energy": 0.0, "bench": 0.0, "deckout": 0.0, "terminal": 0.0, "stall": 0.0,
               "no_energy": 0.0, "strategic": 0.0}
@@ -1761,12 +1764,16 @@ def main():
                 if msg == "PLAY_SELF_COMPLETE":
                     w_idx, samples, result, final_turn, rc_worker, e_accum, e_count = data[:7]
                     action_counts = data[7] if len(data) > 7 else {}
+                    played_cards = data[8] if len(data) > 8 else {}
                     
                     games_received += 1
                     
                     if action_counts:
                         for act_k, act_v in action_counts.items():
                             epoch_action_counts[act_k] += act_v
+                    if played_cards:
+                        for card_id, count in played_cards.items():
+                            epoch_card_plays[card_id] += count
                             
                     opp_name, opp_type, opp_path = active_tasks[w_idx]
                     
@@ -2054,6 +2061,27 @@ def main():
 
         print(f"Epoch Metrics Logged -> Win Rate: {win_rate:.1f}%, Loss: {avg_loss:.4f}, Reward: {avg_reward:.4f}, Active Elo: {active_elo:.1f}")
         print(f"Current Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+        
+        # Log and print card play statistics for the epoch
+        card_stats_path = os.path.join(run_dir, "card_play_stats.csv")
+        file_exists = os.path.exists(card_stats_path)
+        with open(card_stats_path, mode="a", newline="", encoding="utf-8-sig") as cs_f:
+            cs_writer = csv.writer(cs_f)
+            if not file_exists:
+                cs_writer.writerow(["epoch", "card_id", "card_name", "play_count"])
+            for cid, count in sorted(epoch_card_plays.items(), key=lambda x: x[1], reverse=True):
+                c_obj = card_table.get(cid)
+                c_name = c_obj.name if c_obj is not None else f"Card #{cid}"
+                cs_writer.writerow([counter, cid, c_name, count])
+        
+        # Print top 5 cards played this epoch
+        top_cards = sorted(epoch_card_plays.items(), key=lambda x: x[1], reverse=True)[:5]
+        if top_cards:
+            print("  Top Cards Played:")
+            for cid, count in top_cards:
+                c_obj = card_table.get(cid)
+                c_name = c_obj.name if c_obj is not None else f"Card #{cid}"
+                print(f"    - {c_name:<25}: {count} plays")
 
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     print("Stopping worker processes...")
