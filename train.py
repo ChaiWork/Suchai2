@@ -703,6 +703,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
 
                     
                 rewards = []
+                has_attacked_flag = False
+                has_taken_prize_flag = False
                 for step_idx in range(n_steps):
                     sample_obj, pre = player_samples[step_idx]
                     
@@ -772,6 +774,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             r_stall -= min(0.20, 0.02 * (lockout_turns - 3))
                         
                     r_prize_t = prizes_taken * 0.5 if prizes_taken > 0 else 0.0
+                    if prizes_taken > 0 and not has_taken_prize_flag:
+                        r_prize_t += 0.50
+                        has_taken_prize_flag = True
                     r_prize_l = prizes_lost * 0.35 if prizes_lost > 0 else 0.0  # Raised from 0.10 — symmetric with prize-taken to teach defensive play
                     r_ko = 0.0  # Removed: KO double-counts with r_prize_t (same game event triggers both)
                     r_own_ko = own_kos * 0.08 if own_kos > 0 else 0.0
@@ -784,6 +789,36 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     # Principal RL Scientist - Optimized Mewtwo ex Reward Shaping
                     r_strategic = 0.0
                     action_type = pre.get("action_type", -1)
+
+                    is_tr_pokemon = lambda cid: (get_card_data(cid) is not None and 
+                                                 get_card_data(cid).cardType == CardType.POKEMON and 
+                                                 "rocket" in get_card_data(cid).name.lower())
+
+                    # Tactic 1: Race the TR ability gate (first 3 turns)
+                    if post.get("turn", 0) <= 3:
+                        active_id_post = post.get("active_id", -1)
+                        bench_ids_post = post.get("bench_ids", [])
+                        tr_count = 0
+                        if is_tr_pokemon(active_id_post):
+                            tr_count += 1
+                        for bid in bench_ids_post:
+                            if is_tr_pokemon(bid):
+                                tr_count += 1
+                        
+                        if tr_count < 4:
+                            # Reward playing/boarding a TR Pokemon
+                            if action_type == 7:  # PLAY
+                                played_id = pre.get("played_card_id", -1)
+                                if is_tr_pokemon(played_id):
+                                    r_strategic += 0.25
+                            # Reward using search/draw to pull TR Pokemon
+                            if action_type == 7 and pre.get("played_card_id", -1) in [1134, 1216, 1220]:  # Transceiver, Ariana, Proton
+                                r_strategic += 0.15
+                            # Penalize attaching to Mewtwo early if we have < 3 TR mons
+                            if action_type == 8 and tr_count < 3:  # ATTACH
+                                attached_target = pre.get("attached_target_id", -1)
+                                if attached_target == 431:  # Mewtwo ex
+                                    r_strategic -= 0.10
                     
                     # 0. Active Spot Promotion Guard (SelectContext.TO_ACTIVE)
                     if pre.get("context") == SelectContext.TO_ACTIVE:
@@ -977,6 +1012,12 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         target_card = get_card_data(target_id)
                         
                         if attached_card is not None and target_card is not None:
+                            # Reward charging benched Mimikyu (434) when opponent has active Safeguard (ex-immunity)
+                            opp_active_card = get_card_data(pre.get("opp_active_id"))
+                            opp_has_safeguard = opp_active_card is not None and any(s.name == "Safeguard" or "ex" in s.text.lower() for s in getattr(opp_active_card, "skills", []))
+                            if opp_has_safeguard and target_id == 434 and target_id in pre.get("bench_ids", []):
+                                r_strategic += 0.15
+
                             target_is_blocker = is_defensive_blocker(target_card)
                             
                             # Defensive/barrier blockers should never get energy attachments
@@ -1100,7 +1141,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         r_strategic += 0.05
                         
                     elif action_type == 12:  # RETREAT
-                        r_strategic -= 0.15
+                        r_strategic -= 0.40  # Increased penalty to prevent panic retreat-loops
                         opp_active_card = get_card_data(pre.get("opp_active_id"))
                         active_card = get_card_data(pre.get("active_id"))
                         post_active_card = get_card_data(post.get("active_id"))
@@ -1149,6 +1190,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 r_strategic += 1.50  # Boosted: reward attacking with Mewtwo ex
                             else:
                                 r_strategic += 0.75  # Boosted: reward standard attacks
+                            if not has_attacked_flag:
+                                r_strategic += 0.25
+                                has_attacked_flag = True
                             
                     # 3. Bench Quality & Overextension Management
                     r_bench = 0.0
@@ -1177,11 +1221,19 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     if i == 0 and opponent_name == "Rulebasedmodel_Abomasnow":
                         opp_active_now = pre.get("opp_active_id", -1)
                         my_active_now = pre.get("active_id", -1)
+                        
+                        # Tactic 2: Snipe Snover pre-evolution for tempo blowout
+                        if prizes_taken > 0 and opp_active_now == 722:
+                            r_strategic += 1.0
+                            
                         # Reward attacking Snover (722) or Kyogre (721) -- easy prizes before full setup
                         if action_type == 13 and opp_active_now in [721, 722]:
                             r_strategic += 0.30
-                        # Keep Mewtwo ex (431) active vs Mega Abomasnow ex (723) -- survives Hammer-lanche
+                            
+                        # Tactic 3: Exploit retreat-4 lock on Abomasnow (723)
                         if opp_active_now == 723:
+                            if action_type == 13:  # ATTACK
+                                r_strategic += 0.20  # Chip damage reward
                             if my_active_now == 431:
                                 r_strategic += 0.10
                             elif my_active_now in [400, 434]:  # Tarountula/Mimikyu get one-shotted
@@ -1582,7 +1634,7 @@ def main():
     # Train against all opponent decks (including Iono) to learn card-specific
     # counters and strategies, and evaluate against all decks to check progress.
     train_opponent_names = all_opponent_names
-    test_opponent_names = all_opponent_names
+    test_opponent_names = ["Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo"]#all_opponent_names
 
     print(f"Opponent Decks Configuration:")
     print(f"  -> Train Opponent Decks: {train_opponent_names}")
@@ -1759,6 +1811,22 @@ def main():
                         weights.append(max(0.1, 1.0 - wr))
                     w_sum = sum(weights)
                     probs = [w / w_sum for w in weights]
+                    
+                    # Cap Abomasnow selection probability at 35% to avoid defensive collapse / replay buffer flooding
+                    if "Rulebasedmodel_Abomasnow" in train_opponent_names:
+                        abo_idx = train_opponent_names.index("Rulebasedmodel_Abomasnow")
+                        if probs[abo_idx] > 0.35:
+                            diff = probs[abo_idx] - 0.35
+                            probs[abo_idx] = 0.35
+                            other_indices = [idx for idx in range(len(probs)) if idx != abo_idx]
+                            other_sum = sum(probs[idx] for idx in other_indices)
+                            if other_sum > 0:
+                                for idx in other_indices:
+                                    probs[idx] += diff * (probs[idx] / other_sum)
+                            else:
+                                for idx in other_indices:
+                                    probs[idx] += diff / len(other_indices)
+
                     opponent_name = random.choices(train_opponent_names, weights=probs, k=1)[0]
                     opponent_deck = opponent_decks[opponent_name]
                     opponent_type = "Rulebased"
