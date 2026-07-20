@@ -794,31 +794,30 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                                  get_card_data(cid).cardType == CardType.POKEMON and 
                                                  "rocket" in get_card_data(cid).name.lower())
 
-                    # Tactic 1: Race the TR ability gate (first 3 turns)
-                    if post.get("turn", 0) <= 3:
-                        active_id_post = post.get("active_id", -1)
-                        bench_ids_post = post.get("bench_ids", [])
-                        tr_count = 0
-                        if is_tr_pokemon(active_id_post):
+                    # Tactic 1: Race the TR ability gate (Mewtwo ex needs 4 TR mons boarded to attack)
+                    active_id_post = post.get("active_id", -1)
+                    bench_ids_post = post.get("bench_ids", [])
+                    tr_count = 0
+                    if is_tr_pokemon(active_id_post):
+                        tr_count += 1
+                    for bid in bench_ids_post:
+                        if is_tr_pokemon(bid):
                             tr_count += 1
-                        for bid in bench_ids_post:
-                            if is_tr_pokemon(bid):
-                                tr_count += 1
-                        
-                        if tr_count < 4:
-                            # Reward playing/boarding a TR Pokemon
-                            if action_type == 7:  # PLAY
-                                played_id = pre.get("played_card_id", -1)
-                                if is_tr_pokemon(played_id):
-                                    r_strategic += 0.25
-                            # Reward using search/draw to pull TR Pokemon
-                            if action_type == 7 and pre.get("played_card_id", -1) in [1134, 1216, 1220]:  # Transceiver, Ariana, Proton
-                                r_strategic += 0.15
-                            # Penalize attaching to Mewtwo early if we have < 3 TR mons
-                            if action_type == 8 and tr_count < 3:  # ATTACH
-                                attached_target = pre.get("attached_target_id", -1)
-                                if attached_target == 431:  # Mewtwo ex
-                                    r_strategic -= 0.10
+                    
+                    if tr_count < 4:
+                        # Reward playing/boarding a TR Pokemon
+                        if action_type == 7:  # PLAY
+                            played_id = pre.get("played_card_id", -1)
+                            if is_tr_pokemon(played_id):
+                                r_strategic += 0.25
+                        # Reward using search/draw to pull TR Pokemon
+                        if action_type == 7 and pre.get("played_card_id", -1) in [1094, 1121, 1134, 1216, 1220]:  # Bug Catching Set, Ultra Ball, Transceiver, Ariana, Proton
+                            r_strategic += 0.15
+                        # Penalize attaching to Mewtwo early if we have < 3 TR mons
+                        if action_type == 8 and tr_count < 3:  # ATTACH
+                            attached_target = pre.get("attached_target_id", -1)
+                            if attached_target == 431:  # Mewtwo ex
+                                r_strategic -= 0.10
                     
                     # 0. Active Spot Promotion Guard (SelectContext.TO_ACTIVE)
                     if pre.get("context") == SelectContext.TO_ACTIVE:
@@ -1218,29 +1217,53 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
 
                         
                     # 5. Opponent-Specific Counter Rewards
-                    if i == 0 and opponent_name == "Rulebasedmodel_Abomasnow":
+                    if i == 0:
                         opp_active_now = pre.get("opp_active_id", -1)
                         my_active_now = pre.get("active_id", -1)
                         
-                        # Tactic 2: Snipe Snover pre-evolution for tempo blowout
-                        if prizes_taken > 0 and opp_active_now == 722:
-                            r_strategic += 1.0
-                            
-                        # Reward attacking Snover (722) or Kyogre (721) -- easy prizes before full setup
-                        if action_type == 13 and opp_active_now in [721, 722]:
-                            r_strategic += 0.30
-                            
-                        # Tactic 3: Exploit retreat-4 lock on Abomasnow (723)
-                        if opp_active_now == 723:
-                            if action_type == 13:  # ATTACK
-                                r_strategic += 0.20  # Chip damage reward
-                            if my_active_now == 431:
-                                r_strategic += 0.10
-                            elif my_active_now in [400, 434]:  # Tarountula/Mimikyu get one-shotted
-                                r_strategic -= 0.20
-                        # Reward patience (end turn) when Abomasnow is close to self-deckout via Hammer-lanche
-                        if opp_deck_size <= 10 and action_type == 14:
-                            r_strategic += 0.25
+                        # --- ABOMASNOW COUNTERS ---
+                        if opponent_name == "Rulebasedmodel_Abomasnow":
+                            # Tactic 2: Snipe Snover pre-evolution for tempo blowout
+                            if prizes_taken > 0 and opp_active_now == 722:
+                                r_strategic += 1.0
+                            # Reward attacking Snover (722) or Kyogre (721) -- easy prizes before full setup
+                            if action_type == 13 and opp_active_now in [721, 722]:
+                                r_strategic += 0.30
+                            # Tactic 3: Exploit retreat-4 lock & Mimikyu Wall vs Abomasnow ex (723)
+                            if opp_active_now == 723:
+                                if action_type == 13:  # ATTACK
+                                    r_strategic += 0.20  # Chip damage reward
+                                if my_active_now == 434:  # Mimikyu is active wall
+                                    r_strategic += 0.30
+                                elif my_active_now == 431:  # Mewtwo ex active is a risk
+                                    r_strategic -= 0.20
+                                elif my_active_now == 400:
+                                    r_strategic -= 0.20
+                                # Reward attaching energy to Mimikyu (434) when Abomasnow ex is active
+                                if action_type == 8 and pre.get("attached_target_id", -1) == 434:
+                                    r_strategic += 0.20
+                            # Reward patience (end turn) when Abomasnow is close to self-deckout via Hammer-lanche
+                            if opp_deck_size <= 10 and action_type == 14:
+                                    r_strategic += 0.25
+                                    
+                        # --- DRAGOPULT COUNTERS ---
+                        elif opponent_name == "Rulebasedmodel_Dragapult":
+                            # Snipe Dreepy (119) or Drakloak (120) pre-evolutions for tempo blowout
+                            if prizes_taken > 0 and opp_active_now in [119, 120]:
+                                r_strategic += 1.0
+                            # Mimikyu Wall vs Dragapult ex (121)
+                            if opp_active_now == 121:
+                                if my_active_now == 434:  # Mimikyu is immune active wall
+                                    r_strategic += 0.30
+                                elif my_active_now == 431:  # Mewtwo ex is a liability
+                                    r_strategic -= 0.20
+                                # Reward attaching energy to Mimikyu (434) when Dragapult ex is active
+                                if action_type == 8 and pre.get("attached_target_id", -1) == 434:
+                                    r_strategic += 0.20
+                                # Bench conservation: penalise overextension vs spread damage
+                                b_size = post.get("bench_size", 0)
+                                if b_size > 3:
+                                    r_strategic -= 0.15 * (b_size - 3)
 
                     r_deck = 0.0
                     if post["deck_size"] == 0:
@@ -1504,7 +1527,7 @@ def main():
 
     opponent_decks = load_all_decks()
     # Filter opponent decks to exclude inefficient random agent models ,,,
-    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Abomasnow","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo"]}
+    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Abomasnow","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo","Rulebasedmodel_Dragapult"]}
     if not opponent_decks:
         raise ValueError("No valid deck.csv found in root or subdirectories.")
         
@@ -1634,7 +1657,7 @@ def main():
     # Train against all opponent decks (including Iono) to learn card-specific
     # counters and strategies, and evaluate against all decks to check progress.
     train_opponent_names = all_opponent_names
-    test_opponent_names = ["Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo"]#all_opponent_names
+    test_opponent_names = ["Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo"]
 
     print(f"Opponent Decks Configuration:")
     print(f"  -> Train Opponent Decks: {train_opponent_names}")
