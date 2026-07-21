@@ -491,6 +491,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         "stadium_id": stadium_id,
                         "bench_ids": bench_ids,
                         "bench_energies": [len(p.energyCards) for p in state_ps.bench if p is not None],
+                        "bench_damage": [p.maxHp - p.hp for p in state_ps.bench if p is not None],
                         "hand_size": len(state_ps.hand) if state_ps.hand is not None else 0,
                         "hand_ids": [c.id for c in state_ps.hand if c is not None] if state_ps.hand is not None else [],
                         "discard_size": len(state_ps.discard) if state_ps.discard is not None else 0,
@@ -749,6 +750,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             "stadium_id": final_stadium_id,
                             "bench_ids": final_bench_ids,
                             "bench_energies": [len(p.energyCards) for p in final_ps.bench if p is not None],
+                            "bench_damage": [p.maxHp - p.hp for p in final_ps.bench if p is not None],
                             "hand_size": len(final_ps.hand) if final_ps.hand is not None else 0,
                             "hand_ids": [c.id for c in final_ps.hand if c is not None] if final_ps.hand is not None else [],
                             "discard_size": len(final_ps.discard) if final_ps.discard is not None else 0,
@@ -872,6 +874,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         played_card = get_card_data(played_id)
                         
                         if played_card is not None:
+                            # Strategic trainer/supporter/tool/stadium cards played (includes Wobbuffet mirror redirect & Cape tools)
+                            if played_id in [1094, 1097, 1116, 1129, 1152, 1159, 1175, 1121, 1134, 1216, 1217, 1218, 1219, 1220, 1227, 1257]:
+                                r_strategic += 0.08
+                                
                             # Board development: play basic Pokemon to bench
                             if played_card.cardType == CardType.POKEMON:
                                 if played_card.basic:
@@ -1023,6 +1029,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             opp_has_safeguard = opp_active_card is not None and any(s.name == "Safeguard" or "ex" in s.text.lower() for s in getattr(opp_active_card, "skills", []))
                             if opp_has_safeguard and target_id == 434 and target_id in pre.get("bench_ids", []):
                                 r_strategic += 0.15
+                                
+                            # Reward manual energy attachment to Mimikyu (434) when opponent has active ex Pokemon
+                            opp_is_ex = opp_active_card is not None and getattr(opp_active_card, "ex", False)
+                            if opp_is_ex and target_id == 434:
+                                r_strategic += 0.30
 
                             target_is_blocker = is_defensive_blocker(target_card)
                             
@@ -1167,6 +1178,17 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 opp_hp = pre.get("opp_active_hp", 999)
                                 if opp_hp <= 280:
                                     r_strategic -= 0.80  # Strong penalty for fleeing when KO is guaranteed
+                                    
+                        # Strategic retreat to Mimikyu Wall (434) against opponent ex Pokemon
+                        opp_is_ex = opp_active_card is not None and getattr(opp_active_card, "ex", False)
+                        if opp_is_ex and post_active_card is not None and post_active_card.cardId == 434:
+                            r_strategic += 0.60  # Reward retreating to Mimikyu wall to stall/neutralise opponent ex!
+                            
+                        # KO Prevention: Strategic retreat from damaged Mewtwo ex (431) to a defensive blocker (Articuno/Wobbuffet/Mimikyu)
+                        if active_card is not None and active_card.cardId == 431:
+                            if pre.get("active_hp", 280) <= 140:  # Mewtwo ex is damaged / half HP
+                                if post_active_card is not None and is_defensive_blocker(post_active_card):
+                                    r_strategic += 0.50  # Reward retreating to Articuno/Wobbuffet/Mimikyu to save Mewtwo ex!
                             
                     elif action_type == 14:  # END (Turn Stall Decisions)
                         has_attack = pre.get("has_attack_option", False)
@@ -1179,14 +1201,20 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                       any(s.name == "Safeguard" or "ex" in s.text.lower() for s in getattr(opp_active_card, "skills", [])))
                         
                         if has_attack and not opp_immune:
-                            r_strategic -= 0.10  # Penalty for passing when we can attack
+                            r_strategic -= 0.80  # Boosted: Heavy penalty for passing when we can attack
                         elif has_attach and not energy_already_attached:
-                            r_strategic -= 0.15  # Big penalty for leaving energy in hand unattached
+                            r_strategic -= 0.80  # Boosted: Heavy penalty for leaving energy in hand unattached
                         else:
                             r_strategic += 0.02  # Near-zero: just offsets stall tax, net ~0 per forced pass; prevents stall farming
                             
                         if post.get("bench_size", 0) == 0:
-                            r_strategic -= 0.10  # Big penalty for ending turn with 0 bench backup!
+                            r_strategic -= 0.60  # Boosted: Heavy penalty for ending turn with 0 bench backup!
+                            
+                        # Penalty for ending turn with basic Pokemon in hand when bench is not full
+                        has_basic_in_hand = any(cid in [400, 414, 431, 434, 432, 463] for cid in post.get("hand_ids", []))
+                        bench_size_post = post.get("bench_size", 0)
+                        if has_basic_in_hand and bench_size_post < 5:
+                            r_strategic -= 0.40  # Penalty for leaving basics in hand unplayed
                             
                     elif action_type == 13:  # ATTACK
                         opp_active_card = get_card_data(pre.get("opp_active_id"))
@@ -1197,7 +1225,29 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         if opp_immune:
                             r_strategic -= 0.20  # Wastes turn to attack immune opponent
                         else:
-                            if active_card is not None and active_card.cardId == 431:
+                            att_id = pre.get("attack_id", -1)
+                            if att_id == 560:  # Rocket Rush
+                                # Count Team Rocket Pokemon in play (active + bench) in pre state
+                                tr_count_pre = 0
+                                active_id_pre = pre.get("active_id", -1)
+                                bench_ids_pre = pre.get("bench_ids", [])
+                                if is_tr_pokemon(active_id_pre):
+                                    tr_count_pre += 1
+                                for bid in bench_ids_pre:
+                                    if is_tr_pokemon(bid):
+                                        tr_count_pre += 1
+                                
+                                # Scale reward dynamically with board size:
+                                # 2 TR mons -> 0.05, 3 -> 0.13, 4 -> 0.21, 5 -> 0.29, 6 -> 0.37
+                                r_strategic += 0.05 + 0.08 * (tr_count_pre - 2) if tr_count_pre >= 2 else 0.02
+                            elif att_id == 609:  # Rocket Mirror
+                                # Reward based on amount of damage counters healed/redirected
+                                pre_dmg = sum(pre.get("bench_damage", []))
+                                post_dmg = sum(post.get("bench_damage", []))
+                                healed = pre_dmg - post_dmg
+                                if healed > 0:
+                                    r_strategic += 0.02 * healed
+                            elif active_card is not None and active_card.cardId == 431:
                                 r_strategic += 1.50  # Boosted: reward attacking with Mewtwo ex
                             else:
                                 r_strategic += 0.75  # Boosted: reward standard attacks
@@ -1289,10 +1339,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 # Reward attaching energy to Mimikyu (434) to charge Gemstone Mimicry (needs [P][C])
                                 if action_type == 8 and pre.get("attached_target_id", -1) == 434:
                                     r_strategic += 0.30
-                                # Bench conservation: penalise overextension vs spread damage
-                                b_size = post.get("bench_size", 0)
-                                if b_size > 3:
-                                    r_strategic -= 0.15 * (b_size - 3)
+                                    
+                            # Bench conservation: penalise overextension vs spread damage (moved outside ex check)
+                            b_size = post.get("bench_size", 0)
+                            if b_size > 3:
+                                r_strategic -= 0.15 * (b_size - 3)
 
                     r_deck = 0.0
                     if post["deck_size"] == 0:
@@ -1374,7 +1425,35 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     break
                     
                 if obs["current"]["yourIndex"] == your_index:
-                    selected, _ = mcts_agent(obs, sample_deck, client)
+                    # Replicate Kaggle search count budget constraints during evaluation
+                    turn = obs["current"].get("turn", 0)
+                    active_is_walled = False
+                    try:
+                        my_active = obs["current"]["players"][your_index]["active"]
+                        opp_active = obs["current"]["players"][1 - your_index]["active"]
+                        if my_active and opp_active:
+                            if my_active[0]["id"] == 431 and opp_active[0]["id"] == 434:
+                                active_is_walled = True
+                    except Exception:
+                        pass
+                        
+                    is_main_context = False
+                    try:
+                        if obs.get("select") is not None and obs["select"].get("context") == SelectContext.MAIN:
+                            is_main_context = True
+                    except Exception:
+                        pass
+                        
+                    if active_is_walled or is_main_context:
+                        eval_search_count = 35
+                    elif turn <= 3:
+                        eval_search_count = 20
+                    elif turn <= 8:
+                        eval_search_count = 15
+                    else:
+                        eval_search_count = 10
+                        
+                    selected, _ = mcts_agent(obs, sample_deck, client, search_count=eval_search_count)
                 else:
                     if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Abomasnow","Rulebasedmodel_Mewtwo_Wobbuffet"]:
                         try:
@@ -1686,7 +1765,7 @@ def main():
     # Train against all opponent decks (including Iono) to learn card-specific
     # counters and strategies, and evaluate against all decks to check progress.
     train_opponent_names = all_opponent_names
-    test_opponent_names = ["Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo","Rulebasedmodel_Mewtwo_Wobbuffet"]
+    test_opponent_names = ["Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Wobbuffet", "Rulebasedmodel_Dragapult"]
 
     print(f"Opponent Decks Configuration:")
     print(f"  -> Train Opponent Decks: {train_opponent_names}")

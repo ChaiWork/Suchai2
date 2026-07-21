@@ -450,7 +450,7 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     # Caps simulations in the Kaggle runtime environment to avoid TIMEOUT (no GPU)
     IS_KAGGLE = os.path.exists('/kaggle_simulations/agent') or 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
     if IS_KAGGLE:
-        dynamic_search_count = min(dynamic_search_count, 15)
+        dynamic_search_count = min(dynamic_search_count, 40)
 
     # Search loop
     for _ in range(dynamic_search_count):
