@@ -389,7 +389,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
             opp_model = None
             if opponent_path is not None:
                 try:
-                    opp_model = MyModel(
+                    _opp_model_module = MyModel(
                         MODEL_D_MODEL,
                         MODEL_NUM_HEADS,
                         MODEL_D_FEEDFORWARD,
@@ -398,10 +398,12 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     ).to(device)
                     checkpoint = torch.load(opponent_path, map_location=device, weights_only=True)
                     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-                        opp_model.load_state_dict(checkpoint["state_dict"], strict=False)
+                        _opp_model_module.load_state_dict(checkpoint["state_dict"], strict=False)
                     else:
-                        opp_model.load_state_dict(checkpoint, strict=False)
-                    opp_model.eval()
+                        _opp_model_module.load_state_dict(checkpoint, strict=False)
+                    _opp_model_module.eval()
+                    # FIX #10: wrap in GPUInferenceClient — mcts_agent expects .infer(), not nn.Module
+                    opp_model = GPUInferenceClient(_opp_model_module, device)
                 except Exception as e:
                     opp_model = None
             
@@ -692,6 +694,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 if n_steps == 0:
                     continue
                     
+                # Track if player went second (their first turn occurred on game turn 2)
+                first_turn_of_player = player_samples[0][1].get("turn", 1)
+                went_second = (first_turn_of_player == 2)
+                
                 num_attacks = sum(1 for _, pre in player_samples if pre.get("action_type") == 13)
                 if i == result:
                     if num_attacks == 0:
@@ -700,17 +706,25 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         terminal_reward = 0.0
                     else:
                         terminal_reward = 5.0
+                        if went_second:
+                            terminal_reward += 1.0  # Extra +1.0 reward for winning when starting second!
                 elif result == 2:
                     terminal_reward = 0.0   # Draw: neutral outcome — not penalised like a loss
                 elif result == -1:
                     terminal_reward = -5.0  # Error/invalid game — treat as loss
                 else:
-                    terminal_reward = -5.0
+                    # FIX #5: Prize-aware loss — softer penalty for competitive losses
+                    # -5.0 (0 prizes taken) up to -2.5 (5 prizes taken before losing)
+                    start_prizes = player_samples[0][1].get("prizes", 6)
+                    end_prizes = player_samples[-1][1].get("prizes", 6)
+                    prizes_taken_total = max(0, start_prizes - end_prizes)
+                    terminal_reward = max(-5.0, -5.0 + prizes_taken_total * 0.5)
 
                     
                 rewards = []
                 has_attacked_flag = False
                 has_taken_prize_flag = False
+                has_lost_prize_flag = False  # FIX #4: symmetric first-prize-lost penalty
                 for step_idx in range(n_steps):
                     sample_obj, pre = player_samples[step_idx]
                     
@@ -787,6 +801,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         r_prize_t += 0.50
                         has_taken_prize_flag = True
                     r_prize_l = prizes_lost * 0.35 if prizes_lost > 0 else 0.0  # Raised from 0.10 — symmetric with prize-taken to teach defensive play
+                    # FIX #4: symmetric first-prize-lost penalty to match first-prize-taken bonus
+                    if prizes_lost > 0 and not has_lost_prize_flag:
+                        r_prize_l += 0.35
+                        has_lost_prize_flag = True
                     r_ko = 0.0  # Removed: KO double-counts with r_prize_t (same game event triggers both)
                     r_own_ko = own_kos * 0.08 if own_kos > 0 else 0.0
                     
@@ -798,6 +816,13 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     # Principal RL Scientist - Optimized Mewtwo ex Reward Shaping
                     r_strategic = 0.0
                     action_type = pre.get("action_type", -1)
+
+                    # Going second tactical exploitation bonus on first turn
+                    if went_second and step_idx == 0:
+                        if action_type == 13:  # ATTACK on turn 1 going second (exploiting going second attack rule)
+                            r_strategic += 0.35
+                        elif action_type in [7, 8]:  # PLAY / ATTACH on turn 1 going second
+                            r_strategic += 0.15
 
                     is_tr_pokemon = lambda cid: (get_card_data(cid) is not None and 
                                                  get_card_data(cid).cardType == CardType.POKEMON and 
@@ -819,9 +844,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             played_id = pre.get("played_card_id", -1)
                             if is_tr_pokemon(played_id):
                                 r_strategic += 0.25
-                        # Reward using search/draw to pull TR Pokemon
-                        if action_type == 7 and pre.get("played_card_id", -1) in [1094, 1121, 1134, 1216, 1220]:  # Bug Catching Set, Ultra Ball, Transceiver, Ariana, Proton
-                            r_strategic += 0.15
+                        # FIX #3: Removed Tactic-1 search card bonus — it double-fired with the
+                        # per-card contextual reward block added later (e.g. Ariana → +0.15 here
+                        # + up to +0.30 in the Ariana branch = accidental +0.45 stacking).
                         # Penalize attaching to Mewtwo early if we have < 3 TR mons
                         if action_type == 8 and tr_count < 3:  # ATTACH
                             attached_target = pre.get("attached_target_id", -1)
@@ -874,8 +899,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         played_card = get_card_data(played_id)
                         
                         if played_card is not None:
-                            # Strategic trainer/supporter/tool/stadium cards played (includes Wobbuffet mirror redirect & Cape tools)
-                            if played_id in [1094, 1097, 1116, 1129, 1152, 1159, 1175, 1121, 1134, 1216, 1217, 1218, 1219, 1220, 1227, 1257]:
+                            # Generic trainer/tool/stadium cards played without custom handler blocks below
+                            if played_id in [1116, 1159, 1175, 1121, 1134, 1257]:
                                 r_strategic += 0.08
                                 
                             # Board development: play basic Pokemon to bench
@@ -959,60 +984,170 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 else:
                                     r_strategic -= 0.05
                                     
-                            # Bug Catching Set / Night Stretcher play logic
-                            elif "Bug Catching Set" in played_card.name or "Night Stretcher" in played_card.name:
-                                hand_diff = post["hand_size"] - pre["hand_size"]
-                                if hand_diff >= 0:
-                                    r_strategic += 0.10  # Item search/retrieval success
+                            # Bug Catching Set: rewards finding Grass Pokemon or Grass Energy into hand
+                            elif played_id == 1094:  # Bug Catching Set
+                                post_hand = post.get("hand_ids", [])
+                                pre_hand  = pre.get("hand_ids", [])
+                                grass_mon_ids = [400, 401]  # Tarountula, Spidops
+                                grass_energy_id = 1  # Basic Grass Energy
+                                found_grass_mon    = any(cid in post_hand and cid not in pre_hand for cid in grass_mon_ids)
+                                found_grass_energy = post_hand.count(grass_energy_id) > pre_hand.count(grass_energy_id)
+                                spidops_in_play = (pre.get("active_id") == 401 or 401 in pre.get("bench_ids", []))
+                                if found_grass_mon and not spidops_in_play:
+                                    r_strategic += 0.25  # Found Spidops line when not yet on field
+                                elif found_grass_mon:
+                                    r_strategic += 0.15  # Found TR mon for wider Rocket Rush board
+                                elif found_grass_energy:
+                                    r_strategic += 0.12  # Found Grass Energy for charging
                                 else:
-                                    r_strategic -= 0.05
-                                    
-                            # Team Rocket's Archer play logic
-                            elif "Archer" in played_card.name:
-                                if post["energy"] > pre["energy"]:
-                                    r_strategic += 0.15  # Energy acceleration reward
+                                    r_strategic -= 0.08  # Whiffed — nothing found
+
+                            # Night Stretcher: rewards recovering a high-value KO'd attacker or energy
+                            elif played_id == 1097:  # Night Stretcher
+                                pre_discard  = pre.get("discard_ids", [])
+                                post_hand    = post.get("hand_ids", [])
+                                pre_hand     = pre.get("hand_ids", [])
+                                attacker_ids = [431, 401, 400]  # Mewtwo ex, Spidops, Tarountula
+                                energy_ids   = [15, 1, 5]  # TR Energy, Grass, Psychic
+                                got_attacker = any(cid in post_hand and cid not in pre_hand for cid in attacker_ids)
+                                got_energy   = any(cid in post_hand and cid not in pre_hand for cid in energy_ids)
+                                has_attacker_discard = any(cid in pre_discard for cid in attacker_ids)
+                                prizes_opp = pre.get("prizes_remaining_opp", 3)
+                                if got_attacker and prizes_opp <= 2:
+                                    r_strategic += 0.40  # Emergency: recovered attacker when opponent is close to winning
+                                elif got_attacker:
+                                    r_strategic += 0.25  # Recovered a KO'd attacker
+                                elif got_energy:
+                                    r_strategic += 0.15  # Recovered energy (good secondary use)
+                                elif has_attacker_discard and not got_attacker:
+                                    r_strategic -= 0.10  # Should have recovered attacker but didn't
+                                else:
+                                    r_strategic += 0.05  # Neutral recovery
+
+                            # Team Rocket's Archer: reward accelerating energy to useful Pokemon
+                            elif played_id == 1217:  # Team Rocket's Archer
+                                post_bench_energies = post.get("bench_energies", [])
+                                pre_bench_energies  = pre.get("bench_energies", [])
+                                bench_energy_gained = sum(post_bench_energies) - sum(pre_bench_energies)
+                                active_energy_gained = post.get("active_energies", 0) - pre.get("active_energies", 0)
+                                total_energy_gained = bench_energy_gained + active_energy_gained
+                                post_bench = post.get("bench_ids", [])
+                                spidops_bench_idx = next((i for i, bid in enumerate(post_bench) if bid == 401), None)
+                                if spidops_bench_idx is not None and spidops_bench_idx < len(post_bench_energies):
+                                    pre_sp_e = pre_bench_energies[spidops_bench_idx] if spidops_bench_idx < len(pre_bench_energies) else 0
+                                    if post_bench_energies[spidops_bench_idx] > pre_sp_e:
+                                        r_strategic += 0.25  # Accelerated to Spidops — Rocket Rush setup
+                                    elif total_energy_gained > 0:
+                                        r_strategic += 0.15  # Accelerated energy to some Pokemon
+                                    else:
+                                        r_strategic -= 0.10  # No energy accelerated — wasted Supporter slot
+                                elif total_energy_gained > 0:
+                                    r_strategic += 0.15
                                 else:
                                     r_strategic -= 0.10
-                                    
-                            # Lillie's Determination / Team Rocket's Ariana / Proton draw logic
-                            elif any(name in played_card.name for name in ["Lillie", "Ariana", "Proton"]):
-                                hand_diff = post["hand_size"] - pre["hand_size"]
-                                if hand_diff > 1:
-                                    r_strategic += 0.10  # Draw supporter success
+
+                            # Team Rocket's Ariana: reward benching TR Pokemon onto board
+                            elif played_id == 1216:  # Team Rocket's Ariana
+                                pre_bench_size  = len(pre.get("bench_ids", []))
+                                post_bench_size = len(post.get("bench_ids", []))
+                                tr_mons_added   = post_bench_size - pre_bench_size
+                                hand_diff       = post["hand_size"] - pre["hand_size"]
+                                if tr_mons_added >= 2:
+                                    r_strategic += 0.30  # Flooded the board — massive Rocket Rush setup
+                                elif tr_mons_added == 1:
+                                    r_strategic += 0.20  # Benched 1 TR mon + drew cards
+                                elif hand_diff >= 2:
+                                    r_strategic += 0.10  # Drew cards but couldn't bench
+                                else:
+                                    r_strategic -= 0.05  # Wasted Supporter slot
+
+                            # Team Rocket's Proton: reward drawing cards and filling hand
+                            elif played_id == 1220:  # Team Rocket's Proton
+                                hand_before = pre["hand_size"]
+                                hand_after  = post["hand_size"]
+                                hand_diff   = hand_after - hand_before
+                                if hand_before <= 3 and hand_diff >= 2:
+                                    r_strategic += 0.20  # Refilled a thin hand — high value
+                                elif hand_diff >= 2:
+                                    r_strategic += 0.10  # Normal draw — useful
+                                elif hand_before >= 6:
+                                    r_strategic -= 0.10  # Wasted draw with full hand
+                                else:
+                                    r_strategic += 0.05  # Neutral
+
+                            # Lillie's Determination: reward late-game or thin-hand draw
+                            elif played_id == 1227:  # Lillie's Determination
+                                hand_before = pre["hand_size"]
+                                hand_after  = post["hand_size"]
+                                hand_diff   = hand_after - hand_before
+                                if hand_before <= 3 and hand_diff >= 2:
+                                    r_strategic += 0.20  # Thin hand refill — max value
+                                elif hand_diff >= 2:
+                                    r_strategic += 0.10  # Effective draw
+                                elif hand_before >= 6:
+                                    r_strategic -= 0.08  # Wasted with already full hand
+                                else:
+                                    r_strategic += 0.05
+
+                            # Team Rocket's Petrel: reward recovering a high-value discarded card
+                            elif played_id == 1219:  # Team Rocket's Petrel
+                                pre_discard = pre.get("discard_ids", [])
+                                post_hand   = post.get("hand_ids", [])
+                                high_value_ids = [1216, 1218, 1220, 1217, 1227, 1129, 1116, 1097, 1159, 1175]
+                                recovered_high_value = any(cid in post_hand and cid in pre_discard for cid in high_value_ids)
+                                if recovered_high_value:
+                                    r_strategic += 0.25  # Recovered a key Supporter or unique Item
+                                elif post["hand_size"] > pre["hand_size"]:
+                                    r_strategic += 0.10  # Recovered something useful
+                                else:
+                                    r_strategic -= 0.05  # Nothing useful to recover
+
+                            # Poke Pad: reward reloading Supporter pile when discard has Supporters
+                            elif played_id == 1152:  # Poke Pad
+                                pre_discard = pre.get("discard_ids", [])
+                                supporter_ids_all = [1216, 1217, 1218, 1219, 1220, 1227]
+                                num_supporters_in_discard = sum(1 for cid in pre_discard if cid in supporter_ids_all)
+                                if num_supporters_in_discard >= 3:
+                                    r_strategic += 0.30  # Reloaded 3+ Supporters — massive tempo recovery
+                                elif num_supporters_in_discard >= 1:
+                                    r_strategic += 0.15  # Reloaded some Supporters
+                                else:
+                                    r_strategic -= 0.10  # No Supporters in discard — wasted single-copy card
+
+                            # Sacred Ash: reward only when 4+ Pokemon are in discard pile
+                            elif played_id == 1129:  # Sacred Ash
+                                pre_discard = pre.get("discard_ids", [])
+                                pokemon_ids_deck = [400, 401, 414, 431, 432, 434]
+                                num_pokemon_discard = sum(1 for cid in pre_discard if cid in pokemon_ids_deck)
+                                if num_pokemon_discard >= 4:
+                                    r_strategic += 0.40  # Board rebuild from mass KO — max value
+                                elif num_pokemon_discard >= 2:
+                                    r_strategic += 0.20  # Meaningful recovery
+                                else:
+                                    r_strategic -= 0.15  # Night Stretcher would have been better — wasted single-copy
+
+                            # Giovanni: reward playing with a charged TR active ready to attack
+                            elif played_id == 1218:  # Team Rocket's Giovanni
+                                active_c = get_card_data(pre.get("active_id"))
+                                if active_c is not None:
+                                    att_costs = [len(attack_table.get(aid).energies) for aid in active_c.attacks if attack_table.get(aid)]
+                                    min_cost  = min(att_costs) if att_costs else 99
+                                    is_charged = pre.get("active_energies", 0) >= min_cost
+                                    is_tr = getattr(active_c, "name", "").startswith("Team Rocket")
+                                    if is_charged and is_tr:
+                                        r_strategic += 0.20  # Giovanni played with ready-to-attack TR Pokemon
+                                    elif is_charged:
+                                        r_strategic += 0.10  # Charged but non-TR active
+                                    else:
+                                        r_strategic -= 0.10  # Giovanni with un-charged active = wasted Supporter
                                 else:
                                     r_strategic -= 0.05
-                                    
-                            # General Supporter dead usage penalty
-                            elif played_card.cardType == CardType.SUPPORTER and "Giovanni" not in played_card.name:
+
+                            # Fallback: general Supporter dead usage penalty
+                            elif played_card.cardType == CardType.SUPPORTER and played_id not in [1216, 1217, 1218, 1219, 1220, 1227]:
                                 hand_diff = post["hand_size"] - pre["hand_size"]
                                 if hand_diff < 0:
                                     r_strategic -= 0.05
-                                    
-                            # Giovanni switch logic
-                            elif played_card.cardType == CardType.SUPPORTER and "Giovanni" in played_card.name:
-                                benched_ids = pre.get("bench_ids", [])
-                                active_c = get_card_data(pre.get("active_id"))
-                                active_charged = False
-                                if active_c is not None:
-                                    active_att_costs = [len(attack_table.get(aid).energies) for aid in active_c.attacks if attack_table.get(aid)]
-                                    min_cost = min(active_att_costs) if active_att_costs else 99
-                                    active_charged = pre.get("active_energy", 0) >= min_cost
-                                    
-                                has_bench_attacker = False
-                                bench_ready = False
-                                for idx, bid in enumerate(benched_ids):
-                                    bc = get_card_data(bid)
-                                    if bc is not None and bc.cardType == CardType.POKEMON:
-                                        b_energy = pre.get("bench_energies", [])[idx] if idx < len(pre.get("bench_energies", [])) else 0
-                                        bc_att_costs = [len(attack_table.get(aid).energies) for aid in bc.attacks if attack_table.get(aid)]
-                                        bc_min_cost = min(bc_att_costs) if bc_att_costs else 99
-                                        if b_energy >= bc_min_cost:
-                                            bench_ready = True
-                                        if bc.ex or bc.stage1 or bc.stage2:
-                                            has_bench_attacker = True
-                                            
-                                if has_bench_attacker and bench_ready and not active_charged:
-                                    r_strategic += 0.10  # Strategic Giovanni play
                             else:
                                 r_strategic += 0.02
                             
@@ -1024,20 +1159,25 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         target_card = get_card_data(target_id)
                         
                         if attached_card is not None and target_card is not None:
-                            # Reward charging benched Mimikyu (434) when opponent has active Safeguard (ex-immunity)
+                            # FIX #1: Unified Mimikyu charging reward — was two sequential `if` blocks
+                            # that both fired simultaneously (double reward +0.45 per step).
+                            # FIX #2: Exclude Mimikyu from blocker penalty when charging vs ex opponent.
                             opp_active_card = get_card_data(pre.get("opp_active_id"))
-                            opp_has_safeguard = opp_active_card is not None and any(s.name == "Safeguard" or "ex" in s.text.lower() for s in getattr(opp_active_card, "skills", []))
-                            if opp_has_safeguard and target_id == 434 and target_id in pre.get("bench_ids", []):
-                                r_strategic += 0.15
-                                
-                            # Reward manual energy attachment to Mimikyu (434) when opponent has active ex Pokemon
                             opp_is_ex = opp_active_card is not None and getattr(opp_active_card, "ex", False)
-                            if opp_is_ex and target_id == 434:
-                                r_strategic += 0.30
+                            opp_has_safeguard = opp_is_ex and any(
+                                s.name == "Safeguard" or "ex" in s.text.lower()
+                                for s in getattr(opp_active_card, "skills", [])
+                            )
+                            charging_mimikyu = (target_id == 434 and opp_is_ex)
+                            if target_id == 434 and target_id in pre.get("bench_ids", []):
+                                if opp_has_safeguard:
+                                    r_strategic += 0.15  # Safeguard scenario — smaller bonus (Mimikyu immune but Safeguard covers it)
+                                elif opp_is_ex:
+                                    r_strategic += 0.30  # Standard ex-opponent Mimikyu charging reward
 
-                            target_is_blocker = is_defensive_blocker(target_card)
-                            
                             # Defensive/barrier blockers should never get energy attachments
+                            # Exception: Mimikyu acts as an attacker vs ex opponents — don't penalise it
+                            target_is_blocker = is_defensive_blocker(target_card) and not charging_mimikyu
                             if target_is_blocker:
                                 if attached_card.cardType == CardType.SPECIAL_ENERGY:
                                     r_strategic -= 0.15  # Massive penalty for wasting Special Energy on blockers!
@@ -1067,11 +1207,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
 
                                 is_fully_charged = current_energy >= max_attack_cost
 
-                                if target_card.cardId in [431, 401]:
+                                if target_card.cardId in [431, 401, 434]:
                                     if is_fully_charged:
                                         r_strategic -= 0.05  # Penalty for wasting Special Energy on already charged Pokémon!
                                     else:
-                                        r_strategic += 0.50  # High reward for attaching Special/Double Energy to Mewtwo ex or Spidops ex!
+                                        r_strategic += 0.50  # High reward for attaching Special/Double Energy to Mewtwo ex, Spidops, or Mimikyu!
                                         if pre.get("active_id") != target_card.cardId:
                                             r_strategic += 0.15  # Extra reward for charging benched attacker
                                 else:
@@ -1121,6 +1261,17 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                             if pre.get("active_id") != target_card.cardId:
                                                 r_strategic += 0.10  # Charging on bench is also good
                                     elif attached_card.cardId == 5: # Psychic
+                                        r_strategic -= 0.05
+                                # Mimikyu (434) requires Psychic energy (5) for Gemstone Mimicry
+                                elif target_card.cardId == 434:
+                                    if attached_card.cardId == 5: # Psychic
+                                        if is_fully_charged:
+                                            r_strategic -= 0.05
+                                        else:
+                                            r_strategic += 0.50  # High reward for charging Mimikyu with Psychic Energy!
+                                            if pre.get("active_id") != target_card.cardId:
+                                                r_strategic += 0.10
+                                    elif attached_card.cardId == 1: # Grass
                                         r_strategic -= 0.05
                                 else:
                                     if is_fully_charged:
@@ -1201,9 +1352,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                       any(s.name == "Safeguard" or "ex" in s.text.lower() for s in getattr(opp_active_card, "skills", [])))
                         
                         if has_attack and not opp_immune:
-                            r_strategic -= 0.80  # Boosted: Heavy penalty for passing when we can attack
+                            r_strategic -= 0.40  # FIX #8: Reduced from -0.80 — was dominating PER sampling
                         elif has_attach and not energy_already_attached:
-                            r_strategic -= 0.80  # Boosted: Heavy penalty for leaving energy in hand unattached
+                            r_strategic -= 0.40  # FIX #8: Reduced from -0.80 — stall tax handles repeat passes
                         else:
                             r_strategic += 0.02  # Near-zero: just offsets stall tax, net ~0 per forced pass; prevents stall farming
                             
@@ -1211,7 +1362,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             r_strategic -= 0.60  # Boosted: Heavy penalty for ending turn with 0 bench backup!
                             
                         # Penalty for ending turn with basic Pokemon in hand when bench is not full
-                        has_basic_in_hand = any(cid in [400, 414, 431, 434, 432, 463] for cid in post.get("hand_ids", []))
+                        # FIX #7: Removed dead card ID 463 (not in current deck)
+                        has_basic_in_hand = any(cid in [400, 414, 431, 434, 432] for cid in post.get("hand_ids", []))
                         bench_size_post = post.get("bench_size", 0)
                         if has_basic_in_hand and bench_size_post < 5:
                             r_strategic -= 0.40  # Penalty for leaving basics in hand unplayed
@@ -1339,11 +1491,14 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 # Reward attaching energy to Mimikyu (434) to charge Gemstone Mimicry (needs [P][C])
                                 if action_type == 8 and pre.get("attached_target_id", -1) == 434:
                                     r_strategic += 0.30
+                                # Defensive Hero's Cape attachment vs Dragapult
+                                if action_type == 8 and pre.get("attached_card_id", -1) == 1159:
+                                    r_strategic += 0.30  # High reward for creating a 380 HP tank vs Dragapult!
                                     
-                            # Bench conservation: penalise overextension vs spread damage (moved outside ex check)
-                            b_size = post.get("bench_size", 0)
-                            if b_size > 3:
-                                r_strategic -= 0.15 * (b_size - 3)
+                                # Bench conservation: penalise overextension vs spread damage (> 2 benched mons)
+                                b_size = post.get("bench_size", 0)
+                                if b_size > 2:
+                                    r_strategic -= 0.20 * (b_size - 2)
 
                     r_deck = 0.0
                     if post["deck_size"] == 0:
@@ -1531,7 +1686,7 @@ def draw_sprt_slider(llr, A, B, width=20):
 
 
 def run_sprt_evaluation(command_queues, result_queue, num_workers, sample_deck, opponent_decks, test_opponent_names,
-                        alpha=0.05, beta=0.1, p0=0.50, p1=0.55):
+                        alpha=0.05, beta=0.1, p0=0.50, p1=0.58, max_eval_games=40):
     drain_queue(result_queue)
     
     A = math.log(beta / (1.0 - alpha))
@@ -1552,10 +1707,8 @@ def run_sprt_evaluation(command_queues, result_queue, num_workers, sample_deck, 
         active_evals[w_idx] = opp_name
         games_sent += 1
         
-    print(f"SPRT Evaluation started. alpha={alpha}, beta={beta}, p0={p0}, p1={p1}")
+    print(f"SPRT Evaluation started (Max Games: {max_eval_games}). alpha={alpha}, beta={beta}, p0={p0}, p1={p1}")
     deck_stats = {name: [0, 0, 0] for name in test_opponent_names}
-    
-    max_eval_games = 200
     decision = None
     
     while games_received < max_eval_games:
@@ -1634,8 +1787,7 @@ def main():
         torch.cuda.manual_seed_all(SEED)
 
     opponent_decks = load_all_decks()
-    # Filter opponent decks to exclude inefficient random agent models ,,,,"Rulebasedmodel_Abomasnow"
-    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo","Rulebasedmodel_Dragapult","Rulebasedmodel_Mewtwo_Wobbuffet"]}
+    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo","Rulebasedmodel_Dragapult","Rulebasedmodel_Mewtwo_Wobbuffet","Rulebasedmodel_Abomasnow"]}
     if not opponent_decks:
         raise ValueError("No valid deck.csv found in root or subdirectories.")
         
@@ -1765,7 +1917,7 @@ def main():
     # Train against all opponent decks (including Iono) to learn card-specific
     # counters and strategies, and evaluate against all decks to check progress.
     train_opponent_names = all_opponent_names
-    test_opponent_names = ["Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Wobbuffet", "Rulebasedmodel_Dragapult"]
+    test_opponent_names = ["Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Wobbuffet", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Abomasnow"]
 
     print(f"Opponent Decks Configuration:")
     print(f"  -> Train Opponent Decks: {train_opponent_names}")
@@ -1872,7 +2024,7 @@ def main():
             active_elo = league_elos.get("active", 1500.0)
             decision, win_rate, wins, losses, draws, deck_stats = run_sprt_evaluation(
                 command_queues, result_queue, num_workers, sample_deck, opponent_decks, test_opponent_names,
-                alpha=0.05, beta=0.1, p0=0.50, p1=0.55
+                alpha=0.05, beta=0.1, p0=0.50, p1=0.58, max_eval_games=args.eval_episodes
             )
             
             for name, stats in deck_stats.items():
@@ -2074,7 +2226,10 @@ def main():
                     for k in rc:
                         if k in rc_worker:
                             rc[k] += rc_worker[k]
-                    rc_count += len(samples) if len(samples) > 0 else 1
+                    # FIX #6: Count only player-0 steps — rc[] is accumulated for i==0 only,
+                    # using len(samples) (both players combined) was dividing by ~2x the correct count.
+                    player0_steps = len(samples) // 2 if len(samples) > 0 else 1
+                    rc_count += player0_steps
                     total_game_length += final_turn
                     total_games += 1
                     
@@ -2244,7 +2399,7 @@ def main():
                              rc["prize_taken"] / rc_div, rc["prize_lost"] / rc_div,
                              rc["kos"] / rc_div, rc["own_kos"] / rc_div,
                              rc["energy"] / rc_div, rc["bench"] / rc_div,
-                             rc["deckout"] / rc_div, rc["terminal"] / max(1, total_games),
+                             rc["deckout"] / rc_div, rc["terminal"] / rc_div,  # FIX #9: normalize per-step like all other rc fields
                              rc["stall"] / rc_div, rc["no_energy"] / rc_div, rc["strategic"] / rc_div, avg_gl,
                              avg_entropy])
         
