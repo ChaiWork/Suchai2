@@ -206,6 +206,9 @@ def rule_based_opponent_agent(opponent_name, obs):
     elif opponent_name == "Rulebasedmodel_Abomasnow":
         from Rulebasedmodel.abomasnow_agent import agent
         return agent(obs)
+    elif opponent_name == "Rulebasedmodel_Mewtwo_Wobbuffet":
+        from Rulebasedmodel.mewtwo_wobbuffet_agent import agent
+        return agent(obs)
     raise ValueError(f"Unknown rule-based opponent: {opponent_name}")
 
 
@@ -483,6 +486,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         "active_id": active_id,
                         "active_energies": active_energies,
                         "opp_active_id": opp_active_id,
+                        "active_hp": active_pk.hp if active_pk else 0,
+                        "opp_active_hp": opp_active_pk.hp if opp_active_pk else 0,
                         "stadium_id": stadium_id,
                         "bench_ids": bench_ids,
                         "bench_energies": [len(p.energyCards) for p in state_ps.bench if p is not None],
@@ -588,7 +593,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 else:
                                     action_counts["other"] += 1
                     else:
-                        if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Abomasnow"]:
+                        if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Abomasnow","Rulebasedmodel_Mewtwo_Wobbuffet"]:
                             try:
                                 selected = rule_based_opponent_agent(opponent_name, obs)
                             except Exception as e:
@@ -739,6 +744,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             "active_id": final_active_id,
                             "active_energies": final_active_energies,
                             "opp_active_id": final_opp_active_id,
+                            "active_hp": final_active_pk.hp if final_active_pk else 0,
+                            "opp_active_hp": final_opp_active_pk.hp if final_opp_active_pk else 0,
                             "stadium_id": final_stadium_id,
                             "bench_ids": final_bench_ids,
                             "bench_energies": [len(p.energyCards) for p in final_ps.bench if p is not None],
@@ -1155,6 +1162,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 r_strategic += 0.20  # Defensive retreat to blocker to stall
                         elif active_card is not None and active_card.ex and pre.get("active_energies", 0) >= 3:
                             r_strategic -= 0.05
+                            # Mewtwo ex mirror/KO prevention: do not retreat if we can KO opponent active!
+                            if active_card.cardId == 431:
+                                opp_hp = pre.get("opp_active_hp", 999)
+                                if opp_hp <= 280:
+                                    r_strategic -= 0.80  # Strong penalty for fleeing when KO is guaranteed
                             
                     elif action_type == 14:  # END (Turn Stall Decisions)
                         has_attack = pre.get("has_attack_option", False)
@@ -1231,17 +1243,28 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 r_strategic += 0.30
                             # Tactic 3: Exploit retreat-4 lock & Mimikyu Wall vs Abomasnow ex (723)
                             if opp_active_now == 723:
-                                if action_type == 13:  # ATTACK
-                                    r_strategic += 0.20  # Chip damage reward
                                 if my_active_now == 434:  # Mimikyu is active wall
                                     r_strategic += 0.30
+                                    # Reward attacking with Mimikyu to chip or build pressure
+                                    if action_type == 13: 
+                                        r_strategic += 0.20
+                                elif my_active_now == 401:  # Spidops is non-ex attacker (deals 180 dmg with Rocket Rush)
+                                    # Reward Spidops active when ready to attack
+                                    if pre.get("active_energies", 0) >= 2:
+                                        r_strategic += 0.30
+                                        if action_type == 13:  # ATTACK with Spidops
+                                            r_strategic += 0.40
                                 elif my_active_now == 431:  # Mewtwo ex active is a risk
                                     r_strategic -= 0.20
                                 elif my_active_now == 400:
                                     r_strategic -= 0.20
-                                # Reward attaching energy to Mimikyu (434) when Abomasnow ex is active
-                                if action_type == 8 and pre.get("attached_target_id", -1) == 434:
+                                
+                                # Reward charging benched Tarountula/Spidops (400/401) to build Spidops attacker
+                                if action_type == 8 and pre.get("attached_target_id", -1) in [400, 401]:
                                     r_strategic += 0.20
+                                # Reward attaching to Mimikyu to tank/retreat
+                                if action_type == 8 and pre.get("attached_target_id", -1) == 434:
+                                    r_strategic += 0.15
                             # Reward patience (end turn) when Abomasnow is close to self-deckout via Hammer-lanche
                             if opp_deck_size <= 10 and action_type == 14:
                                     r_strategic += 0.25
@@ -1252,14 +1275,20 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             if prizes_taken > 0 and opp_active_now in [119, 120]:
                                 r_strategic += 1.0
                             # Mimikyu Wall vs Dragapult ex (121)
+                            # Dragapult ex is a Tera Pokemon. Mimikyu can copy Phantom Dive (200 dmg) with Gemstone Mimicry!
                             if opp_active_now == 121:
                                 if my_active_now == 434:  # Mimikyu is immune active wall
-                                    r_strategic += 0.30
+                                    if pre.get("active_energies", 0) >= 2:
+                                        r_strategic += 0.30  # Active and ready to copy Phantom Dive
+                                        if action_type == 13:  # ATTACK (Gemstone Mimicry)
+                                            r_strategic += 0.40
+                                    else:
+                                        r_strategic += 0.20  # Active wall but undercharged
                                 elif my_active_now == 431:  # Mewtwo ex is a liability
                                     r_strategic -= 0.20
-                                # Reward attaching energy to Mimikyu (434) when Dragapult ex is active
+                                # Reward attaching energy to Mimikyu (434) to charge Gemstone Mimicry (needs [P][C])
                                 if action_type == 8 and pre.get("attached_target_id", -1) == 434:
-                                    r_strategic += 0.20
+                                    r_strategic += 0.30
                                 # Bench conservation: penalise overextension vs spread damage
                                 b_size = post.get("bench_size", 0)
                                 if b_size > 3:
@@ -1347,7 +1376,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 if obs["current"]["yourIndex"] == your_index:
                     selected, _ = mcts_agent(obs, sample_deck, client)
                 else:
-                    if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Abomasnow"]:
+                    if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Abomasnow","Rulebasedmodel_Mewtwo_Wobbuffet"]:
                         try:
                             selected = rule_based_opponent_agent(opponent_name, obs)
                         except Exception as e:
@@ -1526,8 +1555,8 @@ def main():
         torch.cuda.manual_seed_all(SEED)
 
     opponent_decks = load_all_decks()
-    # Filter opponent decks to exclude inefficient random agent models ,,,
-    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Abomasnow","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo","Rulebasedmodel_Dragapult"]}
+    # Filter opponent decks to exclude inefficient random agent models ,,,,"Rulebasedmodel_Abomasnow"
+    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo","Rulebasedmodel_Dragapult","Rulebasedmodel_Mewtwo_Wobbuffet"]}
     if not opponent_decks:
         raise ValueError("No valid deck.csv found in root or subdirectories.")
         
@@ -1657,7 +1686,7 @@ def main():
     # Train against all opponent decks (including Iono) to learn card-specific
     # counters and strategies, and evaluate against all decks to check progress.
     train_opponent_names = all_opponent_names
-    test_opponent_names = ["Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo"]
+    test_opponent_names = ["Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo","Rulebasedmodel_Mewtwo_Wobbuffet"]
 
     print(f"Opponent Decks Configuration:")
     print(f"  -> Train Opponent Decks: {train_opponent_names}")
