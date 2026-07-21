@@ -1,53 +1,62 @@
 import os
 import sys
+import glob
+import pickle
 from collections import defaultdict
 
-from cg.api import AreaType, CardType, EnergyType, Observation, SelectContext, OptionType, Card, Pokemon, all_card_data, to_observation_class
+# Resolve cg-lib path dynamically for Kaggle vs Local environments
+try:
+    cg_lib_path = glob.glob('/kaggle/input/**/cg-lib', recursive=True)[0]
+    sys.path.append(cg_lib_path)
+except IndexError:
+    pass
 
-"""
-Mega Lucario ex Deck
-Intermediate Level
-This deck battles by strategically switching between Mega Lucario ex as the main attacker, and Hariyama and Solrock as secondary attackers.
-"""
+# Add parent directory to sys.path for local execution
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
 
-# Load deck.csv in the dataset
-file_path = os.path.join("decks", "Rulebasedmodel_Lucario", "deck.csv")
-if not os.path.exists(file_path):
-    file_path = os.path.join("/kaggle_simulations", "agent", "decks", "Rulebasedmodel_Lucario", "deck.csv")
-if not os.path.exists(file_path):
-    file_path = "deck.csv"
-    if not os.path.exists(file_path):
-        file_path = "/kaggle_simulations/agent/" + file_path
+from cg.api import (
+    AreaType,
+    CardType,
+    EnergyType,
+    Observation,
+    SelectContext,
+    OptionType,
+    Card,
+    Pokemon,
+    all_card_data,
+    to_observation_class
+)
 
-with open(file_path, "r") as file:
-    csv = file.read().split("\n")
-my_deck = []
-for i in range(60):
-    my_deck.append(int(csv[i]))
+artifact_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deck.pkl")
 
-# Fetch card metadata database and create an ID-to-Card lookup table
+if not os.path.exists(artifact_path):
+    artifact_path = "/kaggle_simulations/agent/deck.pkl"
+
+with open(artifact_path, "rb") as file:
+    my_deck = pickle.load(file)
+
 all_card = all_card_data()
-card_table = {c.cardId:c for c in all_card}
+card_table = {card.cardId: card for card in all_card}
 
-# Decklist
-Makuhita = 673  # ×2
-Hariyama = 674  # ×2
-Lunatone = 675  # ×2
-Solrock = 676  # ×3
-Riolu = 677  # ×3
-Mega_Lucario_ex = 678  # ×4
-Dusk_Ball = 1102  # ×4
-Switch = 1123  # ×2
-Premium_Power_Pro = 1141  # ×4
-Fighting_Gong = 1142  # ×4
-Poke_Pad = 1152  # x4
-Hero_Cape = 1159  # ×1
-Boss_Orders = 1182  # ×2
-Carmine = 1192  # ×4
-Lillie_Determination = 1227  # ×4
-Gravity_Mountain = 1252  # ×2
-Basic_Fighting_Energy = 6  # ×13
-
+Makuhita = 673  
+Hariyama = 674  
+Lunatone = 675  
+Solrock = 676  
+Riolu = 677  
+Mega_Lucario_ex = 678  
+Dusk_Ball = 1102  
+Switch = 1123
+Premium_Power_Pro = 1141  
+Fighting_Gong = 1142  
+Poke_Pad = 1152  
+Hero_Cape = 1159  
+Boss_Orders = 1182  
+Carmine = 1192  
+Lillie_Determination = 1227  
+Gravity_Mountain = 1252  
+Basic_Fighting_Energy = 6  
 
 class AttackPlan:
     attacker = -1
@@ -56,14 +65,11 @@ class AttackPlan:
     remain_hp = -1
     energy = False
 
-
 plan = AttackPlan()
 pre_turn = 0
 ability_used = False
 
-
 def get_card(obs: Observation, area: AreaType, index: int, player_index: int) -> Pokemon | Card | None:
-    """Helper function to safely extract a Card or Pokemon object from specific zones."""
     ps = obs.current.players[player_index]
     match area:
         case AreaType.DECK:
@@ -85,22 +91,18 @@ def get_card(obs: Observation, area: AreaType, index: int, player_index: int) ->
         case _:
             return None
 
-
 def prize_count(pokemon: Pokemon) -> int:
-    """Calculates how many Prize cards a Pokémon yields upon being Knocked Out, factoring in modifiers."""
     data = card_table[pokemon.id]
     count = 3 if data.megaEx else 2 if data.ex else 1
     for card in pokemon.energyCards:
-        if card.id == 12:  # Legacy Energy
+        if card.id == 12:
             count -= 1
     for card in pokemon.tools:
-        if card.id == 1172 and "Lillie" in data.name:  # Lillie’s Pearl
+        if card.id == 1172 and "Lillie" in data.name:
             count -= 1
     return max(0, count)
 
-
 def pokemon_score(pokemon: Pokemon) -> int:
-    """Heuristically evaluates the tactical worth of targeting a specific Pokémon on the opponent's field."""
     data = card_table[pokemon.id]
     score = prize_count(pokemon) * 1000
     score += len(pokemon.energies) * 150
@@ -111,29 +113,16 @@ def pokemon_score(pokemon: Pokemon) -> int:
         score += 130
     
     id = pokemon.id
-    # Noctowl, Fan Rotom, Archaludon ex, Meowth ex
-    if id == 173 or id == 174 or id == 190 or id == 1071:
+    if id == 144 or id == 322 or id == 323 or id == 337:
         score -= 200
-    if id == 112 and len(pokemon.energies) >= 1:  # Munkidori
+    if id == 112 and len(pokemon.energies) >= 1:  
         score += 300
     score += pokemon.hp
     return score
 
-
 def agent(obs_dict: dict) -> list[int]:
-    """Main Agent Function.
-
-    Each element in the returned list must be >= 0 and < len(obs.select.option).
-    The list length must be between obs.select.minCount and obs.select.maxCount (inclusive), with no duplicate elements.
-    
-    Returns:
-        list[int]: A list of option index.
-    """
     obs = to_observation_class(obs_dict)
     if obs.select == None:
-        # In the initial selection, the obs.select is None, and it is necessary to return the deck.
-        # The deck is a list of 60 card IDs.
-        # The deck must comply with the Pokémon Trading Card Game rules.
         return my_deck
         
     state = obs.current
@@ -152,9 +141,9 @@ def agent(obs_dict: dict) -> list[int]:
         plan = AttackPlan()
         ability_used = False
             
-    field_counts = defaultdict(int)  # Number of cards per card ID on the Bench and in the Active Spot
-    hand_counts = defaultdict(int)  # Number of cards per card ID in hand
-    discard_counts = defaultdict(int)  # Number of cards per card ID in discard pile
+    field_counts = defaultdict(int)
+    hand_counts = defaultdict(int)  
+    discard_counts = defaultdict(int)
 
     attacker1 = False
     attacker2 = False
@@ -199,7 +188,7 @@ def agent(obs_dict: dict) -> list[int]:
                 can_switch = True
             elif o.type == OptionType.ATTACK:
                 can_attack = True
-                if o.attackId == 983:  # Mega Brave
+                if o.attackId == 983:
                     can_use_mega_brave = True
         
         my_cards = [my_state.active[0]]
@@ -301,7 +290,6 @@ def agent(obs_dict: dict) -> list[int]:
                             plan.remain_hp = op_pokemon.hp - damage
                             plan.energy = more_energy
     
-    # Attach energy score
     def energy_score(pokemon: Pokemon, active: bool) -> int:
         energy_count = len(pokemon.energies)
         score = 8000
@@ -330,14 +318,13 @@ def agent(obs_dict: dict) -> list[int]:
                 score -= 50
         return score
 
-    # Iterate over every possible option and assign a heuristic score.
-    scores = []  # Score for each action
+    scores = []
     for o in select.option:
-        score = 0  # The default and baseline score is 0.
+        score = 0
         if o.type == OptionType.NUMBER:
-            score = o.number  # e.g., for "draw X cards"
+            score = o.number
         elif o.type == OptionType.YES:
-            score = 1  # Prefer "Yes"
+            score = 1
         elif o.type == OptionType.CARD:
             card = get_card(obs, o.area, o.index, o.playerIndex)
             if card != None:
@@ -345,7 +332,6 @@ def agent(obs_dict: dict) -> list[int]:
                 if isinstance(card, Pokemon):
                     energy_count = len(card.energies)
                 if context == SelectContext.SWITCH or context == SelectContext.TO_ACTIVE:
-                    # Selection of the Pokémon to send to the Active Spot
                     if o.playerIndex == my_index:
                         score += energy_count * 2
                         if o.index == plan.attacker - 1:
@@ -367,7 +353,6 @@ def agent(obs_dict: dict) -> list[int]:
                         if o.index == plan.target - 1:
                             score += 100
                 elif context == SelectContext.SETUP_ACTIVE_POKEMON:
-                    # Prioritize playing Riolu if going first, and Solrock if going second.
                     if card.id == Solrock:
                         if state.firstPlayer == my_index:
                             score = 2
@@ -482,7 +467,7 @@ def agent(obs_dict: dict) -> list[int]:
                 score = -1
         elif o.type == OptionType.ABILITY:
             card = get_card(obs, o.area, o.index, my_index)
-            if card.id == 1267:  # Lumiose City
+            if card.id == 1267:  
                 score = 1
             else:
                 score = 30000
@@ -494,7 +479,7 @@ def agent(obs_dict: dict) -> list[int]:
         elif o.type == OptionType.ATTACK:
             score = 1000
             if plan.attack_index == 1:
-                if o.attackId == 983:  # Mega Brave
+                if o.attackId == 983:  
                     score += 100
             else:
                 if o.attackId != 983:
@@ -502,7 +487,6 @@ def agent(obs_dict: dict) -> list[int]:
 
         scores.append(score)
 
-    # Select in descending order of score
     desc_indices = [i for i, _ in sorted(enumerate(scores), key=lambda x: x[1], reverse=True)]
     if context == SelectContext.MAIN:
         o = select.option[desc_indices[0]]

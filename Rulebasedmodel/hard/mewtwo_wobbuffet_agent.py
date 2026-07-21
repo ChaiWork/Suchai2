@@ -15,25 +15,28 @@ from cg.api import (
 )
 
 """
-Team Rocket's Mewtwo ex Deck
+Team Rocket's Mewtwo ex + Wobbuffet Deck
 Tactical, Rule-based Agent
 """
 
 # Load deck.csv in the dataset
-file_path = os.path.join("decks", "Rulebasedmodel_Mewtwo", "deck.csv")
+file_path = "decks/Rulebasedmodel_Mewtwo_Wobbuffet/deck.csv"
 if not os.path.exists(file_path):
-    file_path = os.path.join("/kaggle_simulations", "agent", "decks", "Rulebasedmodel_Mewtwo", "deck.csv")
+    file_path = "/kaggle_simulations/agent/decks/Rulebasedmodel_Mewtwo_Wobbuffet/deck.csv"
+
+# Fallback to local if not found
 if not os.path.exists(file_path):
     file_path = "deck.csv"
-    if not os.path.exists(file_path):
-        file_path = "/kaggle_simulations/agent/" + file_path
 
-
-with open(file_path, "r") as file:
-    csv = file.read().split("\n")
 my_deck = []
-for i in range(60):
-    my_deck.append(int(csv[i]))
+if os.path.exists(file_path):
+    with open(file_path, "r") as file:
+        csv = file.read().split("\n")
+    for i in range(min(60, len(csv))):
+        if csv[i].strip():
+            my_deck.append(int(csv[i].strip()))
+else:
+    my_deck = [431]*60 # safe fallback
 
 # Fetch card metadata database
 all_card = all_card_data()
@@ -45,7 +48,8 @@ Spidops = 401
 Tarountula = 400
 Articuno = 414
 Mimikyu = 434
-Clefairy_ex = 272
+Wobbuffet = 432
+Murkrow = 463
 
 Team_Rockets_Energy = 15
 Basic_Psychic_Energy = 5
@@ -53,12 +57,12 @@ Basic_Grass_Energy = 1
 
 Bug_Catching_Set = 1094
 Night_Stretcher = 1097
-Energy_Switch = 1116
+Energy_Search = 1119
 Ultra_Ball = 1121
 Sacred_Ash = 1129
 Rockets_Transceiver = 1134
 Poke_Pad = 1152
-Maximum_Belt = 1158
+Heros_Cape = 1159
 Brave_Bangle = 1175
 
 Rockets_Ariana = 1216
@@ -70,7 +74,6 @@ Lillies_Determination = 1227
 Rockets_Factory = 1257
 
 def get_card(obs: Observation, area: AreaType, index: int, player_index: int) -> Pokemon | Card | None:
-    """Helper function to safely extract a Card or Pokemon object from specific zones."""
     ps = obs.current.players[player_index]
     match area:
         case AreaType.DECK:
@@ -93,11 +96,9 @@ def get_card(obs: Observation, area: AreaType, index: int, player_index: int) ->
             return None
 
 def is_team_rocket_pokemon(card_id: int) -> bool:
-    """Check if the card ID is a Team Rocket's Pokémon."""
-    return card_id in [Tarountula, Spidops, Mewtwo_ex, Articuno, Mimikyu]
+    return card_id in [Tarountula, Spidops, Mewtwo_ex, Articuno, Mimikyu, Wobbuffet, Murkrow]
 
 def agent(obs_dict: dict) -> list[int]:
-    """Main Agent Function."""
     obs = to_observation_class(obs_dict)
     if obs.select is None:
         return my_deck
@@ -114,12 +115,13 @@ def agent(obs_dict: dict) -> list[int]:
     field_hand_counts = defaultdict(int)
     
     active_mewtwo = False
-    active_tarountula = False
-    active_spidops = False
+    active_wobbuffet = False
+    active_murkrow = False
     
     benched_tarountula_count = 0
     benched_spidops_count = 0
     benched_mewtwo_count = 0
+    benched_wobbuffet_count = 0
     
     total_rocket_pokemon_in_play = 0
     
@@ -136,11 +138,12 @@ def agent(obs_dict: dict) -> list[int]:
             total_rocket_pokemon_in_play += 1
         if p.id == Mewtwo_ex:
             active_mewtwo = True
-        elif p.id == Tarountula:
-            active_tarountula = True
-        elif p.id == Spidops:
-            active_spidops = True
+        elif p.id == Wobbuffet:
+            active_wobbuffet = True
+        elif p.id == Murkrow:
+            active_murkrow = True
 
+    max_bench_damage = 0
     for p in my_state.bench:
         if p is None:
             continue
@@ -155,6 +158,12 @@ def agent(obs_dict: dict) -> list[int]:
             benched_spidops_count += 1
         elif p.id == Mewtwo_ex:
             benched_mewtwo_count += 1
+        elif p.id == Wobbuffet:
+            benched_wobbuffet_count += 1
+            
+        damage = p.maxHp - p.hp
+        if damage > max_bench_damage:
+            max_bench_damage = damage
 
     hand_counts = defaultdict(int)
     for c in my_state.hand:
@@ -169,37 +178,12 @@ def agent(obs_dict: dict) -> list[int]:
     for c in state.stadium:
         stadium_id = c.id
 
-    # Identify if we are close to decking ourselves out (stop drawing)
     near_deckout = (my_state.deckCount <= 3)
-
-    # Identify Game Plan (SETUP, AGGRESSIVE, CONSERVE, TEMPO)
-    engine_complete = (field_counts[Spidops] > 0)
-    prizes_me = len(my_state.prize)
-    prizes_op = len(op_state.prize)
-    
-    if not engine_complete:
-        game_plan = "SETUP"
-    elif prizes_me > prizes_op:
-        game_plan = "AGGRESSIVE"
-    elif prizes_me < prizes_op:
-        game_plan = "CONSERVE"
-    else:
-        game_plan = "TEMPO"
-
-    # Resource tracking: count known copies of critical cards
-    DECKLIST_TOTALS = {
-        Mewtwo_ex: 2,
-        Spidops: 4,
-        Tarountula: 4,
-        Team_Rockets_Energy: 3,
-        Night_Stretcher: 2,
-        Ultra_Ball: 4
-    }
 
     active_is_ex = False
     if len(my_state.active) >= 1 and my_state.active[0] is not None:
         active_id = my_state.active[0].id
-        if active_id in [Mewtwo_ex, Clefairy_ex]:
+        if active_id == Mewtwo_ex:
             active_is_ex = True
 
     op_active_id = 0
@@ -215,21 +199,24 @@ def agent(obs_dict: dict) -> list[int]:
 
     op_active_is_immune = (op_active_id == Mimikyu)
 
-    # Check if we can attack this turn
-    can_attack = False
-    if context == SelectContext.MAIN:
-        for o in select.option:
-            if o.type == OptionType.ATTACK:
-                can_attack = True
+    DECKLIST_TOTALS = {
+        Mewtwo_ex: 2,
+        Spidops: 4,
+        Tarountula: 4,
+        Wobbuffet: 1,
+        Murkrow: 2,
+        Team_Rockets_Energy: 4,
+        Night_Stretcher: 1,
+        Ultra_Ball: 0
+    }
 
-    # Assign scores
     scores = []
     for idx, o in enumerate(select.option):
         score = 0
         
         if o.type == OptionType.END:
             if op_state.deckCount == 0:
-                score = 200000  # Instantly end turn to win by opponent deckout
+                score = 200000
             else:
                 score = 0
                 
@@ -238,65 +225,65 @@ def agent(obs_dict: dict) -> list[int]:
             
         elif o.type == OptionType.YES:
             score = 100
-            # Context specific for Erasure Ball energy discard selection:
-            # If we need extra damage, prioritize YES, otherwise prefer NO/don't discard.
             if hasattr(select, 'message') and "discard" in str(select.message).lower():
                 needed_damage = op_active_hp - 160
                 if needed_damage <= 0:
-                    score = 1  # Low priority, prefer NO
+                    score = 1
                 else:
-                    score = 200  # High priority, we need extra damage
+                    score = 200
                     
         elif o.type == OptionType.NO:
             score = 50
             if hasattr(select, 'message') and "discard" in str(select.message).lower():
                 needed_damage = op_active_hp - 160
                 if needed_damage <= 0:
-                    score = 300  # Prefer not discarding energy if 160 is enough
+                    score = 300
                     
         elif o.type == OptionType.EVOLVE:
-            score = 120000  # Evolving Spidops is extremely high priority
+            score = 120000
             
         elif o.type == OptionType.RETREAT:
-            # Retreat only if active is NOT our primary charged attacker, or if active is low HP
             if op_active_is_immune and active_is_ex:
-                score = 180000  # High priority to retreat from immune opponent to Spidops/non-ex
+                score = 180000
             elif active_mewtwo:
                 score = -100
             else:
-                if benched_mewtwo_count > 0 and benched_energies_count >= 2:
-                    score = 80000
-                else:
-                    score = -10
+                score = 1000
                     
         elif o.type == OptionType.ABILITY:
             if near_deckout:
-                score = -100  # Avoid drawing when near deck-out
+                score = -100
             else:
                 score = 89000
             
         elif o.type == OptionType.ATTACK:
             if op_active_is_immune and active_is_ex:
-                score = -100  # Wastes turn to attack immune opponent with ex
+                score = -100
             else:
-                score = 60000  # Base attack score (lower than play/attach/ability to enforce sequencing)
+                score = 60000
                 if o.attackId == 608:  # Erasure Ball
                     score += 10000
+                elif o.attackId == 609:  # Rocket Mirror (Tech move)
+                    if max_bench_damage >= 50:
+                        score += 15000
+                    else:
+                        score -= 50000
                 elif o.attackId == 560:  # Rocket Rush
                     score += 5000
+                elif o.attackId == 652:  # Deceit (Search Supporter)
+                    score += 4000
                 
         elif o.type == OptionType.PLAY:
             c = get_card(obs, AreaType.HAND, o.index, my_index)
             if c is not None:
                 card_data = card_table.get(c.id)
                 if card_data is not None:
-                    # Supporters
                     if card_data.cardType == CardType.SUPPORTER:
                         score = 75000
                         if c.id == Rockets_Proton:
                             if near_deckout:
                                 score = -100
-                            elif field_counts[Tarountula] + field_counts[Mewtwo_ex] < 3:
+                            else:
                                 score = 95000
                         elif c.id == Rockets_Ariana:
                             if near_deckout:
@@ -321,31 +308,26 @@ def agent(obs_dict: dict) -> list[int]:
                             else:
                                 score = 75000
                             
-                    # Stadiums
                     elif card_data.cardType == CardType.STADIUM:
                         if c.id == Rockets_Factory:
                             if stadium_id != Rockets_Factory:
-                                score = 95000  # Prioritize Factory above transceiver (95000 > 92000)
+                                score = 95000
                             else:
                                 score = -1
                                 
-                    # Pokémon placement
                     elif card_data.cardType == CardType.POKEMON:
-                        score = 30000  # Default basic play score
-                        
-                        # Bench-Out Safeguard: If bench is empty, prioritize benching any basic
+                        score = 30000
                         is_bench_empty = (len(my_state.bench) == 0)
                         
-                        # Heuristic: Bench Order / Setup Priority
                         if c.id == Tarountula:
                             if is_bench_empty:
-                                score = 150000  # Absolute priority to prevent bench-out
+                                score = 150000
                             elif field_counts[Tarountula] == 0:
-                                score = 96000  # 1st Tarountula is highest priority
+                                score = 96000
                             elif field_counts[Tarountula] == 1:
-                                score = 90000  # 2nd Tarountula
+                                score = 90000
                             else:
-                                score = 65000  # 3rd+ Tarountula
+                                score = 65000
                         elif c.id == Mewtwo_ex:
                             if is_bench_empty:
                                 score = 149000
@@ -353,85 +335,61 @@ def agent(obs_dict: dict) -> list[int]:
                                 score = 85000
                             else:
                                 score = 50000
-                        elif c.id == Articuno:
+                        elif c.id == Murkrow:
+                            if is_bench_empty:
+                                score = 148500
+                            elif field_counts[Murkrow] < 1:
+                                score = 80000
+                            else:
+                                score = 40000
+                        elif c.id == Wobbuffet:
                             if is_bench_empty:
                                 score = 148000
-                            else:
+                            elif field_counts[Wobbuffet] < 1:
                                 score = 78000
-                        elif c.id == Mimikyu:
+                            else:
+                                score = 30000
+                        elif c.id == Articuno:
                             if is_bench_empty:
                                 score = 147000
                             else:
-                                score = 77000
-                        elif c.id == Clefairy_ex:
+                                score = 76000
+                        elif c.id == Mimikyu:
                             if is_bench_empty:
                                 score = 146000
                             else:
-                                score = 1000  # Avoid benching Clefairy unless utility is relevant
+                                score = 75000
                             
-                        # Bench Capacity Management (Keep at least 1 slot open if possible)
-                        if len(my_state.bench) >= 4:
-                            if c.id in [Articuno, Mimikyu, Clefairy_ex]:
-                                score = 500  # Keep slot open
-                                
                         if len(my_state.bench) >= 5:
                             score = -1
                             
-                    # Items
-                    else:
+                    else:  # Items
                         score = 72000
                         if c.id == Rockets_Transceiver:
                             if near_deckout:
                                 score = -100
                             else:
                                 score = 92000
-                        elif c.id == Ultra_Ball:
-                            if near_deckout:
-                                score = -100
-                            # Avoid using Ultra Ball until free search options are exhausted
-                            elif field_counts[Tarountula] < 1 or field_counts[Mewtwo_ex] < 1:
-                                score = 72000
-                            elif field_counts[Spidops] < field_counts[Tarountula]:
-                                score = 71000
-                            else:
-                                score = 5000
+                        elif c.id == Energy_Search:
+                            score = 91000
                         elif c.id == Bug_Catching_Set:
                             if near_deckout:
                                 score = -100
                             else:
                                 score = 78000
-                        elif c.id == Maximum_Belt:
-                            if op_active_is_ex and (active_mewtwo or (benched_mewtwo_count > 0 and benched_energies_count >= 2)):
+                        elif c.id == Heros_Cape:
+                            if active_mewtwo or benched_mewtwo_count > 0:
                                 score = 93000
                             else:
                                 score = 500
-                        elif c.id == Energy_Switch:
-                            # Use Energy Switch only if we have Mewtwo ex active and it enables a high-damage attack (reaches 3 energy)
-                            mewtwo_active_energy = 0
-                            if len(my_state.active) >= 1 and my_state.active[0] is not None and my_state.active[0].id == Mewtwo_ex:
-                                mewtwo_active_energy = len(my_state.active[0].energyCards)
-                            
-                            # If active Mewtwo has 2 energy, Energy Switch can enable the 3rd energy attack!
-                            if mewtwo_active_energy == 2 and benched_energies_count >= 1:
-                                score = 90000
-                            else:
-                                score = 1000  # Save for prize-critical swing turn
-                        elif c.id == Sacred_Ash:
-                            # Boost recovery item if we have targets in discard
-                            if discard_counts[Mewtwo_ex] > 0 or discard_counts[Spidops] > 0:
-                                score = 70000
-                            else:
-                                score = 2000
-                        elif c.id == Night_Stretcher:
-                            if discard_counts[Mewtwo_ex] > 0 or discard_counts[Spidops] > 0:
-                                score = 79000
-                            else:
-                                score = 2000
+                        elif c.id == Brave_Bangle:
+                            if op_active_is_ex:
+                                score = 84000
                                 
         elif o.type == OptionType.ATTACH or context == SelectContext.ATTACH_FROM:
             card = None
             if o.type == OptionType.ATTACH:
-                card = get_card(obs, AreaType.HAND, o.index, my_index)
+                card = get_card(obs, o.index, my_index)
                 target_pokemon = get_card(obs, o.inPlayArea, o.inPlayIndex, my_index)
                 is_active_target = (o.inPlayArea == AreaType.ACTIVE)
             else:
@@ -440,9 +398,7 @@ def agent(obs_dict: dict) -> list[int]:
                 is_active_target = False
                 
             if card is not None:
-                score = 50000  # Default base score
-                
-                # Heuristic: Avoid attaching energy/resources to low HP/vulnerable targets
+                score = 50000
                 is_vulnerable = False
                 if target_pokemon is not None and hasattr(target_pokemon, "hp") and target_pokemon.hp is not None:
                     if target_pokemon.hp <= 60:
@@ -458,7 +414,7 @@ def agent(obs_dict: dict) -> list[int]:
                         elif target_pokemon.id == Spidops:
                             score += 5000
                     if is_vulnerable:
-                        score -= 20000  # Avoid wasting Rocket Energy
+                        score -= 20000
                             
                 elif card.id == Basic_Psychic_Energy:
                     score = 80000
@@ -467,6 +423,8 @@ def agent(obs_dict: dict) -> list[int]:
                             score += 10000
                             if not is_active_target:
                                 score += 5000
+                        elif target_pokemon.id == Wobbuffet:
+                            score += 5000
                     if is_vulnerable:
                         score -= 10000
                                 
@@ -475,15 +433,13 @@ def agent(obs_dict: dict) -> list[int]:
                     if target_pokemon is not None:
                         if target_pokemon.id in [Tarountula, Spidops]:
                             score += 15000
-                            # Boost grass energy early during SETUP to get Spidops online
-                            if game_plan == "SETUP":
-                                score += 10000
                             
-                elif card.id == Maximum_Belt:
+                elif card.id == Heros_Cape:
                     score = 500
                     if target_pokemon is not None and target_pokemon.id == Mewtwo_ex:
-                        if op_active_is_ex:
-                            score = 86000
+                        score = 88000
+                        if is_active_target:
+                            score += 5000
                             
                 elif card.id == Brave_Bangle:
                     score = 500
@@ -499,19 +455,19 @@ def agent(obs_dict: dict) -> list[int]:
                     context == SelectContext.TO_ACTIVE or 
                     context == SelectContext.SETUP_ACTIVE_POKEMON):
                     if context == SelectContext.SETUP_ACTIVE_POKEMON:
-                        # Turn 0 Setup Active choice: prioritize opening basics, ensure all get positive scores
-                        if c.id == Tarountula:
+                        if c.id == Murkrow:
+                            score = 28000
+                        elif c.id == Tarountula:
                             score = 27000
                         elif c.id == Articuno:
                             score = 26000
                         elif c.id == Mimikyu:
                             score = 25000
-                        elif c.id in [Mewtwo_ex, Clefairy_ex]:
+                        elif c.id in [Mewtwo_ex, Wobbuffet]:
                             score = 1000
                     else:
-                        # Mid-game promotions and switches
-                        if op_active_is_immune and c.id in [Mewtwo_ex, Clefairy_ex]:
-                            score = -1000  # Avoid putting ex Pokemon active against Mimikyu
+                        if op_active_is_immune and c.id in [Mewtwo_ex]:
+                            score = -1000
                         elif c.id == Spidops:
                             score = 28000
                         elif c.id == Tarountula:
@@ -528,26 +484,29 @@ def agent(obs_dict: dict) -> list[int]:
                                 score = 1000
                             
                 elif context == SelectContext.TO_HAND or context == SelectContext.TO_BENCH:
-                    # Heuristic: Setup Tarountula/Spidops engine first before seeking Mewtwo ex
                     if c.id == Tarountula:
                         if field_counts[Tarountula] == 0:
-                            score = 60000  # Highest priority if empty field
+                            score = 60000
                         elif field_counts[Tarountula] < 2:
                             score = 45000
                         else:
                             score = 12000
                     elif c.id == Spidops:
                         if field_counts[Tarountula] > 0 and field_counts[Spidops] == 0:
-                            score = 58000  # High priority to get Spidops online
+                            score = 58000
                         elif field_counts[Tarountula] > field_counts[Spidops]:
                             score = 48000
                         else:
                             score = 10000
                     elif c.id == Mewtwo_ex:
                         if field_counts[Tarountula] > 0 and field_counts[Spidops] > 0:
-                            score = 55000  # Prioritize Mewtwo ex only when engine is online
+                            score = 55000
                         else:
-                            score = 35000  # Lower priority if engine is missing
+                            score = 35000
+                    elif c.id == Wobbuffet:
+                        score = 40000
+                    elif c.id == Murkrow:
+                        score = 38000
                     elif c.id == Team_Rockets_Energy:
                         score = 40000
                     elif c.id == Basic_Psychic_Energy:
@@ -556,21 +515,29 @@ def agent(obs_dict: dict) -> list[int]:
                         score = 25000
                         
                 elif context == SelectContext.DISCARD:
-                    # Heuristic: Ultra Ball Discard Priorities (Avoid discarding last copies)
                     is_last_critical = (c.id in DECKLIST_TOTALS and (DECKLIST_TOTALS[c.id] - discard_counts[c.id] <= 1))
-                    
                     if is_last_critical or c.id == Night_Stretcher:
-                        score = -10000  # Never discard critical singletons or recovery
+                        score = -10000
                     elif c.id == Rockets_Factory and (stadium_id == Rockets_Factory or hand_counts[Rockets_Factory] > 1):
-                        score = 8000  # Safe to discard duplicate Factory
+                        score = 8000
                     elif card_data is not None and card_data.cardType == CardType.SUPPORTER and hand_counts[c.id] > 1:
-                        score = 7000  # Safe to discard duplicate Supporter
-                    elif c.id in [Brave_Bangle, Maximum_Belt] and hand_counts[c.id] > 1:
-                        score = 6000  # Safe to discard duplicate Tool
+                        score = 7000
+                    elif c.id in [Brave_Bangle, Heros_Cape] and hand_counts[c.id] > 1:
+                        score = 6000
                     elif c.id in [Basic_Psychic_Energy, Basic_Grass_Energy]:
-                        score = 5000  # Prefer basic energy discard over basics
+                        score = 5000
                     else:
                         score = 100
+                
+                elif hasattr(select, 'message') and "mirror" in str(select.message).lower():
+                    if o.area == AreaType.BENCH:
+                        bench_pk = get_card(obs, AreaType.BENCH, o.index, my_index)
+                        if bench_pk is not None:
+                            score = (bench_pk.maxHp - bench_pk.hp) * 1000
+                        else:
+                            score = -1000
+                    else:
+                        score = -1000
 
         scores.append(score)
 

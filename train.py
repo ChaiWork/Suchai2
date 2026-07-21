@@ -188,27 +188,29 @@ class ProgressBar:
 
 
 def rule_based_opponent_agent(opponent_name, obs):
-    if opponent_name == "Rulebasedmodel":
-        from Rulebasedmodel.main import agent
-        return agent(obs)
-    elif opponent_name == "Rulebasedmodel_Iono":
-        from Rulebasedmodel.iono_agent import agent
-        return agent(obs)
-    elif opponent_name == "Rulebasedmodel_Dragapult":
-        from Rulebasedmodel.dragapult_agent import agent
-        return agent(obs)
-    elif opponent_name == "Rulebasedmodel_Mewtwo":
-        from Rulebasedmodel.mewtwo_agent import agent
-        return agent(obs)
-    elif opponent_name == "Rulebasedmodel_Mewtwo_Easy":
-        from Rulebasedmodel.mewtwo_agent_easy import agent
-        return agent(obs)
-    elif opponent_name == "Rulebasedmodel_Abomasnow":
-        from Rulebasedmodel.abomasnow_agent import agent
-        return agent(obs)
-    elif opponent_name == "Rulebasedmodel_Mewtwo_Wobbuffet":
-        from Rulebasedmodel.mewtwo_wobbuffet_agent import agent
-        return agent(obs)
+    mapping = {
+        "Rulebasedmodel": ["main", "easy.main"],
+        "Rulebasedmodel_Iono": ["iono_agent", "hard.iono_agent"],
+        "Rulebasedmodel_Dragapult": ["dragapult_agent", "hard.dragapult_agent"],
+        "Rulebasedmodel_Mewtwo": ["mewtwo_agent", "easy.mewtwo_agent"],
+        "Rulebasedmodel_Mewtwo_Easy": ["mewtwo_agent_easy", "easy.mewtwo_agent_easy"],
+        "Rulebasedmodel_Abomasnow": ["abomasnow_agent", "easy.abomasnow_agent"],
+        "Rulebasedmodel_Lucario": ["lucario_agent", "hard.lucario_agent"],
+        "Rulebasedmodel_Crustle": ["crustle_agent", "easy.crustle_agent"],
+        "Rulebasedmodel_Starmie": ["starmie_agent", "hard.starmie_agent"],
+        "Rulebasedmodel_Dipplin": ["dipplin_agent", "hard.dipplin_agent"],
+        "Rulebasedmodel_Mewtwo_Wobbuffet": ["mewtwo_wobbuffet_agent", "hard.mewtwo_wobbuffet_agent"]
+    }
+    
+    modules = mapping.get(opponent_name, [opponent_name])
+    for mod_path in modules:
+        try:
+            import importlib
+            mod = importlib.import_module(f"Rulebasedmodel.{mod_path}")
+            return mod.agent(obs)
+        except Exception:
+            pass
+            
     raise ValueError(f"Unknown rule-based opponent: {opponent_name}")
 
 
@@ -227,23 +229,22 @@ def load_all_decks():
         with open(root_deck_path, "r", encoding="utf-8-sig") as f:
             decks["Current (Self)"] = [int(line.strip()) for line in f if line.strip()]
             
-    # 2. Scan decks directory for additional deck.csv files
+    # 2. Scan decks directory recursively for deck.csv files
     if os.path.exists(base_path):
-        for item in os.listdir(base_path):
-            item_path = os.path.join(base_path, item)
-            if os.path.isdir(item_path):
-                deck_file = os.path.join(item_path, "deck.csv")
-                if os.path.exists(deck_file):
-                    try:
-                        with open(deck_file, "r", encoding="utf-8-sig") as f:
-                            card_ids = [int(line.strip()) for line in f if line.strip()]
-                            if len(card_ids) == 60:
-                                decks[item] = card_ids
-                                print(f"Loaded deck '{item}' from {deck_file}")
-                            else:
-                                print(f"Warning: Deck in {deck_file} has {len(card_ids)} cards (must be 60). Skipping.")
-                    except Exception as e:
-                        print(f"Error loading deck from {deck_file}: {e}")
+        for root_dir, dirs, files in os.walk(base_path):
+            if "deck.csv" in files:
+                deck_file = os.path.join(root_dir, "deck.csv")
+                folder_name = os.path.basename(root_dir)
+                try:
+                    with open(deck_file, "r", encoding="utf-8-sig") as f:
+                        card_ids = [int(line.strip()) for line in f if line.strip()]
+                        if len(card_ids) == 60:
+                            decks[folder_name] = card_ids
+                            print(f"Loaded deck '{folder_name}' from {deck_file}")
+                        else:
+                            print(f"Warning: Deck in {deck_file} has {len(card_ids)} cards (must be 60). Skipping.")
+                except Exception as e:
+                    print(f"Error loading deck from {deck_file}: {e}")
     return decks
 
 
@@ -596,7 +597,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 else:
                                     action_counts["other"] += 1
                     else:
-                        if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Abomasnow","Rulebasedmodel_Mewtwo_Wobbuffet"]:
+                        if opponent_name.startswith("Rulebasedmodel"):
                             try:
                                 selected = rule_based_opponent_agent(opponent_name, obs)
                             except Exception as e:
@@ -1400,12 +1401,33 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 if healed > 0:
                                     r_strategic += 0.02 * healed
                             elif active_card is not None and active_card.cardId == 431:
-                                r_strategic += 1.50  # Boosted: reward attacking with Mewtwo ex
+                                r_strategic += 0.35  # Calibrated: reward attacking with Mewtwo ex
+                            elif active_card is not None and active_card.cardId == 414:  # Team Rocket's Articuno
+                                r_strategic += 0.30  # Calibrated: reward Articuno Dark Frost rush
+                                if pre.get("turn", 0) <= 3:
+                                    r_strategic += 0.15  # Early turn aggro rush bonus
                             else:
-                                r_strategic += 0.75  # Boosted: reward standard attacks
+                                r_strategic += 0.20  # Calibrated: reward standard attacks
                             if not has_attacked_flag:
-                                r_strategic += 0.25
+                                r_strategic += 0.10
                                 has_attacked_flag = True
+
+                            # Early Turn 1-3 KO Aggro Rush Bonus
+                            if pre.get("turn", 0) <= 3 and prizes_taken > 0:
+                                r_strategic += 0.35  # Calibrated: Early Turn 1-3 Knockout bonus
+                            
+                    # Reward attaching Team Rocket's Energy (15) to Articuno (414) for 120 dmg Dark Frost
+                    if action_type == 8:  # ATTACH
+                        attached_cid = pre.get("attached_card_id", -1)
+                        target_cid = pre.get("attached_target_id", -1)
+                        if (attached_cid == 15 or pre.get("card_id") == 15) and (target_cid == 414 or pre.get("target_id") == 414):
+                            r_strategic += 0.20  # Powering up Articuno Dark Frost
+
+                    # Reward playing Giovanni (1218) during early turns (turn <= 3) for +30 damage 1-shot KO
+                    if action_type == 6:  # PLAY SUPPORTER/CARD
+                        played_cid = pre.get("played_card_id", -1)
+                        if (played_cid == 1218 or pre.get("card_id") == 1218) and pre.get("turn", 0) <= 3:
+                            r_strategic += 0.15  # Early Giovanni Aggro Damage Boost
                             
                     # 3. Bench Quality & Overextension Management
                     r_bench = 0.0
@@ -1505,6 +1527,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         r_deck -= 0.50  # Penalize imminent deckout only
                         
                     step_reward = r_stall + r_prize_t - r_prize_l + r_ko - r_own_ko + r_en + r_bench + r_deck + r_strategic
+                    step_reward = max(-1.0, min(1.0, step_reward))  # Clip step_reward to [-1.0, 1.0] for PER stability
                     
                     if i == 0:
                         rc_worker["prize_taken"] += r_prize_t
@@ -1787,7 +1810,7 @@ def main():
         torch.cuda.manual_seed_all(SEED)
 
     opponent_decks = load_all_decks()
-    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo","Rulebasedmodel_Dragapult","Rulebasedmodel_Mewtwo_Wobbuffet","Rulebasedmodel_Abomasnow"]}
+    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo","Rulebasedmodel_Dragapult","Rulebasedmodel_Mewtwo_Wobbuffet","Rulebasedmodel_Abomasnow","Rulebasedmodel_Lucario","Rulebasedmodel_Crustle","Rulebasedmodel_Starmie","Rulebasedmodel_Dipplin","Rulebasedmodel_Iono"]}
     if not opponent_decks:
         raise ValueError("No valid deck.csv found in root or subdirectories.")
         
@@ -1917,7 +1940,7 @@ def main():
     # Train against all opponent decks (including Iono) to learn card-specific
     # counters and strategies, and evaluate against all decks to check progress.
     train_opponent_names = all_opponent_names
-    test_opponent_names = ["Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Wobbuffet", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Abomasnow"]
+    test_opponent_names = ["Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Wobbuffet", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Abomasnow", "Rulebasedmodel_Lucario", "Rulebasedmodel_Crustle", "Rulebasedmodel_Starmie", "Rulebasedmodel_Dipplin", "Rulebasedmodel_Iono"]
 
     print(f"Opponent Decks Configuration:")
     print(f"  -> Train Opponent Decks: {train_opponent_names}")
