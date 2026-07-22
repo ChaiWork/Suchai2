@@ -985,6 +985,31 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 else:
                                     r_strategic -= 0.05
                                     
+                            # Buddy-Buddy Poffin / Basic Search (1086): reward searching basic Pokemon for bench setup
+                            elif played_id == 1086:
+                                pre_bench  = len(pre.get("bench_ids", []))
+                                post_bench = len(post.get("bench_ids", []))
+                                mons_benched = post_bench - pre_bench
+                                if mons_benched >= 2:
+                                    r_strategic += 0.30  # Dual basic bench setup — max Spidops Rocket Rush value
+                                elif mons_benched == 1:
+                                    r_strategic += 0.20  # Single basic setup
+                                else:
+                                    r_strategic += 0.10  # Search item played
+
+                            # Switch (1123): reward strategic switching to ready attacker or escaping bad matchup
+                            elif played_id == 1123:
+                                pre_active_id  = pre.get("active_id", -1)
+                                post_active_id = post.get("active_id", -1)
+                                post_active_c  = get_card_data(post_active_id)
+                                is_post_ready  = post_active_c is not None and post.get("active_energies", 0) >= 1
+                                if post_active_id in [414, 401, 431] and is_post_ready:
+                                    r_strategic += 0.25  # Strategic switch into ready attacker (Articuno/Spidops/Mewtwo)
+                                elif pre_active_id == 431 and pre.get("active_hp", 280) <= 140:
+                                    r_strategic += 0.20  # Strategic escape from damaged Mewtwo ex
+                                else:
+                                    r_strategic += 0.10  # Standard switch mobility
+
                             # Bug Catching Set: rewards finding Grass Pokemon or Grass Energy into hand
                             elif played_id == 1094:  # Bug Catching Set
                                 post_hand = post.get("hand_ids", [])
@@ -1193,12 +1218,16 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 else:
                                     benched_ids = pre.get("bench_ids", [])
                                     benched_energies = pre.get("bench_energies", [])
-                                    try:
-                                        b_idx = benched_ids.index(target_card.cardId)
-                                        if b_idx < len(benched_energies):
-                                            current_energy = benched_energies[b_idx]
-                                    except ValueError:
-                                        pass
+                                    target_bench_idx = pre.get("attached_target_bench_idx", -1)
+                                    if target_bench_idx >= 0 and target_bench_idx < len(benched_energies):
+                                        current_energy = benched_energies[target_bench_idx]
+                                    else:
+                                        try:
+                                            b_idx = benched_ids.index(target_card.cardId)
+                                            if b_idx < len(benched_energies):
+                                                current_energy = benched_energies[b_idx]
+                                        except ValueError:
+                                            pass
 
                                 max_attack_cost = 0
                                 for aid in target_card.attacks:
@@ -1208,15 +1237,15 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
 
                                 is_fully_charged = current_energy >= max_attack_cost
 
-                                if target_card.cardId in [431, 401, 434]:
+                                if target_card.cardId in [431, 401, 434, 414]:
                                     if is_fully_charged:
-                                        r_strategic -= 0.05  # Penalty for wasting Special Energy on already charged Pokémon!
+                                        r_strategic -= 0.03  # Calibrated penalty for overcharging
                                     else:
-                                        r_strategic += 0.50  # High reward for attaching Special/Double Energy to Mewtwo ex, Spidops, or Mimikyu!
+                                        r_strategic += 0.25  # Calibrated reward for Special/Double Energy attachment
                                         if pre.get("active_id") != target_card.cardId:
-                                            r_strategic += 0.15  # Extra reward for charging benched attacker
+                                            r_strategic += 0.08  # Bench charging bonus
                                 else:
-                                    r_strategic -= 0.10  # Severe penalty for wasting Special Energy on non-key attackers
+                                    r_strategic -= 0.05  # Calibrated penalty
                                     
                             # Basic energy attachment logic
                             elif attached_card.cardType == CardType.BASIC_ENERGY:
@@ -1226,12 +1255,16 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 else:
                                     benched_ids = pre.get("bench_ids", [])
                                     benched_energies = pre.get("bench_energies", [])
-                                    try:
-                                        b_idx = benched_ids.index(target_card.cardId)
-                                        if b_idx < len(benched_energies):
-                                            current_energy = benched_energies[b_idx]
-                                    except ValueError:
-                                        pass
+                                    target_bench_idx = pre.get("attached_target_bench_idx", -1)
+                                    if target_bench_idx >= 0 and target_bench_idx < len(benched_energies):
+                                        current_energy = benched_energies[target_bench_idx]
+                                    else:
+                                        try:
+                                            b_idx = benched_ids.index(target_card.cardId)
+                                            if b_idx < len(benched_energies):
+                                                current_energy = benched_energies[b_idx]
+                                        except ValueError:
+                                            pass
 
                                 max_attack_cost = 0
                                 for aid in target_card.attacks:
@@ -1241,48 +1274,56 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
 
                                 is_fully_charged = current_energy >= max_attack_cost
 
-                                # Mewtwo ex (431) uses Psychic (5) or Special (15) energy. Grass energy (1) is wasted on it.
+                                # Mewtwo ex (431) uses Psychic (5) or Special (15) energy.
                                 if target_card.cardId == 431:
                                     if attached_card.cardId == 5: # Psychic
                                         if is_fully_charged:
-                                            r_strategic -= 0.05  # Penalty for overcharging Mewtwo ex!
+                                            r_strategic -= 0.03
                                         else:
-                                            r_strategic += 0.50
+                                            r_strategic += 0.25
                                             if pre.get("active_id") != target_card.cardId:
-                                                r_strategic += 0.10  # Charging Mewtwo ex on bench is also good
+                                                r_strategic += 0.08
                                     elif attached_card.cardId == 1: # Grass
-                                        r_strategic -= 0.10 # Penalty for wasting Grass energy on Mewtwo ex!
+                                        r_strategic -= 0.05
                                 # Spidops/Tarountula (401/400) requires Grass energy (1)
                                 elif target_card.cardId in [401, 400]:
                                     if attached_card.cardId == 1: # Grass
                                         if is_fully_charged:
-                                            r_strategic -= 0.05  # Penalty for overcharging Spidops/Tarountula!
+                                            r_strategic -= 0.03
                                         else:
-                                            r_strategic += 0.50
+                                            r_strategic += 0.25
                                             if pre.get("active_id") != target_card.cardId:
-                                                r_strategic += 0.10  # Charging on bench is also good
+                                                r_strategic += 0.08
                                     elif attached_card.cardId == 5: # Psychic
-                                        r_strategic -= 0.05
-                                # Mimikyu (434) requires Psychic energy (5) for Gemstone Mimicry
+                                        r_strategic -= 0.03
+                                # Mimikyu (434) requires Psychic energy (5)
                                 elif target_card.cardId == 434:
                                     if attached_card.cardId == 5: # Psychic
                                         if is_fully_charged:
-                                            r_strategic -= 0.05
+                                            r_strategic -= 0.03
                                         else:
-                                            r_strategic += 0.50  # High reward for charging Mimikyu with Psychic Energy!
+                                            r_strategic += 0.25
                                             if pre.get("active_id") != target_card.cardId:
-                                                r_strategic += 0.10
+                                                r_strategic += 0.08
                                     elif attached_card.cardId == 1: # Grass
-                                        r_strategic -= 0.05
-                                else:
+                                        r_strategic -= 0.03
+                                # Articuno (414) powered by any basic energy
+                                elif target_card.cardId == 414:
                                     if is_fully_charged:
                                         r_strategic -= 0.03
                                     else:
+                                        r_strategic += 0.25
+                                        if pre.get("active_id") != target_card.cardId:
+                                            r_strategic += 0.08
+                                else:
+                                    if is_fully_charged:
+                                        r_strategic -= 0.02
+                                    else:
                                         target_is_attacker = target_card.ex or target_card.stage1 or target_card.stage2
                                         if target_is_attacker:
-                                            r_strategic += 0.20
+                                            r_strategic += 0.15
                                             if pre.get("active_id") != target_card.cardId:
-                                                r_strategic += 0.15
+                                                r_strategic += 0.05
                                         else:
                                             r_strategic += 0.05
                                     
@@ -1461,66 +1502,82 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         if opponent_name == "Rulebasedmodel_Abomasnow":
                             # Tactic 2: Snipe Snover pre-evolution for tempo blowout
                             if prizes_taken > 0 and opp_active_now == 722:
-                                r_strategic += 1.0
+                                r_strategic += 0.35
                             # Reward attacking Snover (722) or Kyogre (721) -- easy prizes before full setup
                             if action_type == 13 and opp_active_now in [721, 722]:
-                                r_strategic += 0.30
+                                r_strategic += 0.15
                             # Tactic 3: Exploit retreat-4 lock & Mimikyu Wall vs Abomasnow ex (723)
                             if opp_active_now == 723:
                                 if my_active_now == 434:  # Mimikyu is active wall
-                                    r_strategic += 0.30
+                                    r_strategic += 0.15
                                     # Reward attacking with Mimikyu to chip or build pressure
                                     if action_type == 13: 
-                                        r_strategic += 0.20
+                                        r_strategic += 0.10
                                 elif my_active_now == 401:  # Spidops is non-ex attacker (deals 180 dmg with Rocket Rush)
                                     # Reward Spidops active when ready to attack
                                     if pre.get("active_energies", 0) >= 2:
-                                        r_strategic += 0.30
+                                        r_strategic += 0.15
                                         if action_type == 13:  # ATTACK with Spidops
-                                            r_strategic += 0.40
+                                            r_strategic += 0.20
                                 elif my_active_now == 431:  # Mewtwo ex active is a risk
-                                    r_strategic -= 0.20
+                                    r_strategic -= 0.10
                                 elif my_active_now == 400:
-                                    r_strategic -= 0.20
+                                    r_strategic -= 0.10
                                 
                                 # Reward charging benched Tarountula/Spidops (400/401) to build Spidops attacker
-                                if action_type == 8 and pre.get("attached_target_id", -1) in [400, 401]:
-                                    r_strategic += 0.20
+                                attached_t_id = pre.get("attached_target_id", -1)
+                                if action_type == 8 and (attached_t_id in [400, 401] or pre.get("target_id") in [400, 401]):
+                                    r_strategic += 0.10
                                 # Reward attaching to Mimikyu to tank/retreat
-                                if action_type == 8 and pre.get("attached_target_id", -1) == 434:
-                                    r_strategic += 0.15
+                                if action_type == 8 and (attached_t_id == 434 or pre.get("target_id") == 434):
+                                    r_strategic += 0.10
                             # Reward patience (end turn) when Abomasnow is close to self-deckout via Hammer-lanche
                             if opp_deck_size <= 10 and action_type == 14:
-                                    r_strategic += 0.25
+                                    r_strategic += 0.15
                                     
                         # --- DRAGOPULT COUNTERS ---
                         elif opponent_name == "Rulebasedmodel_Dragapult":
                             # Snipe Dreepy (119) or Drakloak (120) pre-evolutions for tempo blowout
                             if prizes_taken > 0 and opp_active_now in [119, 120]:
-                                r_strategic += 1.0
+                                r_strategic += 0.35
                             # Mimikyu Wall vs Dragapult ex (121)
                             # Dragapult ex is a Tera Pokemon. Mimikyu can copy Phantom Dive (200 dmg) with Gemstone Mimicry!
                             if opp_active_now == 121:
                                 if my_active_now == 434:  # Mimikyu is immune active wall
                                     if pre.get("active_energies", 0) >= 2:
-                                        r_strategic += 0.30  # Active and ready to copy Phantom Dive
+                                        r_strategic += 0.15  # Active and ready to copy Phantom Dive
                                         if action_type == 13:  # ATTACK (Gemstone Mimicry)
-                                            r_strategic += 0.40
+                                            r_strategic += 0.20
                                     else:
-                                        r_strategic += 0.20  # Active wall but undercharged
+                                        r_strategic += 0.10  # Active wall but undercharged
                                 elif my_active_now == 431:  # Mewtwo ex is a liability
-                                    r_strategic -= 0.20
+                                    r_strategic -= 0.10
                                 # Reward attaching energy to Mimikyu (434) to charge Gemstone Mimicry (needs [P][C])
-                                if action_type == 8 and pre.get("attached_target_id", -1) == 434:
-                                    r_strategic += 0.30
+                                attached_t_id = pre.get("attached_target_id", -1)
+                                if action_type == 8 and (attached_t_id == 434 or pre.get("target_id") == 434):
+                                    r_strategic += 0.15
                                 # Defensive Hero's Cape attachment vs Dragapult
-                                if action_type == 8 and pre.get("attached_card_id", -1) == 1159:
-                                    r_strategic += 0.30  # High reward for creating a 380 HP tank vs Dragapult!
+                                attached_c_id = pre.get("attached_card_id", -1)
+                                if action_type == 8 and (attached_c_id == 1159 or pre.get("card_id") == 1159):
+                                    r_strategic += 0.15  # High reward for creating a 380 HP tank vs Dragapult!
                                     
                                 # Bench conservation: penalise overextension vs spread damage (> 2 benched mons)
                                 b_size = post.get("bench_size", 0)
                                 if b_size > 2:
                                     r_strategic -= 0.20 * (b_size - 2)
+
+                        # --- IONO COUNTERS ---
+                        elif opponent_name == "Rulebasedmodel_Iono":
+                            # Reward playing TR Transceiver (1134), TR Ariana (1216), or TR Factory (1257) for hand recovery right after Iono disruption
+                            played_c_id = pre.get("played_card_id", -1)
+                            if action_type == 6 and (played_c_id in [1134, 1216, 1257] or pre.get("card_id") in [1134, 1216, 1257]):
+                                if pre.get("hand_size", 0) <= 3:
+                                    r_strategic += 0.25  # High reward for hand recovery after Iono disruption!
+                                else:
+                                    r_strategic += 0.15
+                            # Snipe opponent Electric attackers (265-271) before full energy acceleration
+                            if prizes_taken > 0 and opp_active_now in [265, 268, 269, 270, 271]:
+                                r_strategic += 0.20
 
                     r_deck = 0.0
                     if post["deck_size"] == 0:

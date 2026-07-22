@@ -54,6 +54,8 @@ from cg.api import (
     search_end,
     OptionType,
     SelectContext,
+    CardType,
+    all_card_data,
 )
 
 SEARCH_COUNT = 200  # MCTS Search count — ≥200 needed for meaningful visit differentiation (audit: was 50, policy targets were noise)
@@ -289,7 +291,17 @@ def create_node(parent: Node | None,
 
 # --- Opponent Deck Database & Belief State Identification ---
 OPPONENT_DECKS = {
-    'Rulebasedmodel_Mewtwo_Wobbuffet': [1, 1, 1, 1, 1, 1, 1, 5, 5, 5, 15, 15, 15, 15, 400, 400, 400, 400, 401, 401, 401, 401, 414, 414, 431, 431, 432, 463, 463, 1094, 1094, 1094, 1097, 1119, 1119, 1134, 1134, 1134, 1134, 1152, 1152, 1152, 1152, 1159, 1175, 1216, 1216, 1216, 1216, 1217, 1218, 1218, 1218, 1219, 1220, 1220, 1227, 1227, 1257, 1257],
+    'Rulebasedmodel': [673, 673, 674, 674, 675, 675, 676, 676, 676, 677, 677, 677, 678, 678, 678, 678, 1102, 1102, 1102, 1102, 1123, 1123, 1141, 1141, 1141, 1141, 1142, 1142, 1142, 1142, 1152, 1152, 1152, 1152, 1159, 1182, 1182, 1192, 1192, 1192, 1192, 1227, 1227, 1227, 1227, 1252, 1252, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+    'Rulebasedmodel_Abomasnow': [721, 721, 722, 722, 722, 722, 723, 723, 723, 723, 1121, 1121, 1121, 1121, 1126, 1192, 1192, 1192, 1192, 1227, 1227, 1227, 1227, 1262, 1262, 1262, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+    'Rulebasedmodel_Crustle': [1123, 344, 1123, 1, 1227, 1182, 1, 1, 1152, 345, 5, 1192, 1091, 1192, 1097, 158, 157, 1, 1182, 1, 344, 1, 1, 1192, 1227, 1227, 1, 344, 345, 7, 1086, 345, 1152, 345, 1182, 1097, 1159, 1227, 1, 5, 1, 158, 158, 1235, 1152, 1235, 6, 344, 1, 343, 1091, 1235, 1192, 343, 2, 1152, 1, 1231, 1, 1086],
+    'Rulebasedmodel_Dipplin': [1086, 1097, 45, 1191, 1245, 93, 1086, 74, 1122, 93, 42, 1227, 93, 1, 90, 1245, 1227, 90, 1174, 1122, 89, 1094, 1231, 89, 1094, 42, 1, 1, 1245, 1, 1122, 89, 42, 1094, 1191, 100, 1184, 1129, 1227, 93, 42, 90, 1086, 1182, 1182, 1086, 1245, 73, 1080, 1123, 1122, 1094, 1227, 1211, 858, 240, 89, 1, 90, 1184],
+    'Rulebasedmodel_Dragapult': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 121, 140, 184, 235, 235, 1071, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1097, 1120, 1120, 1120, 1120, 1121, 1121, 1121, 1121, 1152, 1152, 1152, 1156, 1182, 1182, 1182, 1198, 1198, 1198, 1198, 1210, 1210, 1227, 1227, 1227, 1227, 1256, 1256, 2, 2, 2, 2, 5, 5, 5, 5],
+    'Rulebasedmodel_Iono': [265, 265, 265, 268, 268, 268, 269, 269, 269, 270, 270, 270, 271, 271, 271, 1086, 1086, 1086, 1097, 1097, 1110, 1118, 1121, 1121, 1121, 1152, 1152, 1227, 1227, 1227, 1227, 1233, 1233, 1233, 1233, 1254, 1254, 1254, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],
+    'Rulebasedmodel_Lucario': [673, 673, 674, 674, 675, 675, 676, 676, 676, 677, 677, 677, 678, 678, 678, 678, 1102, 1102, 1102, 1102, 1123, 1123, 1141, 1141, 1141, 1141, 1142, 1142, 1142, 1142, 1152, 1152, 1152, 1152, 1159, 1182, 1182, 1192, 1192, 1192, 1192, 1227, 1227, 1227, 1227, 1252, 1252, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+    'Rulebasedmodel_Mewtwo': [431, 431, 414, 414, 434, 434, 272, 401, 401, 401, 401, 400, 400, 400, 400, 1094, 1227, 1227, 1217, 1217, 1218, 1218, 1218, 1121, 1158, 1220, 1220, 1220, 1152, 1152, 1257, 1257, 1257, 1129, 1134, 1134, 1097, 1097, 1116, 1216, 1216, 1216, 1216, 1175, 1219, 1121, 1121, 1121, 1134, 1134, 5, 5, 1, 1, 1, 1, 1, 15, 15, 15],
+    'Rulebasedmodel_Mewtwo_Easy': [431, 431, 414, 414, 434, 434, 272, 401, 401, 401, 401, 400, 400, 400, 400, 1094, 1227, 1227, 1217, 1217, 1218, 1218, 1218, 1121, 1158, 1220, 1220, 1220, 1152, 1152, 1257, 1257, 1257, 1129, 1134, 1134, 1097, 1097, 1116, 1216, 1216, 1216, 1216, 1175, 1219, 1121, 1121, 1121, 1134, 1134, 5, 5, 1, 1, 1, 1, 1, 15, 15, 15],
+    'Rulebasedmodel_Mewtwo_Wobbuffet': [1, 1, 1, 1, 1, 1, 1, 5, 5, 5, 15, 15, 15, 15, 400, 400, 400, 400, 401, 401, 401, 401, 414, 414, 431, 431, 432, 1094, 1094, 1094, 1097, 1119, 1119, 1134, 1134, 1134, 1134, 1152, 1152, 1152, 1152, 1159, 1175, 1216, 1216, 1216, 1216, 1217, 1218, 1218, 1218, 1219, 1220, 1220, 1227, 1227, 1257, 1257, 1257],
+    'Rulebasedmodel_Starmie': [1227, 1227, 1225, 7, 1198, 1260, 104, 1030, 1145, 112, 7, 1152, 1182, 1097, 3, 3, 1225, 860, 1086, 1122, 1227, 1260, 3, 1152, 1031, 1030, 1152, 1225, 3, 1198, 112, 1145, 1086, 1174, 1086, 1159, 1097, 7, 1086, 1182, 1122, 1213, 1145, 1174, 1030, 1122, 112, 3, 1031, 1152, 860, 1260, 7, 1227, 1031, 860, 1229, 104, 1030, 861],
     'BasicallyBot_85134910': [788, 788, 788, 788, 789, 789, 789, 789, 928, 928, 928, 928, 855, 855, 855, 855, 1079, 1079, 1079, 1079, 1121, 1121, 1121, 1121, 1232, 1232, 1232, 1232, 1225, 1225, 1225, 1231, 1231, 1231, 17, 17, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
     'Cada_85134382': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 121, 140, 184, 235, 1120, 1071, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1097, 131, 131, 132, 133, 1121, 1121, 1121, 1120, 1120, 1152, 1152, 1152, 1182, 1182, 1182, 1198, 1198, 1198, 1198, 1210, 1210, 1227, 1227, 1227, 1227, 1256, 1256, 2, 2, 2, 2, 5, 5, 5, 5],
     'Cotini_85137077': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 131, 131, 132, 132, 133, 235, 140, 1071, 112, 1227, 1227, 1227, 1227, 1198, 1198, 1198, 1182, 1182, 1231, 1121, 1121, 1121, 1121, 1152, 1152, 1152, 1152, 1086, 1086, 1086, 1086, 1120, 1120, 1120, 1120, 1097, 1097, 1080, 1256, 1256, 1161, 343, 2, 2, 2, 5, 5, 5, 7, 7],
@@ -339,33 +351,75 @@ def get_opponent_revealed_card_ids(obs, opponent_index: int) -> list[int]:
     return revealed
 
 
-def identify_opponent_deck(revealed_ids: list[int], opponent_decks: dict) -> list[int]:
-    """Identifies the opponent's deck template using multiset intersection match."""
-    if not revealed_ids:
-        # Default to BasicallyBot if no cards have been revealed yet
-        return opponent_decks.get("BasicallyBot_85134910")
-        
-    best_name = None
-    best_matches = -1
+def create_dynamic_opponent_deck(revealed_ids: list[int]) -> list[int]:
+    """Generates a realistic 60-card deck template using revealed cards & energy/evolution line inference."""
+    deck = []
+    card_db = {c.cardId: c for c in all_card_data()}
     
+    # 1. Include revealed cards (up to 4 copies for plausible deck reconstruction)
+    seen_counts = Counter(revealed_ids)
+    for cid, count in seen_counts.items():
+        deck.extend([cid] * min(4, max(count, 3)))
+        
+    # 2. Auto-infer evolution chain completion (e.g. Dreepy 119 -> Drakloak 120 -> Dragapult ex 121)
+    revealed_mons = [card_db[cid] for cid in revealed_ids if cid in card_db and card_db[cid].cardType == CardType.POKEMON]
+    for m in revealed_mons:
+        for c in card_db.values():
+            if getattr(c, "evolvesFrom", None) == m.name and c.cardId not in deck:
+                deck.extend([c.cardId] * 2)
+
+    # 3. Add High-Value Competitive Trainer Staples (Ultra Ball 1121, Switch 1123, Supporters)
+    trainers = [1121, 1121, 1121, 1121, 1123, 1123, 1227, 1227, 1227, 1227, 1097, 1097, 1086, 1086, 1152, 1152, 1129, 1159]
+    for t_id in trainers:
+        if len(deck) >= 48:
+            break
+        deck.append(t_id)
+
+    # 4. Fill Remaining with Energy Types up to exactly 60 Cards
+    energy_pool = [2, 5, 1, 3]  # Fire, Psychic, Grass, Water
+    idx = 0
+    while len(deck) < 60:
+        deck.append(energy_pool[idx % len(energy_pool)])
+        idx += 1
+
+    return deck[:60]
+
+
+def sample_opponent_belief_deck(revealed_ids: list[int], opponent_decks: dict) -> list[int]:
+    """Computes Bayesian belief probabilities over known archetypes + dynamic template, sampling a belief deck for MCTS."""
+    if not revealed_ids:
+        sample_key = random.choice(list(opponent_decks.keys()))
+        return opponent_decks[sample_key]
+
+    scores = {}
+    r_counts = Counter(revealed_ids)
+    r_len = max(1, len(revealed_ids))
+
     for name, deck in opponent_decks.items():
-        # Count frequency of each card ID in the deck
-        deck_counts = {}
-        for cid in deck:
-            deck_counts[cid] = deck_counts.get(cid, 0) + 1
-            
-        # Count matches based on multiset intersection
-        matches = 0
-        for cid in revealed_ids:
-            if deck_counts.get(cid, 0) > 0:
-                matches += 1
-                deck_counts[cid] -= 1
-                
-        if matches > best_matches:
-            best_matches = matches
-            best_name = name
-            
-    return opponent_decks[best_name]
+        d_counts = Counter(deck)
+        matches = sum(min(cnt, d_counts.get(cid, 0)) for cid, cnt in r_counts.items())
+        scores[name] = matches / r_len
+
+    max_score = max(scores.values()) if scores else 0.0
+    
+    # Low max_score means low confidence in known archetypes -> favors dynamic template
+    dynamic_score = max(0.0, 1.0 - max_score * 1.5)
+    
+    # Softmax temperature-scaled belief probabilities
+    temp = 4.0
+    exp_scores = {k: math.exp(v * temp) for k, v in scores.items()}
+    exp_scores["__DYNAMIC__"] = math.exp(dynamic_score * temp)
+    
+    total_prob = sum(exp_scores.values())
+    keys = list(exp_scores.keys())
+    weights = [exp_scores[k] / total_prob for k in keys]
+    
+    chosen_key = random.choices(keys, weights=weights, k=1)[0]
+    
+    if chosen_key == "__DYNAMIC__":
+        return create_dynamic_opponent_deck(revealed_ids)
+    else:
+        return opponent_decks[chosen_key]
 
 
 def get_own_visible_card_ids(obs, your_index: int) -> list[int]:
@@ -411,10 +465,10 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
     state = obs.current
     active = state.players[1 - your_index].active
     
-    # Dynamically match opponent deck based on revealed cards
+    # Dynamically sample opponent belief deck using Bayesian Information Set probabilities
     opp_index = 1 - your_index
     revealed_ids = get_opponent_revealed_card_ids(obs, opp_index)
-    matched_deck = identify_opponent_deck(revealed_ids, OPPONENT_DECKS)
+    matched_deck = sample_opponent_belief_deck(revealed_ids, OPPONENT_DECKS)
     
     # Use Counter for O(1) per-card removal instead of O(n) list.remove()
     remaining_counter = Counter(matched_deck)
@@ -628,8 +682,8 @@ def agent(obs_dict: dict) -> list[int]:
             with open(deck_path, "r") as f:
                 _deck = [int(line.strip()) for line in f if line.strip()]
         except Exception:
-            # Default sample deck
-            _deck = [721,721,722,722,722,722,723,723,723,723,1092,1121,1121,1145,1145,1163,1163,1219,1219,1219,1219,1227,1227,1227,1227,1262,1262,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3]
+            # Fallback to exact Team Rocket 60-card decklist
+            _deck = [1, 1, 1, 1, 1, 1, 5, 5, 5, 5, 15, 15, 15, 15, 400, 400, 400, 401, 401, 401, 414, 414, 431, 431, 432, 434, 1094, 1094, 1097, 1097, 1116, 1121, 1121, 1121, 1121, 1129, 1134, 1134, 1134, 1134, 1152, 1159, 1175, 1216, 1216, 1216, 1216, 1217, 1217, 1218, 1218, 1218, 1219, 1220, 1220, 1220, 1227, 1227, 1257, 1257]
 
     # Check if this is the initial deck-registration step (obs.select is None)
     if obs_dict.get("select") is None:
@@ -662,9 +716,10 @@ def agent(obs_dict: dict) -> list[int]:
         _model = _model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         _model.eval()
 
-    # Determine adaptive search count budget based on current turn
+    # Determine adaptive search count budget based on current turn & remaining overage time
     obs = to_observation_class(obs_dict)
     turn = obs.current.turn if (obs.current is not None) else 0
+    remaining_time = float(obs_dict.get('remainingOverageTime', 600.0))
     
     # Check if active is walled (Mewtwo ex active against opponent Mimikyu)
     active_is_walled = False
@@ -687,8 +742,20 @@ def agent(obs_dict: dict) -> list[int]:
         pass
 
     IS_KAGGLE = os.path.exists('/kaggle_simulations/agent') or 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
-    if IS_KAGGLE:
-        # Lower budget on Kaggle to prevent TIMEOUT on weak CPU
+    if remaining_time < 60.0:
+        # Emergency fast play mode to prevent TIMEOUT when remaining time is low (<60s)
+        search_count = 5
+    elif remaining_time < 150.0:
+        # Low time budget mode (<150s)
+        search_count = 8
+    elif remaining_time < 300.0:
+        # Moderate time budget mode (<300s)
+        if active_is_walled or is_main_context:
+            search_count = 20 if IS_KAGGLE else 50
+        else:
+            search_count = 10 if IS_KAGGLE else 25
+    elif IS_KAGGLE:
+        # Standard Kaggle budget with comfortable time remaining (>300s)
         if active_is_walled or is_main_context:
             search_count = 35  # Boost budget for critical decisions on Kaggle
         elif turn <= 3:
