@@ -39,6 +39,11 @@ from model import (
     MODEL_NUM_LAYERS_DECODER,
 )
 
+try:
+    from expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE
+except ImportError:
+    from src.expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE
+
 # Resolve cg-lib path dynamically for Kaggle vs Local environments
 try:
     cg_lib_path = glob.glob('/kaggle/input/**/cg-lib', recursive=True)[0]
@@ -82,15 +87,12 @@ class GPUInferenceClient:
 
 
 class Child:
-    """MCTS Node Child representing a possible selected action combination."""
-    node: 'Node | None'
-    select: list[int]  # Selected option indices
-    prob: float        # Probability of selection
-
-    def __init__(self, select: list[int], prob: float):
+    """Edge in the MCTS search tree pointing to a child node."""
+    def __init__(self, select: list[int], prob: float, select_option=None):
         self.node = None
         self.select = select
         self.prob = prob
+        self.select_option = select_option
 
 
 class Node:
@@ -430,7 +432,8 @@ def create_node(parent: Node | None,
         prob_sum = 0.0
         for i in range(n_actions):
             p = math.exp(policy_biased[i] - max_logit)
-            node.children.append(Child(actions[i], p))
+            first_opt = options[actions[i][0]] if (options and actions[i] and actions[i][0] < len(options)) else None
+            node.children.append(Child(actions[i], p, select_option=first_opt))
             prob_sum += p
         if prob_sum > 0.0:
             for c in node.children:
@@ -611,7 +614,7 @@ def get_own_visible_card_ids(obs, your_index: int) -> list[int]:
     return visible
 
 
-def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_count: int = None, temperature: float = 0.0, force_action: list[int] = None) -> tuple[list[int], LearnSample]:
+def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_count: int = None, temperature: float = 0.0, force_action: list[int] = None, opponent_name: str = "unknown") -> tuple[list[int], LearnSample]:
     """Perform MCTS exploration and select the best action list, returning it and a training sample."""
     obs = to_observation_class(obs_dict)
     your_index = obs.current.yourIndex
@@ -723,7 +726,10 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
                 
                 if current.state.observation.current.yourIndex != your_index:
                     v = -v
-                v += puct_scale * child.prob / (1 + visit)
+                exp_bonus = 0.0
+                if child.select_option is not None and hasattr(current.state, "observation"):
+                    exp_bonus, _ = get_expert_bonus(current.state.observation, child.select_option, opponent_name=opponent_name)
+                v += puct_scale * child.prob / (1 + visit) + EXPERT_WEIGHT * exp_bonus
                 if value < v:
                     value = v
                     next_child = child

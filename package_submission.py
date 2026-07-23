@@ -4,11 +4,13 @@ import tarfile
 def main():
     # Mapping of local file path to path in the root of the archive
     files_to_include = [
-        ("main.py", "main.py"),
-        ("deck.csv", "deck.csv"),
-        ("src/model.py", "model.py"),
-        ("src/agent.py", "agent.py"),
-        ("cg", "cg")
+        ("main.py",                   "main.py"),
+        ("deck.csv",                  "deck.csv"),
+        ("src/model.py",              "model.py"),
+        ("src/agent.py",              "agent.py"),
+        ("src/expert_knowledge.py",   "expert_knowledge.py"),  # Required: agent.py imports this at startup
+        ("src/utils.py",              "utils.py"),             # Required: helper lookup functions
+        ("cg",                        "cg"),
     ]
     
     # Prioritize best_model.pth (highest evaluation win rate) over final model.pth

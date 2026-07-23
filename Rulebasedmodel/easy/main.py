@@ -30,7 +30,8 @@ from cg.api import (
 )
 
 artifact_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deck.pkl")
-
+if not os.path.exists(artifact_path):
+    artifact_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "deck.pkl")
 if not os.path.exists(artifact_path):
     artifact_path = "/kaggle_simulations/agent/deck.pkl"
 

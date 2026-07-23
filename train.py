@@ -51,6 +51,10 @@ from model import (
 )
 from agent import LearnSample, mcts_agent, random_agent, GPUInferenceClient
 from plot_metrics import plot_metrics
+try:
+    from expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE
+except ImportError:
+    from src.expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE
 
 from cg.game import battle_start, battle_finish, battle_select
 from cg.api import (
@@ -189,23 +193,24 @@ class ProgressBar:
 
 def rule_based_opponent_agent(opponent_name, obs):
     mapping = {
-        "Rulebasedmodel": ["main", "easy.main"],
-        "Rulebasedmodel_Iono": ["iono_agent", "hard.iono_agent"],
-        "Rulebasedmodel_Dragapult": ["dragapult_agent", "hard.dragapult_agent"],
-        "Rulebasedmodel_Mewtwo": ["mewtwo_agent", "easy.mewtwo_agent"],
-        "Rulebasedmodel_Mewtwo_Easy": ["mewtwo_agent_easy", "easy.mewtwo_agent_easy"],
-        "Rulebasedmodel_Abomasnow": ["abomasnow_agent", "easy.abomasnow_agent"],
-        "Rulebasedmodel_Lucario": ["lucario_agent", "hard.lucario_agent"],
-        "Rulebasedmodel_Crustle": ["crustle_agent", "easy.crustle_agent"],
-        "Rulebasedmodel_Starmie": ["starmie_agent", "hard.starmie_agent"],
-        "Rulebasedmodel_Dipplin": ["dipplin_agent", "hard.dipplin_agent"],
-        "Rulebasedmodel_Mewtwo_Wobbuffet": ["mewtwo_wobbuffet_agent", "hard.mewtwo_wobbuffet_agent"],
-        "Rulebasedmodel_TR_Mewtwo": ["team_rocket_mewtwo_rule_agent"],
-        "Rulebasedmodel_Alakazam": ["alakazam_agent", "hard.alakazam_agent"],
-        "Rulebasedmodel_Archaludon": ["archaludon_agent", "hard.archaludon_agent"],
-        "Rulebasedmodel_Kangaskhan_Crustle": ["kangaskhan_crustle_agent", "hard.kangaskhan_crustle_agent"],
-        "Rulebasedmodel_Grimmsnarl": ["grimmsnarl_agent", "hard.grimmsnarl_agent"],
-        "Rulebasedmodel_Trevenant": ["trevenant_agent", "hard.trevenant_agent"]
+        "Rulebasedmodel": ["easy.main"],
+        "Rulebasedmodel_Mewtwo_Easy": ["easy.mewtwo_agent_easy"],
+        "Rulebasedmodel_Mewtwo": ["easy.mewtwo_agent"],
+        "Rulebasedmodel_Abomasnow": ["easy.abomasnow_agent"],
+        "Rulebasedmodel_Crustle": ["easy.crustle_agent"],
+        
+        "Rulebasedmodel_Alakazam": ["hard.alakazam_agent"],
+        "Rulebasedmodel_Archaludon": ["hard.archaludon_agent"],
+        "Rulebasedmodel_Dipplin": ["hard.dipplin_agent"],
+        "Rulebasedmodel_Dragapult": ["hard.dragapult_agent"],
+        "Rulebasedmodel_Grimmsnarl": ["hard.grimmsnarl_agent"],
+        "Rulebasedmodel_Iono": ["hard.iono_agent"],
+        "Rulebasedmodel_Kangaskhan_Crustle": ["hard.kangaskhan_crustle_agent"],
+        "Rulebasedmodel_Lucario": ["hard.lucario_agent"],
+        "Rulebasedmodel_Mewtwo_Wobbuffet": ["hard.mewtwo_wobbuffet_agent"],
+        "Rulebasedmodel_Starmie": ["hard.starmie_agent"],
+        "Rulebasedmodel_Trevenant": ["hard.trevenant_agent"],
+        "Rulebasedmodel_TR_Mewtwo": ["team_rocket_mewtwo_rule_agent"]
     }
     
     modules = mapping.get(opponent_name, [opponent_name])
@@ -428,6 +433,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 action_counts = {"attack": 0, "play": 0, "attach": 0, "evolve": 0, "ability": 0, "retreat": 0, "end": 0, "other": 0}
                 played_cards = {}
                 samples = [[], []]
+                expert_log = []  # Per-step expert guidance log
                 
                 # Episode-state active spot lockout trackers
                 episode_lockouts = [0, 0]
@@ -524,15 +530,32 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 rb_selected = rule_based_opponent_agent("Rulebasedmodel_Mewtwo", obs)
                                 # Run MCTS with force_action to collect Behavioral Cloning data
                                 temperature = 1.0 if turn <= 15 else 0.1
-                                selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature, force_action=rb_selected)
+                                selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature, force_action=rb_selected, opponent_name=opponent_name)
                             except Exception as e:
                                 use_warmup = False
                                 
                         if not use_warmup:
                             # Temperature decay: explore fully early, exploit late-game
                             temperature = 1.0 if turn <= 15 else 0.1
-                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature)
+                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature, opponent_name=opponent_name)
                             sample.pred_val = sample.value
+                            
+                            # Log expert guidance trigger for the chosen action (player 0 only)
+                            if selected and len(selected) > 0:
+                                try:
+                                    chosen_opt = obs_class.select.option[selected[0]]
+                                    exp_bonus, exp_trigger = get_expert_bonus(obs_class, chosen_opt, opponent_name=opponent_name)
+                                    if exp_trigger != "NONE":
+                                        expert_log.append({
+                                            "trigger":     exp_trigger,
+                                            "action_type": chosen_opt.type,
+                                            "bonus":       exp_bonus,
+                                            "turn":        obs_class.current.turn,
+                                            "my_prizes":   len(obs_class.current.players[curr_player].prize),
+                                            "opp_prizes":  len(obs_class.current.players[1 - curr_player].prize),
+                                        })
+                                except Exception:
+                                    pass
                             
                             opt_type_val = -1
                             played_card_id = -1
@@ -836,14 +859,16 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         for cid in pre_opp_b:
                             if cid not in post_opp_b:
                                 card = get_card_data(cid)
-                                if card and getattr(card, "name", None) and any(p in card.name.lower() for p in ["dreepy", "snover", "drakloak", "tarountula"]):
-                                    r_strategic += 0.15  # Evolution denial bonus
+                                if card and getattr(card, "name", None) and any(p in card.name.lower() for p in ["dreepy", "snover", "drakloak", "tarountula", "abra", "staryu", "impidimp", "phantump", "applin", "riolu"]):
+                                    r_strategic += 0.15  # Evolution denial bonus across all 10 archetypes
                                     break
 
-                    # Anti-Overbenching Penalty (-0.15 for bench >= 3 against Dragapult, >= 4 generic)
+                    # Action-based counter-play heuristics
                     if action_type == 7:  # PLAY
                         played_id = pre.get("played_card_id", -1)
                         played_card = get_card_data(played_id)
+                        
+                        # Anti-Overbenching Penalty (-0.15 for bench >= 3 against Dragapult, >= 4 generic)
                         if played_card is not None and played_card.cardType == CardType.POKEMON and played_card.basic:
                             opp_b_ids = pre.get("opp_bench_ids", [])
                             opp_act_id = pre.get("opp_active_id", -1)
@@ -854,6 +879,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         if played_id == 431:  # TR Mewtwo ex
                             r_strategic += 0.20  # Early Mewtwo ex boarding bonus
 
+                        # Stadium Counter Reward (+0.20 for overriding opponent Stadiums like Festival Grounds)
+                        if played_id in (1257, 1258) and pre.get("stadium_id") is not None and pre.get("stadium_id") != 1257:
+                            r_strategic += 0.20
+
                         # Iono Low-Hand Recovery Contingency Reward (+0.15 when hand <= 2)
                         my_hand_size = pre.get("hand_size", 5)
                         if my_hand_size <= 2 and played_id in (1257, 1134, 1097, 1094, 1216):
@@ -861,7 +890,14 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
 
                         # Tool Attachment Survivability Bonus (+0.15 for Hero's Cape / Brave Bangle)
                         if played_id in (1159, 1175):
-                            r_strategic += 0.15  # Tool survivability boost against Dragapult/Abomasnow
+                            r_strategic += 0.15  # Tool survivability boost against Dragapult/Abomasnow/Trevenant
+
+                    elif action_type == 13:  # ATTACK
+                        # Weakness Exploit Bonus (+0.20 for Mewtwo ex 2x Psychic damage vs Fighting-types Lucario/Riolu)
+                        opp_act_id = pre.get("opp_active_id", -1)
+                        opp_act_card = get_card_data(opp_act_id)
+                        if opp_act_card and getattr(opp_act_card, "name", None) and any(kw in opp_act_card.name.lower() for kw in ["riolu", "lucario"]):
+                            r_strategic += 0.20  # Psychic weakness exploitation bonus
 
                     # Passive Basic Active Penalty (-0.20 for Articuno 414 or Mimikyu 434 against heavy ex threats)
                     if post.get("active_id") in (414, 434) and post.get("active_energy", 0) == 0:
@@ -871,7 +907,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
 
                     # Going second tactical exploitation bonus on first turn
                     if went_second and step_idx == 0:
-                        if action_type == 13:  # ATTACK on turn 1 going second (exploiting going second attack rule)
+                        if action_type == 13:  # ATTACK on turn 1 going second
                             r_strategic += 0.35
                         elif action_type in [7, 8]:  # PLAY / ATTACH on turn 1 going second
                             r_strategic += 0.15
@@ -1393,7 +1429,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         evolved_id = pre.get("evolved_card_id", -1)
                         evolved_card = get_card_data(evolved_id)
                         if evolved_card is not None:
-                            if evolved_card.stage1 or evolved_card.stage2:
+                            if evolved_id == 401 or getattr(evolved_card, "cardId", -1) == 401:
+                                r_strategic += 0.25  # High priority Spidops evolution reward
+                            elif evolved_card.stage1 or evolved_card.stage2:
                                 r_strategic += 0.15  # Evolution setup reward
                             else:
                                 r_strategic += 0.08
@@ -1515,11 +1553,25 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         if (attached_cid == 15 or pre.get("card_id") == 15) and (target_cid == 414 or pre.get("target_id") == 414):
                             r_strategic += 0.20  # Powering up Articuno Dark Frost
 
-                    # Reward playing Giovanni (1218) during early turns (turn <= 3) for +30 damage 1-shot KO
-                    if action_type == 6:  # PLAY SUPPORTER/CARD
+                    # Reward playing Transceiver/Poffin/Proton when bench_size == 0 (prevent lone active wipe)
+                    if action_type in (6, 7):  # PLAY SUPPORTER/CARD
                         played_cid = pre.get("played_card_id", -1)
-                        if (played_cid == 1218 or pre.get("card_id") == 1218) and pre.get("turn", 0) <= 3:
+                        if pre.get("bench_size", 0) == 0 and (played_cid in (1134, 1086, 1220) or pre.get("card_id") in (1134, 1086, 1220)):
+                            r_strategic += 0.20  # Emergency bench search on 0 bench
+                        elif (played_cid == 1218 or pre.get("card_id") == 1218) and pre.get("turn", 0) <= 3:
                             r_strategic += 0.15  # Early Giovanni Aggro Damage Boost
+                        elif played_cid == 1227 or pre.get("card_id") == 1227:
+                            my_deck_size = pre.get("deck_size", 40)
+                            my_hand_size = pre.get("hand_size", 5)
+                            hand_diff = post.get("hand_size", 5) - pre.get("hand_size", 5)
+                            if my_deck_size <= 5:
+                                r_strategic -= 0.15  # Heavy penalty for Lillie hand reset when deck is low
+                            elif my_hand_size <= 3:
+                                r_strategic += 0.15  # Emergency hand reset when low on cards
+                            elif hand_diff >= 2:
+                                r_strategic += 0.10  # Good net card draw gain
+                            elif my_hand_size >= 6 and hand_diff <= 0:
+                                r_strategic -= 0.05  # Wasteful hand reset on rich hand
                             
                     # 3. Bench Quality & Overextension Management
                     r_bench = 0.0
@@ -1528,6 +1580,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         if post.get("turn", 0) <= 2:
                             r_bench -= 0.05  # Extra -0.05 penalty during early turns (turn <= 2)
 
+                    elif post["bench_size"] >= 3 and "Alakazam" in str(opponent_name):
+                        r_bench -= 0.05  # Overextension penalty vs Alakazam to minimize Mind Jack damage
                     elif post["bench_size"] == 5:
                         r_bench -= 0.02  # Overextension penalty
                         
@@ -1689,7 +1743,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         entropy_accum += entropy
                         entropy_count += 1
                         
-            result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, processed_samples, result, final_turn, rc_worker, entropy_accum, entropy_count, action_counts, played_cards)))
+            result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, processed_samples, result, final_turn, rc_worker, entropy_accum, entropy_count, action_counts, played_cards, expert_log)))
             
         elif cmd == "EVAL":
             sample_deck, opponent_deck, opponent_name = args
@@ -2045,6 +2099,14 @@ def main():
         writer = csv.writer(f)
         writer.writerow(["epoch", "opponent_name", "result", "turns", "attacks", "plays", "attaches", "evolves", "abilities", "retreats", "ends", "other"])
 
+    expert_guidance_path = os.path.join(run_dir, "expert_guidance.csv")
+    with open(expert_guidance_path, mode="w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "episode", "opponent", "trigger", "action_type", "bonus",
+            "game_result", "turn", "my_prizes", "opp_prizes"
+        ])
+
     try:
         from torch.utils.tensorboard import SummaryWriter
         tb_writer = SummaryWriter(log_dir=run_dir)
@@ -2283,7 +2345,8 @@ def main():
                 if msg == "PLAY_SELF_COMPLETE":
                     w_idx, samples, result, final_turn, rc_worker, e_accum, e_count = data[:7]
                     action_counts = data[7] if len(data) > 7 else {}
-                    played_cards = data[8] if len(data) > 8 else {}
+                    played_cards  = data[8] if len(data) > 8 else {}
+                    expert_log    = data[9] if len(data) > 9 else []
                     
                     games_received += 1
                     
@@ -2320,6 +2383,23 @@ def main():
                             action_counts.get("other", 0)
                         ])
                     
+                    # Write expert guidance log entries for this game
+                    if expert_log:
+                        with open(expert_guidance_path, mode="a", newline="", encoding="utf-8-sig") as f_eg:
+                            eg_writer = csv.writer(f_eg)
+                            for entry in expert_log:
+                                eg_writer.writerow([
+                                    counter,
+                                    opp_name,
+                                    entry.get("trigger", "NONE"),
+                                    entry.get("action_type", -1),
+                                    entry.get("bonus", 0.0),
+                                    result,
+                                    entry.get("turn", -1),
+                                    entry.get("my_prizes", -1),
+                                    entry.get("opp_prizes", -1),
+                                ])
+
                     if result >= 0:
                         if result == 0:
                             epoch_self_play_wins += 1.0
