@@ -118,6 +118,68 @@ class Node:
             self.parent.backprop(value)
 
 
+def detect_opponent_archetype(obs, your_index: int) -> str:
+    """Detect opponent deck archetype from revealed active, bench, and discard cards."""
+    if obs is None or obs.current is None:
+        return "GENERIC"
+    try:
+        opp_index = 1 - your_index
+        opp_player = obs.current.players[opp_index]
+        visible_cards = []
+        for card in opp_player.active + opp_player.bench + opp_player.discard:
+            name = getattr(card, 'name', '').lower()
+            visible_cards.append(name)
+        card_str = " ".join(visible_cards)
+        if "dreepy" in card_str or "drakloak" in card_str or "dragapult" in card_str:
+            return "DRAGAPULT"
+        elif "snover" in card_str or "abomasnow" in card_str:
+            return "ABOMASNOW"
+        elif "iono" in card_str or "pidgeot" in card_str or "snorlax" in card_str:
+            return "IONO_CONTROL"
+    except Exception:
+        pass
+    return "GENERIC"
+
+
+def get_target_card_priority_score(opt, obs, archetype: str) -> float:
+    """Calculate strategic priority score for targeting opponent cards based on matchup prompt."""
+    if opt.type != OptionType.CARD:
+        return 1.0
+    
+    card_name = ""
+    try:
+        if hasattr(opt, 'area') and hasattr(opt, 'index') and hasattr(opt, 'playerIndex'):
+            target_player = obs.current.players[opt.playerIndex]
+            if opt.area == AreaType.ACTIVE and target_player.active:
+                card_name = getattr(target_player.active[0], 'name', '').lower()
+            elif opt.area == AreaType.BENCH and opt.index < len(target_player.bench):
+                card_name = getattr(target_player.bench[opt.index], 'name', '').lower()
+    except Exception:
+        pass
+
+    if not card_name:
+        return 1.0
+
+    if archetype == "DRAGAPULT":
+        if "dreepy" in card_name:
+            return 10.0   # Highest Priority 1: KO Dreepy immediately
+        elif "drakloak" in card_name:
+            return 8.0    # Priority 2: KO Drakloak before Dragapult evolves
+        elif "dragapult" in card_name:
+            return 5.0    # Priority 3: Dragapult ex
+    elif archetype == "ABOMASNOW":
+        if "snover" in card_name:
+            return 10.0   # Highest Priority 1: KO Snover immediately
+        elif "abomasnow" in card_name:
+            return 7.0    # Priority 2: Abomasnow
+    elif archetype == "IONO_CONTROL":
+        if "iono" in card_name or "pidgeot" in card_name or "bibarel" in card_name:
+            return 8.0    # Draw/Support engine
+            
+    # Universal Rule: Target evolving pre-evolutions (Basic Pokémon) over fully evolved forms
+    return 3.0
+
+
 def create_node(parent: Node | None,
                 search_state: SearchState,
                 your_index: int,
@@ -144,8 +206,7 @@ def create_node(parent: Node | None,
         actions = []
         options = obs.select.option
         
-        high_priority = []
-        low_priority = []
+        archetype = detect_opponent_archetype(obs, your_index)
         
         # High priority option types to guarantee evaluation
         HIGH_PRIORITY_TYPES = {
@@ -163,13 +224,102 @@ def create_node(parent: Node | None,
             OptionType.END
         }
         
+        scored_options = []
         for idx, opt in enumerate(options):
+            score = 1.0
             if opt.type in HIGH_PRIORITY_TYPES:
-                high_priority.append(idx)
-            else:
-                low_priority.append(idx)
+                score += 10.0
+            
+            # Decision Hierarchy Implementation
+            # 1. Guaranteed KO / Attack Priority (Attack every turn)
+            if opt.type == OptionType.ATTACK:
+                score += 100.0
+            
+            # 2. Stop Opponent Evolution / Target Priority
+            elif opt.type == OptionType.CARD:
+                target_score = get_target_card_priority_score(opt, obs, archetype)
+                score += target_score * 10.0  # Scales up to +100 for Dreepy/Snover
+            
+            # 3. Evolve Immediately (Tarountula -> Spidops)
+            elif opt.type == OptionType.EVOLVE:
+                score += 60.0
+            
+            # 4. Attach Energy (TR Energy > Psychic > Grass; Prioritize TR Mewtwo ex)
+            elif opt.type == OptionType.ATTACH:
+                score += 50.0
+                try:
+                    target_id = -1
+                    if hasattr(opt, "inPlayArea") and hasattr(opt, "inPlayIndex"):
+                        players = obs.current.players[your_index]
+                        if opt.inPlayArea == 4 and len(players.active) > 0 and players.active[0]:
+                            target_id = players.active[0].id
+                        elif opt.inPlayArea == 5 and 0 <= opt.inPlayIndex < len(players.bench) and players.bench[opt.inPlayIndex]:
+                            target_id = players.bench[opt.inPlayIndex].id
+                    if target_id == 431:  # TR Mewtwo ex
+                        score += 30.0
+                except Exception:
+                    pass
+            
+            # 5. Improve Board / Early Mewtwo ex Setup / Iono Recovery
+            elif opt.type in (OptionType.PLAY, OptionType.CARD):
+                score += 40.0
+                try:
+                    played_cid = getattr(opt, "cardId", -1)
+                    if played_cid == -1 and hasattr(opt, "index") and obs.current:
+                        hand = obs.current.players[your_index].hand
+                        if 0 <= opt.index < len(hand) and hand[opt.index]:
+                            played_cid = hand[opt.index].id
+                    if played_cid == 431:  # TR Mewtwo ex - High priority to bench early!
+                        score += 50.0
+                    
+                    # Iono Low-Hand Recovery Contingency: Boost Factory, Transceiver, Night Stretcher when hand <= 2
+                    hand_len = len(obs.current.players[your_index].hand) if obs.current else 5
+                    if hand_len <= 2 and played_cid in (1257, 1134, 1097, 1094, 1216):
+                        score += 40.0  # Contingency draw recovery boost after Iono
+                    
+                    # Tool Attachment Contingency: Hero's Cape (1159) / Brave Bangle (1175)
+                    if played_cid in (1159, 1175):
+                        score += 30.0  # Survivability boost against Dragapult / Abomasnow
+                except Exception:
+                    pass
                 
-        sorted_indices = high_priority + low_priority
+            # Active Spot Promotion Safeguards against Heavy Threats (e.g. Mega Abomasnow ex)
+            if obs.select and obs.select.context == SelectContext.TO_ACTIVE:
+                try:
+                    cand_cid = getattr(opt, "cardId", -1)
+                    if cand_cid == -1 and hasattr(opt, "index") and obs.current:
+                        players = obs.current.players[your_index]
+                        if 0 <= opt.index < len(players.bench) and players.bench[opt.index]:
+                            cand_cid = players.bench[opt.index].id
+                    
+                    opp_active = obs.current.players[1 - your_index].active
+                    opp_is_heavy = False
+                    if len(opp_active) > 0 and opp_active[0]:
+                        opp_is_heavy = opp_active[0].maxHp >= 200 or opp_active[0].id in (723, 722)
+
+                    if cand_cid in (414, 434) and opp_is_heavy:
+                        # Avoid floating passive Articuno (414) or Mimikyu (434) against 300 HP Mega Abomasnow ex!
+                        score -= 60.0
+                    elif cand_cid in (431, 401):
+                        score += 40.0
+                except Exception:
+                    pass
+
+            # Anti-Overbenching Rule: Ideal bench 1 Mewtwo, 1-2 Spidops, 1 Articuno. Max 3-4 total.
+            if obs.select and obs.select.context in (SelectContext.SETUP_BENCH_POKEMON, SelectContext.TO_BENCH):
+                try:
+                    my_bench = obs.current.players[your_index].bench
+                    max_allowed_bench = 3 if archetype in ("DRAGAPULT", "GENERIC") else 4
+                    if len(my_bench) >= max_allowed_bench:
+                        if opt.type in (OptionType.PLAY, OptionType.CARD):
+                            score -= 35.0  # Heavily penalize unnecessary extra benching
+                except Exception:
+                    pass
+            
+            scored_options.append((idx, score))
+            
+        scored_options.sort(key=lambda x: x[1], reverse=True)
+        sorted_indices = [idx for idx, _ in scored_options]
         n = len(sorted_indices)
         k = obs.select.maxCount
         
@@ -302,6 +452,9 @@ OPPONENT_DECKS = {
     'Rulebasedmodel_Mewtwo_Easy': [431, 431, 414, 414, 434, 434, 272, 401, 401, 401, 401, 400, 400, 400, 400, 1094, 1227, 1227, 1217, 1217, 1218, 1218, 1218, 1121, 1158, 1220, 1220, 1220, 1152, 1152, 1257, 1257, 1257, 1129, 1134, 1134, 1097, 1097, 1116, 1216, 1216, 1216, 1216, 1175, 1219, 1121, 1121, 1121, 1134, 1134, 5, 5, 1, 1, 1, 1, 1, 15, 15, 15],
     'Rulebasedmodel_Mewtwo_Wobbuffet': [1, 1, 1, 1, 1, 1, 1, 5, 5, 5, 15, 15, 15, 15, 400, 400, 400, 400, 401, 401, 401, 401, 414, 414, 431, 431, 432, 1094, 1094, 1094, 1097, 1119, 1119, 1134, 1134, 1134, 1134, 1152, 1152, 1152, 1152, 1159, 1175, 1216, 1216, 1216, 1216, 1217, 1218, 1218, 1218, 1219, 1220, 1220, 1227, 1227, 1257, 1257, 1257],
     'Rulebasedmodel_Starmie': [1227, 1227, 1225, 7, 1198, 1260, 104, 1030, 1145, 112, 7, 1152, 1182, 1097, 3, 3, 1225, 860, 1086, 1122, 1227, 1260, 3, 1152, 1031, 1030, 1152, 1225, 3, 1198, 112, 1145, 1086, 1174, 1086, 1159, 1097, 7, 1086, 1182, 1122, 1213, 1145, 1174, 1030, 1122, 112, 3, 1031, 1152, 860, 1260, 7, 1227, 1031, 860, 1229, 104, 1030, 861],
+    'Rulebasedmodel_Kangaskhan_Crustle': [1, 11, 11, 11, 11, 14, 14, 14, 14, 18, 18, 18, 18, 343, 344, 344, 344, 344, 345, 345, 345, 345, 756, 756, 756, 756, 1086, 1086, 1086, 1086, 1087, 1122, 1122, 1122, 1122, 1123, 1123, 1123, 1123, 1147, 1147, 1147, 1147, 1159, 1182, 1182, 1197, 1197, 1197, 1197, 1225, 1225, 1225, 1225, 1227, 1227, 1227, 1227, 1264, 1264],
+    'Rulebasedmodel_Grimmsnarl': [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 104, 104, 112, 112, 112, 112, 646, 646, 646, 646, 647, 647, 647, 648, 648, 648, 860, 860, 1079, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1097, 1097, 1152, 1152, 1152, 1152, 1122, 1137, 1182, 1182, 1219, 1219, 1219, 1219, 1227, 1227, 1227, 1227, 1231, 1259, 1259, 1259, 1259],
+    'Rulebasedmodel_Trevenant': [879, 879, 879, 184, 311, 44, 878, 878, 878, 878, 140, 272, 343, 304, 858, 299, 1080, 1171, 1171, 1171, 1171, 1115, 1115, 1115, 1122, 1122, 1152, 1152, 1152, 1152, 1097, 1097, 1193, 1193, 1225, 1225, 1255, 1255, 1255, 1255, 1194, 1213, 1227, 1227, 1227, 1227, 1123, 1121, 1121, 1182, 1182, 1182, 19, 19, 19, 19, 11, 11, 11, 11],
     'BasicallyBot_85134910': [788, 788, 788, 788, 789, 789, 789, 789, 928, 928, 928, 928, 855, 855, 855, 855, 1079, 1079, 1079, 1079, 1121, 1121, 1121, 1121, 1232, 1232, 1232, 1232, 1225, 1225, 1225, 1231, 1231, 1231, 17, 17, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
     'Cada_85134382': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 121, 140, 184, 235, 1120, 1071, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1097, 131, 131, 132, 133, 1121, 1121, 1121, 1120, 1120, 1152, 1152, 1152, 1182, 1182, 1182, 1198, 1198, 1198, 1198, 1210, 1210, 1227, 1227, 1227, 1227, 1256, 1256, 2, 2, 2, 2, 5, 5, 5, 5],
     'Cotini_85137077': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 131, 131, 132, 132, 133, 235, 140, 1071, 112, 1227, 1227, 1227, 1227, 1198, 1198, 1198, 1182, 1182, 1231, 1121, 1121, 1121, 1121, 1152, 1152, 1152, 1152, 1086, 1086, 1086, 1086, 1120, 1120, 1120, 1120, 1097, 1097, 1080, 1256, 1256, 1161, 343, 2, 2, 2, 5, 5, 5, 7, 7],

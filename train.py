@@ -199,7 +199,13 @@ def rule_based_opponent_agent(opponent_name, obs):
         "Rulebasedmodel_Crustle": ["crustle_agent", "easy.crustle_agent"],
         "Rulebasedmodel_Starmie": ["starmie_agent", "hard.starmie_agent"],
         "Rulebasedmodel_Dipplin": ["dipplin_agent", "hard.dipplin_agent"],
-        "Rulebasedmodel_Mewtwo_Wobbuffet": ["mewtwo_wobbuffet_agent", "hard.mewtwo_wobbuffet_agent"]
+        "Rulebasedmodel_Mewtwo_Wobbuffet": ["mewtwo_wobbuffet_agent", "hard.mewtwo_wobbuffet_agent"],
+        "Rulebasedmodel_TR_Mewtwo": ["team_rocket_mewtwo_rule_agent"],
+        "Rulebasedmodel_Alakazam": ["alakazam_agent", "hard.alakazam_agent"],
+        "Rulebasedmodel_Archaludon": ["archaludon_agent", "hard.archaludon_agent"],
+        "Rulebasedmodel_Kangaskhan_Crustle": ["kangaskhan_crustle_agent", "hard.kangaskhan_crustle_agent"],
+        "Rulebasedmodel_Grimmsnarl": ["grimmsnarl_agent", "hard.grimmsnarl_agent"],
+        "Rulebasedmodel_Trevenant": ["trevenant_agent", "hard.trevenant_agent"]
     }
     
     modules = mapping.get(opponent_name, [opponent_name])
@@ -350,6 +356,7 @@ class GPUInferenceServer:
                         )
                         values = out_enc.squeeze(-1).tolist()
                         policies = out_dec.tolist()
+                        del out_enc, out_dec
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -482,6 +489,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         "active_energy": count_active_energy(state_ps),
                         "pokemon": count_pokemon(state_ps),
                         "opp_pokemon": count_pokemon(opp_ps),
+                        "opp_bench_ids": [p.id for p in opp_ps.bench if p is not None],
                         "bench_size": len(bench_list),
                         "deck_size": state_ps.deckCount,
                         "opp_deck_size": opp_ps.deckCount,
@@ -669,7 +677,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             if opt_type == 13 or opt_type == OptionType.ATTACK:
                                 episode_attacked[curr_player] = True
                                 
-                    obs = battle_select(selected)
+                    try:
+                        obs = battle_select(selected)
+                    except IndexError:
+                        selected = random_agent(obs)
+                        obs = battle_select(selected)
                     
                 battle_finish()
             except Exception as e:
@@ -753,6 +765,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             "active_energy": count_active_energy(final_ps),
                             "pokemon": count_pokemon(final_ps),
                             "opp_pokemon": count_pokemon(final_opp_ps),
+                            "opp_bench_ids": [p.id for p in final_opp_ps.bench if p is not None],
                             "bench_size": len(final_bench_list),
                             "deck_size": final_ps.deckCount,
                             "opp_deck_size": final_opp_ps.deckCount,
@@ -801,22 +814,60 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     if prizes_taken > 0 and not has_taken_prize_flag:
                         r_prize_t += 0.50
                         has_taken_prize_flag = True
-                    r_prize_l = prizes_lost * 0.35 if prizes_lost > 0 else 0.0  # Raised from 0.10 — symmetric with prize-taken to teach defensive play
-                    # FIX #4: symmetric first-prize-lost penalty to match first-prize-taken bonus
+                    r_prize_l = - (prizes_lost * 0.35) if prizes_lost > 0 else 0.0
                     if prizes_lost > 0 and not has_lost_prize_flag:
-                        r_prize_l += 0.35
+                        r_prize_l -= 0.35
                         has_lost_prize_flag = True
                     r_ko = 0.0  # Removed: KO double-counts with r_prize_t (same game event triggers both)
-                    r_own_ko = own_kos * 0.08 if own_kos > 0 else 0.0
+                    r_own_ko = - (own_kos * 0.15) if own_kos > 0 else 0.0
                     
-                    r_en = 0.0
-                    # r_en deliberately omitted: type-aware r_strategic (below) provides
-                    # the energy attachment signal. A separate baseline here partially
-                    # cancels the type-mismatch penalty (audit item 1.3).
+                    action_type = pre.get("action_type", -1)
+                    r_en = 0.05 if energy_attached > 0 else 0.0
+                    r_no_en = -0.05 if (action_type != 8 and pre.get("has_energy_in_hand", False)) else 0.0
                         
                     # Principal RL Scientist - Optimized Mewtwo ex Reward Shaping
                     r_strategic = 0.0
-                    action_type = pre.get("action_type", -1)
+
+                    # Evolution Denial Reward (+0.15 for KO'ing opponent pre-evolutions)
+                    opp_pk_lost = pre.get("opp_pokemon", 0) - post.get("opp_pokemon", 0)
+                    if opp_pk_lost > 0:
+                        pre_opp_b = pre.get("opp_bench_ids", [])
+                        post_opp_b = post.get("opp_bench_ids", [])
+                        for cid in pre_opp_b:
+                            if cid not in post_opp_b:
+                                card = get_card_data(cid)
+                                if card and getattr(card, "name", None) and any(p in card.name.lower() for p in ["dreepy", "snover", "drakloak", "tarountula"]):
+                                    r_strategic += 0.15  # Evolution denial bonus
+                                    break
+
+                    # Anti-Overbenching Penalty (-0.15 for bench >= 3 against Dragapult, >= 4 generic)
+                    if action_type == 7:  # PLAY
+                        played_id = pre.get("played_card_id", -1)
+                        played_card = get_card_data(played_id)
+                        if played_card is not None and played_card.cardType == CardType.POKEMON and played_card.basic:
+                            opp_b_ids = pre.get("opp_bench_ids", [])
+                            opp_act_id = pre.get("opp_active_id", -1)
+                            is_dragapult = any(get_card_data(cid) is not None and any(kw in get_card_data(cid).name.lower() for kw in ["dreepy", "drakloak", "dragapult"]) for cid in opp_b_ids + [opp_act_id])
+                            max_bench_limit = 3 if is_dragapult else 4
+                            if post.get("bench_size", 0) >= max_bench_limit:
+                                r_strategic -= 0.15  # Anti-overbenching penalty
+                        if played_id == 431:  # TR Mewtwo ex
+                            r_strategic += 0.20  # Early Mewtwo ex boarding bonus
+
+                        # Iono Low-Hand Recovery Contingency Reward (+0.15 when hand <= 2)
+                        my_hand_size = pre.get("hand_size", 5)
+                        if my_hand_size <= 2 and played_id in (1257, 1134, 1097, 1094, 1216):
+                            r_strategic += 0.15  # Draw recovery after Iono
+
+                        # Tool Attachment Survivability Bonus (+0.15 for Hero's Cape / Brave Bangle)
+                        if played_id in (1159, 1175):
+                            r_strategic += 0.15  # Tool survivability boost against Dragapult/Abomasnow
+
+                    # Passive Basic Active Penalty (-0.20 for Articuno 414 or Mimikyu 434 against heavy ex threats)
+                    if post.get("active_id") in (414, 434) and post.get("active_energy", 0) == 0:
+                        opp_act_id = pre.get("opp_active_id", -1)
+                        if opp_act_id in (723, 722, 1145):  # Mega Abomasnow ex line
+                            r_strategic -= 0.20  # Penalise stalling passive Articuno/Mimikyu against heavy threat
 
                     # Going second tactical exploitation bonus on first turn
                     if went_second and step_idx == 0:
@@ -1583,15 +1634,16 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     if post["deck_size"] == 0:
                         r_deck -= 0.50  # Penalize imminent deckout only
                         
-                    step_reward = r_stall + r_prize_t - r_prize_l + r_ko - r_own_ko + r_en + r_bench + r_deck + r_strategic
+                    step_reward = r_stall + r_prize_t + r_prize_l + r_ko + r_own_ko + r_en + r_no_en + r_bench + r_deck + r_strategic
                     step_reward = max(-1.0, min(1.0, step_reward))  # Clip step_reward to [-1.0, 1.0] for PER stability
                     
                     if i == 0:
                         rc_worker["prize_taken"] += r_prize_t
                         rc_worker["prize_lost"] += r_prize_l
                         rc_worker["kos"] += prizes_taken
-                        rc_worker["own_kos"] += prizes_lost
+                        rc_worker["own_kos"] += r_own_ko
                         rc_worker["energy"] += r_en
+                        rc_worker["no_energy"] += r_no_en
                         rc_worker["bench"] += r_bench
                         rc_worker["deckout"] += r_deck
                         rc_worker["stall"] += r_stall
@@ -1690,14 +1742,18 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         
                     selected, _ = mcts_agent(obs, sample_deck, client, search_count=eval_search_count)
                 else:
-                    if opponent_name in ["Rulebasedmodel", "Rulebasedmodel_Iono", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Abomasnow","Rulebasedmodel_Mewtwo_Wobbuffet"]:
+                    if opponent_name.startswith("Rulebasedmodel") or opponent_name in mapping:
                         try:
                             selected = rule_based_opponent_agent(opponent_name, obs)
                         except Exception as e:
                             selected = random_agent(obs)
                     else:
                         selected = random_agent(obs)
-                obs = battle_select(selected)
+                try:
+                    obs = battle_select(selected)
+                except IndexError:
+                    selected = random_agent(obs)
+                    obs = battle_select(selected)
                 
             battle_finish()
             result = obs["current"]["result"]
@@ -1867,7 +1923,15 @@ def main():
         torch.cuda.manual_seed_all(SEED)
 
     opponent_decks = load_all_decks()
-    opponent_decks = {k: v for k, v in opponent_decks.items() if k in ["Current (Self)","Rulebasedmodel_Mewtwo_Easy","Rulebasedmodel_Mewtwo","Rulebasedmodel_Dragapult","Rulebasedmodel_Mewtwo_Wobbuffet","Rulebasedmodel_Abomasnow","Rulebasedmodel_Lucario","Rulebasedmodel_Crustle","Rulebasedmodel_Starmie","Rulebasedmodel_Dipplin","Rulebasedmodel_Iono"]}
+    allowed_opponents = [
+        "Current (Self)", "Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo",
+        "Rulebasedmodel_Mewtwo_Wobbuffet", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Abomasnow",
+        "Rulebasedmodel_Lucario", "Rulebasedmodel_Crustle", "Rulebasedmodel_Starmie",
+        "Rulebasedmodel_Dipplin", "Rulebasedmodel_Iono", "Rulebasedmodel_Archaludon",
+        "Rulebasedmodel_Alakazam", "Rulebasedmodel_Kangaskhan_Crustle", "Rulebasedmodel_Grimmsnarl",
+        "Rulebasedmodel_Trevenant"
+    ]
+    opponent_decks = {k: v for k, v in opponent_decks.items() if k in allowed_opponents}
     if not opponent_decks:
         raise ValueError("No valid deck.csv found in root or subdirectories.")
         
@@ -1961,7 +2025,7 @@ def main():
     metrics_path = os.path.join(run_dir, "training_metrics.csv")
     with open(metrics_path, mode="w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "win_rate", "avg_loss", "avg_reward",
+        writer.writerow(["epoch", "win_rate", "avg_loss", "value_loss", "policy_loss", "avg_reward",
                          "r_prize_taken", "r_prize_lost", "r_kos", "r_own_kos",
                          "r_energy", "r_bench", "r_deckout", "r_terminal", "r_stall", "r_no_energy", "r_strategic",
                          "avg_game_length", "policy_entropy"])
@@ -1997,7 +2061,13 @@ def main():
     # Train against all opponent decks (including Iono) to learn card-specific
     # counters and strategies, and evaluate against all decks to check progress.
     train_opponent_names = all_opponent_names
-    test_opponent_names = ["Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Wobbuffet", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Abomasnow", "Rulebasedmodel_Lucario", "Rulebasedmodel_Crustle", "Rulebasedmodel_Starmie", "Rulebasedmodel_Dipplin", "Rulebasedmodel_Iono"]
+    test_opponent_names = [
+        "Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Wobbuffet",
+        "Rulebasedmodel_Dragapult", "Rulebasedmodel_Abomasnow", "Rulebasedmodel_Lucario",
+        "Rulebasedmodel_Crustle", "Rulebasedmodel_Starmie", "Rulebasedmodel_Dipplin",
+        "Rulebasedmodel_Iono", "Rulebasedmodel_Archaludon", "Rulebasedmodel_Alakazam",
+        "Rulebasedmodel_Kangaskhan_Crustle", "Rulebasedmodel_Grimmsnarl", "Rulebasedmodel_Trevenant"
+    ]
 
     print(f"Opponent Decks Configuration:")
     print(f"  -> Train Opponent Decks: {train_opponent_names}")
@@ -2175,13 +2245,12 @@ def main():
                     w_sum = sum(weights)
                     probs = [w / w_sum for w in weights]
                     
-                    # Cap Abomasnow selection probability at 35% to avoid defensive collapse / replay buffer flooding
-                    if "Rulebasedmodel_Abomasnow" in train_opponent_names:
-                        abo_idx = train_opponent_names.index("Rulebasedmodel_Abomasnow")
-                        if probs[abo_idx] > 0.35:
-                            diff = probs[abo_idx] - 0.35
-                            probs[abo_idx] = 0.35
-                            other_indices = [idx for idx in range(len(probs)) if idx != abo_idx]
+                    # Cap any single opponent selection probability at 25% to prevent replay buffer flooding
+                    for i_op in range(len(probs)):
+                        if probs[i_op] > 0.25:
+                            diff = probs[i_op] - 0.25
+                            probs[i_op] = 0.25
+                            other_indices = [idx for idx in range(len(probs)) if idx != i_op]
                             other_sum = sum(probs[idx] for idx in other_indices)
                             if other_sum > 0:
                                 for idx in other_indices:
@@ -2335,17 +2404,23 @@ def main():
             print("Skipping self-play data collection (self-play-episodes=0).")
 
         avg_loss = 0.0
+        avg_val_loss = 0.0
+        avg_pol_loss = 0.0
         last_loss_enc_val = 0.0      # Captured per-batch; used for TensorBoard after tensor del
         last_loss_dec_ce_val = 0.0
         trained_this_epoch = False
         if len(replay_buffer) >= args.batch_size:
             trained_this_epoch = True
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
             print("Training Start.")
             model.train()
             batch_count = min(50, len(replay_buffer) // args.batch_size)
             print(f"Total training buffer size: {len(replay_buffer)}, Batch Count: {batch_count}")
             
             epoch_losses = []
+            epoch_val_losses = []
+            epoch_pol_losses = []
             for i in range(batch_count):
                 beta = min(1.0, 0.4 + 0.6 * (counter / args.epochs))
                 samples, indices, is_weights = replay_buffer.sample(args.batch_size, beta=beta)
@@ -2412,6 +2487,8 @@ def main():
                         optimizer.step()
                         
                 epoch_losses.append(loss.item())
+                epoch_val_losses.append(loss_enc.item())
+                epoch_pol_losses.append(loss_dec_ce.item())
 
                 errors = (out_enc - label_tensor_enc).abs().squeeze().tolist()
                 if isinstance(errors, float):
@@ -2428,7 +2505,11 @@ def main():
                 del mask_tensor, label_tensor_enc, label_tensor_dec, is_weight_tensor
                 
             avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
-            print(f"Training Finish. Average Loss: {avg_loss:.4f}")
+            avg_val_loss = sum(epoch_val_losses) / len(epoch_val_losses) if epoch_val_losses else 0.0
+            avg_pol_loss = sum(epoch_pol_losses) / len(epoch_pol_losses) if epoch_pol_losses else 0.0
+            print(f"Training Finish. Average Loss: {avg_loss:.4f} (Value Loss: {avg_val_loss:.4f}, Policy Loss: {avg_pol_loss:.4f})")
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
         else:
             if args.self_play_episodes > 0:
                 print(f"Skipping training: collected buffer size ({len(replay_buffer)}) less than batch size ({args.batch_size}).")
@@ -2475,7 +2556,7 @@ def main():
         
         with open(metrics_path, mode="a", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            writer.writerow([counter, win_rate, avg_loss, avg_reward,
+            writer.writerow([counter, win_rate, avg_loss, avg_val_loss, avg_pol_loss, avg_reward,
                              rc["prize_taken"] / rc_div, rc["prize_lost"] / rc_div,
                              rc["kos"] / rc_div, rc["own_kos"] / rc_div,
                              rc["energy"] / rc_div, rc["bench"] / rc_div,

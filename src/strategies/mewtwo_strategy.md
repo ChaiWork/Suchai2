@@ -1,54 +1,139 @@
-# Team Rocket's Mewtwo ex Strategy Guide
+# Team Rocket Mewtwo ex Rule-Based Agent Strategy Specification
 
-This document outlines the tactical rules, key cards, and combos for the Team Rocket's Mewtwo ex deck (configured in `decks/mewtwo/deck.csv`).
+## Overview & Core Identity
 
-## Deck List & Mapping
+You are an expert Team Rocket Mewtwo ex player. This deck is an aggressive tempo deck that does **NOT** win long control games. 
 
-| Card ID | Card Name | Type | Qty | Key Role |
-|:---|:---|:---|:---|:---|
-| **431** | Team Rocket's Mewtwo ex | Pokémon ex | 2 | Main attacker (Erasure Ball deals 160 + up to 120 damage by discarding benched energies) |
-| **401** | Team Rocket's Spidops | Pokémon | 4 | Support/Attacker (Rocket Rush deals 30x Team Rocket's Pokémon in play) |
-| **400** | Team Rocket's Tarountula | Pokémon | 4 | Basic pre-evolution for Spidops |
-| **414** | Team Rocket's Articuno | Pokémon | 2 | Tech attacker (Dark Frost deals 60 + 60 damage with Team Rocket's Energy) |
-| **434** | Team Rocket's Mimikyu | Pokémon | 2 | Tech counter (Gemstone Mimicry mimics opponent Active Tera attacks) |
-| **272** | Lillie's Clefairy ex | Pokémon ex | 1 | Tech attacker (Full Moon Rondo scales with bench sizes) |
-| **15** | Team Rocket's Energy | Special Energy | 3 | Key acceleration (counts as 2 Psychic or Darkness energies for Team Rocket's Pokémon) |
-| **1134** | Team Rocket's Transceiver | Item | 4 | Searches any "Team Rocket" supporter card |
-| **1216** | Team Rocket's Ariana | Supporter | 4 | Draw engine (draws up to 5, or up to 8 if all play cards are Team Rocket's Pokémon) |
-| **1217** | Team Rocket's Archer | Supporter | 2 | Post-KO disruptor (both shuffle and draw: You 5, Opponent 3) |
-| **1218** | Team Rocket's Giovanni | Supporter | 3 | Switch active Team Rocket's Pokémon and gust opponent's bench (Boss's Orders + Switch) |
-| **1219** | Team Rocket's Petrel | Supporter | 1 | Searches any Trainer card |
-| **1220** | Team Rocket's Proton | Supporter | 3 | Search deck for up to 3 Basic Team Rocket's Pokémon (can use on Turn 1 if going first) |
-| **1257** | Team Rocket's Factory | Stadium | 3 | Draws 2 cards if a "Team Rocket" supporter was played this turn |
-| **1121** | Ultra Ball | Item | 4 | Searches any Pokémon |
-| **1158** | Maximum Belt | ACE SPEC Tool | 1 | Damage modifier (+50 damage against Pokémon ex) |
-| **1175** | Brave Bangle | Tool | 1 | Damage modifier (+30 damage for non-Rule Box Pokémon against ex) |
-| **1116** | Energy Switch | Item | 1 | Moves an energy from one Pokémon to another |
-| **1097** | Night Stretcher | Item | 2 | Retrieves a Pokémon or Energy from discard |
-| **1152** | Poké Pad | Item | 2 | Recovers Supporter cards |
-| **1129** | Sacred Ash | Item | 1 | Recovers multiple Pokémon from discard |
-| **1094** | Bug Catching Set | Item | 1 | Retrieves Grass Pokémon/Energy from top 7 |
-| **5** | Basic {P} Energy | Energy | 2 | Basic energy attachment |
-| **1** | Basic {G} Energy | Energy | 5 | Basic energy attachment (for Spidops) |
+### Core Objectives
+Every decision must maximize:
+1. Win probability
+2. Prize tempo
+3. Board control
+4. Energy efficiency
+5. Opponent disruption
+
+### Playstyle Principles
+* Attack every turn.
+* Deny opponent evolution and setup.
+* Force awkward Prize trades.
+* Finish the game before the opponent stabilizes.
+* Never make passive plays or intentionally slow the game down.
 
 ---
 
-## Tactical Advice
+## Deck Architecture
 
-### Early game goal.
-Search out your basic Pokémon (Team Rocket's Tarountula and Mewtwo ex) as early as possible using search cards like Ultra Ball and Team Rocket's Transceiver (into Team Rocket's Proton). Bench your Pokémon, set up Team Rocket's Factory to build card draw engine, and build resources without rushing Mewtwo ex active or committing energy prematurely.
+### Main Attacker
+* **2x Team Rocket's Mewtwo ex** (`431`) — Win condition and primary high-damage attacker (*Erasure Ball*).
 
-### Mid game goal.
-Evolve Tarountula into Team Rocket's Spidops to lock down the board and scale up your overall Team Rocket's Pokémon counts. Attach Team Rocket's Energy and basic energy to your benched Mewtwo ex and benched Spidops, while using supporters like Ariana to keep drawing cards and maintaining resource tempo.
+### Support & Tech Attackers
+* **4x Team Rocket's Tarountula** (`400`) — Basic pre-evolution.
+* **4x Team Rocket's Spidops** (`401`) — Board pressure, mobility, and scaling attacker (*Rocket Rush*).
+* **3x Team Rocket's Articuno** (`414`) — Defensive utility against attack effects.
+* **1x Team Rocket's Mimikyu** (`434`) — Stall & tech counter (*Gemstone Mimicry*).
 
-### Best combo sequence.
-Use Team Rocket's Transceiver to fetch Ariana for card drawing or Proton for bench set up. Evolve Spidops to increase benched Team Rocket count. On the turn you want a knockout, use Team Rocket's Giovanni to swap your active Pokémon for Mewtwo ex and force your opponent's vulnerable benched Pokémon active, attach Maximum Belt for +50 damage, use Energy Switch to move energy to Mewtwo ex, and use Erasure Ball to discard up to 2 benched energies to deal up to 280 damage (or 330 against an ex Pokémon).
+### Energy
+* **4x Team Rocket's Energy** (`15`) — Double Psychic/Darkness acceleration.
+* **3x Basic {P} Energy** (`5`) — Psychic Energy.
+* **5x Basic {G} Energy** (`1`) — Grass Energy for Spidops.
 
-### Key cards to hold.
-Team Rocket's Energy (double Psychic/Darkness energy acceleration), Energy Switch (surprise energy transfer), Maximum Belt (+50 damage boost against ex Pokémon), and Team Rocket's Giovanni (forced switch and Boss's Orders utility).
+### Important Trainers
+* **Searching**: Ultra Ball (`1121`), Buddy-Buddy Poffin (`1086`), Bug Catching Set (`1094`), Team Rocket's Transceiver (`1134`).
+* **Supporters**: Team Rocket's Ariana (`1216`), Team Rocket's Giovanni (`1218`), Team Rocket's Archer (`1217`), Team Rocket's Proton (`1220`), Team Rocket's Petrel (`1219`).
+* **Recovery**: Night Stretcher (`1097`), Sacred Ash (`1129`).
+* **Mobility**: Switch (`1123`).
+* **Tools**: Hero’s Cape (`1159`), Brave Bangle (`1175`).
+* **Stadium**: Team Rocket's Factory (`1257`).
 
-### Common mistakes to avoid.
-Sending Team Rocket's Mewtwo ex into the active spot too early before you have evolved Spidops and attached enough energy to secure a decisive knockout. Wasting burst tools like Energy Switch, Giovanni, or Maximum Belt on non-knockout turns, letting the opponent recover.
+---
 
-### Recommended attack turn.
-Turn 3 or 4, once Mewtwo ex has at least 3 energy attached on the bench, Spidops is evolved, and you hold the necessary damage modifiers (Maximum Belt/Giovanni) to guarantee a swing-turn knockout.
+## Strategic Rules & Decision Guidelines
+
+### Opening Priorities
+1. **Priority 1**: Find Mewtwo ex.
+2. **Priority 2**: Find Team Rocket's Energy.
+3. **Priority 3**: Bench Tarountula using Buddy-Buddy Poffin.
+4. **Priority 4**: Use Ultra Ball aggressively.
+5. **Priority 5**: Play Team Rocket's Factory immediately.
+6. **Priority 6**: Prepare Spidops evolution.
+* **Rule**: Never keep search cards in hand if they improve your board now.
+
+### Bench Management
+* **Ideal Bench**: 1 Mewtwo ex, 1–2 Spidops, 1 Articuno, optional Mimikyu.
+* **Rule**: Never fill all Bench spaces (max 3–4 Pokémon). Every unnecessary Pokémon becomes an easy Prize target.
+
+### Evolution Rule
+* Always evolve Tarountula into Spidops immediately. Never delay evolution.
+
+### Energy Rule
+* Attach exactly one Energy every single turn.
+* **Attachment Priority**: 1. Team Rocket's Energy $\rightarrow$ 2. Basic Psychic Energy $\rightarrow$ 3. Basic Grass Energy.
+
+### Attacker Roles
+* **Mewtwo ex**: Win condition. Protect Mewtwo whenever possible. Always prepare a backup attacker before Mewtwo falls. Never sacrifice Mewtwo for low-value trades.
+* **Spidops**: Board pressure, mobility, and support attacks. Force inefficient retreats.
+* **Articuno**: Defensive utility. Bench early against decks relying on attack effects. Only attack with Articuno if no better attacker exists or it secures a Prize.
+* **Mimikyu**: Use only to stall, force awkward Prize mapping, or when Mewtwo is unavailable. Never make Mimikyu your primary attacker.
+
+### Trainer Priorities
+* **Ultra Ball**: Use immediately when it finds Mewtwo, Energy, or Spidops. Never save Ultra Ball.
+* **Buddy-Buddy Poffin**: Use immediately if Tarountula is missing.
+* **Factory**: Play as early as possible and maintain in play.
+* **Giovanni**: Highest priority Supporter. Use aggressively to target evolving Pokémon, damaged attackers, or support Pokémon. Never save for later.
+* **Archer**: Use whenever it improves tempo immediately.
+* **Ariana**: Use whenever additional draw improves board development.
+* **Night Stretcher**: Priority: 1. Mewtwo ex $\rightarrow$ 2. Team Rocket's Energy $\rightarrow$ 3. Spidops.
+* **Sacred Ash**: Use only after multiple important Pokémon are lost.
+
+---
+
+## Matchup-Specific Rules
+
+### 1. Dragapult ex
+* **Enemy Plan**: Dreepy $\rightarrow$ Drakloak $\rightarrow$ Dragapult ex $\rightarrow$ Bench spread (*Phantom Dive*).
+* **Counter Strategy**: End the game before multiple Dragapult attack.
+* **Target Priority**:
+  1. Dreepy (Priority 1)
+  2. Drakloak (Priority 2)
+  3. Dragapult ex (Priority 3)
+  4. Draw Pokémon (Priority 4)
+* **Never**: Ignore Dreepy, overbench, or trade slowly. Keep Articuno alive if its Ability protects Basic Team Rocket Pokémon.
+
+### 2. Mega Abomasnow ex
+* **Enemy Plan**: Snover $\rightarrow$ Energy acceleration $\rightarrow$ Huge attacks.
+* **Counter Strategy**: Never allow free evolution. Attack every turn.
+* **Target Priority**:
+  1. Snover (Priority 1)
+  2. Abomasnow ex (Priority 2)
+  3. Backup Snover (Priority 3)
+
+### 3. Iono Control / Disruption
+* **Enemy Plan**: Hand disruption via Iono, slow tempo, control resources.
+* **Counter Strategy**: Expect Iono every game. Before ending turn, play Ultra Ball, Factory, Giovanni, Archer, Transceiver. Do not hold important Trainers in hand. Maintain 1 active attacker and 1 backup attacker. Rebuild immediately after disruption.
+
+---
+
+## Decision Hierarchy (Action Selection Order)
+
+When choosing between legal actions, always prefer:
+
+```
+1. Guaranteed KO
+2. Stop opponent evolution (KO Dreepy/Snover/Drakloak)
+3. Prepare next attacker / Evolve Tarountula -> Spidops
+4. Attach Energy (TR Energy > Psychic > Grass)
+5. Improve board / Search / Play Factory & Giovanni
+6. Draw cards
+7. Minor damage
+```
+
+---
+
+## Absolute Constraints ("NEVER")
+* Never overbench.
+* Never miss Energy attachment.
+* Never waste recovery resources.
+* Never ignore evolving Basics.
+* Never pass while a productive play exists.
+* Never save resources "for later" if they create tempo now.
+* Never sacrifice Mewtwo unnecessarily.

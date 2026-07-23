@@ -44,9 +44,10 @@ def _force_int_xaxis(ax):
 def smooth(data, weight=0.6):
     """Exponential moving average for smoothing curves."""
     smoothed = []
-    last = data[0] if data else 0
-    for d in data:
-        s = last * weight + d * (1 - weight)
+    clean_data = [float(d) if (d is not None and d != "") else 0.0 for d in data]
+    last = clean_data[0] if clean_data else 0.0
+    for d in clean_data:
+        s = last * weight + d * (1.0 - weight)
         smoothed.append(s)
         last = s
     return smoothed
@@ -61,12 +62,17 @@ def read_csv_dict(csv_path):
         reader = csv.DictReader(f)
         for row in reader:
             for key, val in row.items():
+                if key is None:
+                    continue
                 if key not in data:
                     data[key] = []
-                try:
-                    data[key].append(float(val))
-                except (ValueError, TypeError):
-                    data[key].append(val)
+                if val is None or val == "":
+                    data[key].append(0.0)
+                else:
+                    try:
+                        data[key].append(float(val))
+                    except (ValueError, TypeError):
+                        data[key].append(val)
     return data
 
 
@@ -122,7 +128,10 @@ def plot_training_curves(data, output_dir):
     axs[2].legend()
     _force_int_xaxis(axs[2])
 
-    plt.tight_layout()
+    try:
+        plt.tight_layout()
+    except Exception:
+        pass
     plt.savefig(os.path.join(output_dir, "learning_curves.png"), dpi=200, bbox_inches="tight")
     plt.close()
 
@@ -180,10 +189,11 @@ def plot_reward_breakdown(data, output_dir):
     colors_terminal = [ACCENT_COLORS[4] if v >= 0 else ACCENT_COLORS[2] for v in terminal]
     bars = ax2.bar(x, terminal, 0.6, color=colors_terminal, alpha=0.85, edgecolor=GRID_COLOR, linewidth=0.5)
     for bar, val in zip(bars, terminal):
+        offset = 0.005 if val >= 0 else -0.005
         ax2.text(bar.get_x() + bar.get_width() / 2,
-                 bar.get_height() + (3 if val >= 0 else -8),
-                 f"{val:.0f}", ha="center", va="bottom" if val >= 0 else "top",
-                 fontsize=10, fontweight="bold", color=TEXT_COLOR)
+                 bar.get_height() + offset,
+                 f"{val:.3f}", ha="center", va="bottom" if val >= 0 else "top",
+                 fontsize=9, fontweight="bold", color=TEXT_COLOR)
     ax2.axhline(y=0, color=TEXT_COLOR, linewidth=0.8, alpha=0.5)
     ax2.set_title("Terminal Reward (Win/Loss)")
     ax2.set_xlabel("Epoch")
@@ -192,7 +202,10 @@ def plot_reward_breakdown(data, output_dir):
     ax2.set_xticklabels([str(int(e)) for e in epochs])
     ax2.grid(True, axis="y", linestyle="--")
 
-    plt.tight_layout()
+    try:
+        plt.tight_layout()
+    except Exception:
+        pass
     plt.savefig(os.path.join(output_dir, "reward_breakdown.png"), dpi=200, bbox_inches="tight")
     plt.close()
 
@@ -252,7 +265,10 @@ def plot_deck_matchup(deck_data, output_dir):
     cbar.ax.yaxis.label.set_color(TEXT_COLOR)
     cbar.ax.tick_params(colors=TEXT_COLOR)
 
-    plt.tight_layout()
+    try:
+        plt.tight_layout()
+    except Exception:
+        pass
     plt.savefig(os.path.join(output_dir, "deck_matchup.png"), dpi=200, bbox_inches="tight")
     plt.close()
 
@@ -320,7 +336,10 @@ def plot_action_distribution(action_data, output_dir):
             t.set_fontsize(11)
     ax2.set_title(f"Epoch {epochs[-1]} — Strategic Decisions", fontsize=13, fontweight="bold")
 
-    plt.tight_layout()
+    try:
+        plt.tight_layout()
+    except Exception:
+        pass
     plt.savefig(os.path.join(output_dir, "action_distribution.png"), dpi=200, bbox_inches="tight")
     plt.close()
 
@@ -361,7 +380,10 @@ def plot_selfplay_progress(data, output_dir):
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="lower right")
 
     ax1.set_title("Self-Play Improvement Over Training", fontsize=14, fontweight="bold")
-    plt.tight_layout()
+    try:
+        plt.tight_layout()
+    except Exception:
+        pass
     plt.savefig(os.path.join(output_dir, "selfplay_progress.png"), dpi=200, bbox_inches="tight")
     plt.close()
 
@@ -482,7 +504,10 @@ def plot_strategy_report(data, deck_data, action_data, output_dir):
         axs[1, 2].text(0.5, 0.5, "No Data", ha="center", va="center", fontsize=12)
         axs[1, 2].set_title("Game Length")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    try:
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+    except Exception:
+        pass
     plt.savefig(os.path.join(output_dir, "strategy_report.png"), dpi=200, bbox_inches="tight")
     plt.close()
 
