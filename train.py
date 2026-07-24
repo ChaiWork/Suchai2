@@ -363,6 +363,11 @@ class GPUInferenceServer:
                         policies = out_dec.tolist()
                         del out_enc, out_dec
             except Exception as e:
+                if device.type == 'cuda':
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
                 import traceback
                 traceback.print_exc()
                 values = [0.0] * len(batch_conns)
@@ -530,14 +535,14 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 rb_selected = rule_based_opponent_agent("Rulebasedmodel_Mewtwo", obs)
                                 # Run MCTS with force_action to collect Behavioral Cloning data
                                 temperature = 1.0 if turn <= 15 else 0.1
-                                selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature, force_action=rb_selected, opponent_name=opponent_name)
+                                selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature, force_action=rb_selected, opponent_name=opponent_name, epoch=current_epoch)
                             except Exception as e:
                                 use_warmup = False
                                 
                         if not use_warmup:
                             # Temperature decay: explore fully early, exploit late-game
                             temperature = 1.0 if turn <= 15 else 0.1
-                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature, opponent_name=opponent_name)
+                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature, opponent_name=opponent_name, epoch=current_epoch)
                             sample.pred_val = sample.value
                             
                             # Log expert guidance trigger for the chosen action (player 0 only)
@@ -636,7 +641,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         elif opponent_type == "Current":
                             # Temperature decay mirrors player-0 for consistent training distribution
                             opp_temperature = 1.0 if turn_num <= 15 else 0.1
-                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=opp_temperature)
+                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=opp_temperature, epoch=current_epoch)
                             sample.pred_val = sample.value
                             
                             opt_type_val = -1
@@ -749,12 +754,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 elif result == -1:
                     terminal_reward = -5.0  # Error/invalid game — treat as loss
                 else:
-                    # FIX #5: Prize-aware loss — softer penalty for competitive losses
-                    # -5.0 (0 prizes taken) up to -2.5 (5 prizes taken before losing)
-                    start_prizes = player_samples[0][1].get("prizes", 6)
-                    end_prizes = player_samples[-1][1].get("prizes", 6)
-                    prizes_taken_total = max(0, start_prizes - end_prizes)
-                    terminal_reward = max(-5.0, -5.0 + prizes_taken_total * 0.5)
+                    # Constant -5.0 penalty for game losses ensures winning is the single objective
+                    terminal_reward = -5.0
 
                     
                 rewards = []
@@ -845,11 +846,32 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     r_own_ko = - (own_kos * 0.15) if own_kos > 0 else 0.0
                     
                     action_type = pre.get("action_type", -1)
-                    r_en = 0.05 if energy_attached > 0 else 0.0
+                    r_en = 0.0
+                    if energy_attached > 0:
+                        attached_target = pre.get("attached_target_id", -1)
+                        target_card = get_card_data(attached_target) if attached_target > 0 else None
+                        max_req_en = 2
+                        if target_card and hasattr(target_card, "attacks"):
+                            costs = [len(attack_table[aid].energies) for aid in getattr(target_card, "attacks", []) if aid in attack_table]
+                            if costs:
+                                max_req_en = max(costs)
+                        target_curr_en = pre.get("active_energies", 0) if attached_target == pre.get("active_id") else 0
+                        if target_curr_en >= max_req_en:
+                            r_en = -0.10  # Penalize over-attaching energy to already maxed-out Pokemon
+                        else:
+                            r_en = 0.05
                     r_no_en = -0.05 if (action_type != 8 and pre.get("has_energy_in_hand", False)) else 0.0
                         
                     # Principal RL Scientist - Optimized Mewtwo ex Reward Shaping
                     r_strategic = 0.0
+
+                    # Opening Bench Security Reward (Turns 1-2)
+                    if step_idx <= 2:
+                        bench_size_curr = post.get("bench_size", 0)
+                        if bench_size_curr == 0:
+                            r_strategic -= 0.50  # Severe penalty for leaving bench empty on Turn 1-2
+                        elif bench_size_curr >= 2:
+                            r_strategic += 0.25  # Reward for establishing 2+ bench insurance
 
                     # Evolution Denial Reward (+0.15 for KO'ing opponent pre-evolutions)
                     opp_pk_lost = pre.get("opp_pokemon", 0) - post.get("opp_pokemon", 0)
@@ -876,8 +898,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             max_bench_limit = 3 if is_dragapult else 4
                             if post.get("bench_size", 0) >= max_bench_limit:
                                 r_strategic -= 0.15  # Anti-overbenching penalty
-                        if played_id == 431:  # TR Mewtwo ex
-                            r_strategic += 0.20  # Early Mewtwo ex boarding bonus
+                        if played_id in (431, 272):  # TR Mewtwo ex or Lillie's Clefairy ex
+                            r_strategic += 0.20  # Early ex attacker boarding bonus
 
                         # Stadium Counter Reward (+0.20 for overriding opponent Stadiums like Festival Grounds)
                         if played_id in (1257, 1258) and pre.get("stadium_id") is not None and pre.get("stadium_id") != 1257:
@@ -1437,7 +1459,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 r_strategic += 0.08
                                 
                     elif action_type == 10:  # ABILITY
-                        r_strategic += 0.05
+                        r_strategic += 0.20  # Strong reward for activating Pokemon abilities before attacking
                         
                     elif action_type == 12:  # RETREAT
                         r_strategic -= 0.40  # Increased penalty to prevent panic retreat-loops
@@ -1558,8 +1580,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         played_cid = pre.get("played_card_id", -1)
                         if pre.get("bench_size", 0) == 0 and (played_cid in (1134, 1086, 1220) or pre.get("card_id") in (1134, 1086, 1220)):
                             r_strategic += 0.20  # Emergency bench search on 0 bench
-                        elif (played_cid == 1218 or pre.get("card_id") == 1218) and pre.get("turn", 0) <= 3:
-                            r_strategic += 0.15  # Early Giovanni Aggro Damage Boost
+                        elif (played_cid == 1218 or pre.get("card_id") == 1218) and pre.get("active_energies", 0) >= 1:
+                            r_strategic += 0.10  # Early Giovanni Aggro Damage Boost ONLY if active is charged
                         elif played_cid == 1227 or pre.get("card_id") == 1227:
                             my_deck_size = pre.get("deck_size", 40)
                             my_hand_size = pre.get("hand_size", 5)
@@ -2492,7 +2514,10 @@ def main():
         if len(replay_buffer) >= args.batch_size:
             trained_this_epoch = True
             if device.type == 'cuda':
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
             print("Training Start.")
             model.train()
             batch_count = min(50, len(replay_buffer) // args.batch_size)

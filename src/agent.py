@@ -60,8 +60,11 @@ from cg.api import (
     OptionType,
     SelectContext,
     CardType,
+    AreaType,
     all_card_data,
 )
+
+card_table = {c.cardId: c for c in all_card_data()}
 
 SEARCH_COUNT = 200  # MCTS Search count — ≥200 needed for meaningful visit differentiation (audit: was 50, policy targets were noise)
 C_PUCT = 1.25       # AlphaZero PUCT exploration constant (fixed, per original paper)
@@ -186,7 +189,8 @@ def create_node(parent: Node | None,
                 search_state: SearchState,
                 your_index: int,
                 your_deck: list[int],
-                model: MyModel
+                model: MyModel,
+                epoch: int = 1
 ) -> tuple[Node, LearnSample | None]:
     """Create a new node and evaluate its state using the neural network."""
     node = Node(parent, search_state)
@@ -201,7 +205,7 @@ def create_node(parent: Node | None,
             node.value = 1.0
         else:
             node.value = -1.0
-        node.backprop(node.value)
+        # Backpropagation is handled exclusively during tree expansion in mcts_agent
         sample = None
     else:
         # Enumerate up to 128 potential action combinations prioritizing high-value options
@@ -230,58 +234,44 @@ def create_node(parent: Node | None,
         for idx, opt in enumerate(options):
             score = 1.0
             if opt.type in HIGH_PRIORITY_TYPES:
-                score += 10.0
+                score += 2.0
             
-            # Decision Hierarchy Implementation
-            # 1. Guaranteed KO / Attack Priority (Attack every turn)
+            # Smooth Decision Hierarchy
             if opt.type == OptionType.ATTACK:
-                score += 100.0
-            
-            # 2. Stop Opponent Evolution / Target Priority
-            elif opt.type == OptionType.CARD:
-                target_score = get_target_card_priority_score(opt, obs, archetype)
-                score += target_score * 10.0  # Scales up to +100 for Dreepy/Snover
-            
-            # 3. Evolve Immediately (Tarountula -> Spidops)
+                score += 5.0
             elif opt.type == OptionType.EVOLVE:
-                score += 60.0
-            
-            # 4. Attach Energy (TR Energy > Psychic > Grass; Prioritize TR Mewtwo ex)
+                score += 4.0
+            elif opt.type == OptionType.ABILITY:
+                score += 4.0
             elif opt.type == OptionType.ATTACH:
-                score += 50.0
-                try:
-                    target_id = -1
-                    if hasattr(opt, "inPlayArea") and hasattr(opt, "inPlayIndex"):
-                        players = obs.current.players[your_index]
-                        if opt.inPlayArea == 4 and len(players.active) > 0 and players.active[0]:
-                            target_id = players.active[0].id
-                        elif opt.inPlayArea == 5 and 0 <= opt.inPlayIndex < len(players.bench) and players.bench[opt.inPlayIndex]:
-                            target_id = players.bench[opt.inPlayIndex].id
-                    if target_id == 431:  # TR Mewtwo ex
-                        score += 30.0
-                except Exception:
-                    pass
-            
-            # 5. Improve Board / Early Mewtwo ex Setup / Iono Recovery
+                score += 3.0
             elif opt.type in (OptionType.PLAY, OptionType.CARD):
-                score += 40.0
+                score += 3.0
                 try:
                     played_cid = getattr(opt, "cardId", -1)
                     if played_cid == -1 and hasattr(opt, "index") and obs.current:
                         hand = obs.current.players[your_index].hand
                         if 0 <= opt.index < len(hand) and hand[opt.index]:
                             played_cid = hand[opt.index].id
-                    if played_cid == 431:  # TR Mewtwo ex - High priority to bench early!
-                        score += 50.0
                     
-                    # Iono Low-Hand Recovery Contingency: Boost Factory, Transceiver, Night Stretcher when hand <= 2
-                    hand_len = len(obs.current.players[your_index].hand) if obs.current else 5
-                    if hand_len <= 2 and played_cid in (1257, 1134, 1097, 1094, 1216):
-                        score += 40.0  # Contingency draw recovery boost after Iono
+                    played_card = card_table.get(played_cid)
+                    if played_card:
+                        # Generic Feature 1: High priority for ex attackers early
+                        if getattr(played_card, "ex", False):
+                            score += 5.0
+                        # Generic Feature 2: Hand recovery for Supporters/Stadiums/Items when low on cards
+                        hand_len = len(obs.current.players[your_index].hand) if obs.current else 5
+                        if hand_len <= 2 and played_card.cardType in (CardType.SUPPORTER, CardType.STADIUM, CardType.ITEM):
+                            score += 4.0
+                        # Generic Feature 3: Tool attachment survivability
+                        if played_card.cardType == CardType.TOOL:
+                            score += 3.0
                     
-                    # Tool Attachment Contingency: Hero's Cape (1159) / Brave Bangle (1175)
-                    if played_cid in (1159, 1175):
-                        score += 30.0  # Survivability boost against Dragapult / Abomasnow
+                    # Supporter Contingency: Only play damage-buff supporters if active has energy to attack
+                    if played_card and played_card.cardType == CardType.SUPPORTER and getattr(played_card, "damageBuff", False):
+                        active_en = len(obs.current.players[your_index].active[0].energyCards) if (obs.current and obs.current.players[your_index].active) else 0
+                        if active_en == 0:
+                            score -= 5.0  # Soft penalty for playing damage buff without energy
                 except Exception:
                     pass
                 
@@ -297,24 +287,14 @@ def create_node(parent: Node | None,
                     opp_active = obs.current.players[1 - your_index].active
                     opp_is_heavy = False
                     if len(opp_active) > 0 and opp_active[0]:
-                        opp_is_heavy = opp_active[0].maxHp >= 200 or opp_active[0].id in (723, 722)
+                        opp_is_heavy = getattr(opp_active[0], "maxHp", 0) >= 200
 
-                    if cand_cid in (414, 434) and opp_is_heavy:
-                        # Avoid floating passive Articuno (414) or Mimikyu (434) against 300 HP Mega Abomasnow ex!
-                        score -= 60.0
-                    elif cand_cid in (431, 401):
-                        score += 40.0
-                except Exception:
-                    pass
-
-            # Anti-Overbenching Rule: Ideal bench 1 Mewtwo, 1-2 Spidops, 1 Articuno. Max 3-4 total.
-            if obs.select and obs.select.context in (SelectContext.SETUP_BENCH_POKEMON, SelectContext.TO_BENCH):
-                try:
-                    my_bench = obs.current.players[your_index].bench
-                    max_allowed_bench = 3 if archetype in ("DRAGAPULT", "GENERIC") else 4
-                    if len(my_bench) >= max_allowed_bench:
-                        if opt.type in (OptionType.PLAY, OptionType.CARD):
-                            score -= 35.0  # Heavily penalize unnecessary extra benching
+                    cand_card = card_table.get(cand_cid)
+                    if cand_card and not getattr(cand_card, "ex", False) and getattr(cand_card, "hp", 150) <= 100 and opp_is_heavy:
+                        # Avoid floating low-HP non-ex Pokémon against heavy 200+ HP threat
+                        score -= 10.0
+                    elif cand_card and (getattr(cand_card, "ex", False) or getattr(cand_card, "stage1", False) or getattr(cand_card, "stage2", False)):
+                        score += 3.0
                 except Exception:
                     pass
             
@@ -376,7 +356,7 @@ def create_node(parent: Node | None,
         if state.yourIndex != your_index:
             v = -v
         node.value = v
-        node.backprop(v)
+        # Backpropagation is handled exclusively during tree expansion in mcts_agent
 
         # Apply a prior bias to guide MCTS exploration towards constructive actions
         has_constructive = False
@@ -412,19 +392,20 @@ def create_node(parent: Node | None,
                         has_end = True
             
             if has_attack:
-                bias += 5.0
-            if has_evolve:
                 bias += 1.5
+            if has_evolve:
+                bias += 1.0
             if has_attach:
-                bias += 1.2
-            if has_ability:
                 bias += 0.8
+            if has_ability:
+                bias += 1.0  # High priority prior for activating Pokemon abilities before attacking
             if has_play:
-                bias += 0.5
+                bias += 0.3
             if has_end and has_constructive:
-                bias -= 10.0  # Penalize passing turn if constructive actions are possible
+                bias -= 5.0  # Penalize passing turn if constructive actions are possible
                 
-            policy_biased[i] += bias
+            prior_scale = 1.0 / math.sqrt(max(1, epoch))
+            policy_biased[i] += bias * prior_scale
 
         # Convert raw policy logits to probabilities via numerically stable softmax.
         n_actions = len(actions)
@@ -614,7 +595,7 @@ def get_own_visible_card_ids(obs, your_index: int) -> list[int]:
     return visible
 
 
-def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_count: int = None, temperature: float = 0.0, force_action: list[int] = None, opponent_name: str = "unknown") -> tuple[list[int], LearnSample]:
+def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_count: int = None, temperature: float = 0.0, force_action: list[int] = None, opponent_name: str = "unknown", epoch: int = 1) -> tuple[list[int], LearnSample]:
     """Perform MCTS exploration and select the best action list, returning it and a training sample."""
     obs = to_observation_class(obs_dict)
     your_index = obs.current.yourIndex
@@ -681,7 +662,7 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
         opponent_active=[1072] if len(active) > 0 and active[0] is None else []
     )
     
-    root, sample = create_node(None, search_state, your_index, your_deck, model)
+    root, sample = create_node(None, search_state, your_index, your_deck, model, epoch=epoch)
 
     # Add Dirichlet noise to root prior for exploration (AlphaZero-style)
     # Without noise, MCTS always explores the same paths from the NN prior,
@@ -697,15 +678,31 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
             child.prob = (1.0 - noise_frac) * child.prob + noise_frac * noise[i]
 
     # Dynamic Simulation Count based on branch branching factor
+    # Phase-Based Dynamic Search Count:
+    # Opening (Turns 1-3): 60 sims (fast opening setup)
+    # Midgame (Turns 4-10): 120 sims (balanced board development)
+    # Endgame (Turn 11+ or <=2 prizes remaining): 200 sims (maximum tactical precision for KO race)
     if search_count is None:
-        dynamic_search_count = SEARCH_COUNT
+        turn = state.turn if (state is not None) else 1
+        my_prizes = len(state.players[your_index].prize) if (state and len(state.players) > your_index) else 6
+        opp_prizes = len(state.players[opp_index].prize) if (state and len(state.players) > opp_index) else 6
+        min_prizes = min(my_prizes, opp_prizes)
+        
+        if turn <= 3:
+            dynamic_search_count = 60
+        elif turn <= 10 and min_prizes > 2:
+            dynamic_search_count = 120
+        else:
+            dynamic_search_count = 200
     else:
         dynamic_search_count = search_count
 
-    # Caps simulations in the Kaggle runtime environment to avoid TIMEOUT (no GPU)
+    # Caps simulations in the Kaggle runtime environment if total time is constrained
     IS_KAGGLE = os.path.exists('/kaggle_simulations/agent') or 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
-    if IS_KAGGLE:
-        dynamic_search_count = min(dynamic_search_count, 40)
+    if IS_KAGGLE and search_count is None:
+        # Scale Kaggle cap slightly for endgame precision while respecting runtime limits
+        if dynamic_search_count > 150:
+            dynamic_search_count = 150
 
     # Search loop
     for _ in range(dynamic_search_count):
@@ -736,7 +733,8 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
             
             if next_child.node is None:
                 search_state = search_step(current.state.searchId, next_child.select)
-                next_child.node, _ = create_node(current, search_state, your_index, your_deck, model)
+                next_child.node, _ = create_node(current, search_state, your_index, your_deck, model, epoch=epoch)
+                next_child.node.backprop(next_child.node.value)
                 break
             else:
                 current = next_child.node
@@ -861,18 +859,35 @@ def agent(obs_dict: dict) -> list[int]:
             base_path = os.path.dirname(os.path.abspath(__file__))
         else:
             base_path = os.getcwd()
-        model_path = os.path.join(base_path, "model.pth")
+        candidate_paths = [
+            os.path.join(base_path, "best_model.pth"),
+            os.path.join(base_path, "model.pth"),
+            os.path.join(os.getcwd(), "best_model.pth"),
+            os.path.join(os.getcwd(), "model.pth"),
+            "/kaggle_simulations/agent/best_model.pth",
+            "/kaggle_simulations/agent/model.pth"
+        ]
         
-        # Load weights if available
-        if os.path.exists(model_path):
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            checkpoint = torch.load(model_path, map_location=device, weights_only=True)
-            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-                _model.load_state_dict(checkpoint["state_dict"])
-            else:
-                _model.load_state_dict(checkpoint)
+        loaded = False
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        for model_path in candidate_paths:
+            if os.path.exists(model_path):
+                try:
+                    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+                    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                        _model.load_state_dict(checkpoint["state_dict"])
+                    else:
+                        _model.load_state_dict(checkpoint)
+                    print(f"Loaded RL model checkpoint from: {model_path}", file=sys.stderr)
+                    loaded = True
+                    break
+                except Exception as e:
+                    print(f"Failed to load checkpoint {model_path}: {e}", file=sys.stderr)
         
-        _model = _model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        if not loaded:
+            print("Warning: No checkpoint loaded! Operating on fresh RL model weights.", file=sys.stderr)
+        
+        _model = _model.to(device)
         _model.eval()
 
     # Determine adaptive search count budget based on current turn & remaining overage time
