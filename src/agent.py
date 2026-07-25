@@ -439,6 +439,19 @@ OPPONENT_DECKS = {
     'Rulebasedmodel_Kangaskhan_Crustle': [1, 11, 11, 11, 11, 14, 14, 14, 14, 18, 18, 18, 18, 343, 344, 344, 344, 344, 345, 345, 345, 345, 756, 756, 756, 756, 1086, 1086, 1086, 1086, 1087, 1122, 1122, 1122, 1122, 1123, 1123, 1123, 1123, 1147, 1147, 1147, 1147, 1159, 1182, 1182, 1197, 1197, 1197, 1197, 1225, 1225, 1225, 1225, 1227, 1227, 1227, 1227, 1264, 1264],
     'Rulebasedmodel_Grimmsnarl': [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 104, 104, 112, 112, 112, 112, 646, 646, 646, 646, 647, 647, 647, 648, 648, 648, 860, 860, 1079, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1097, 1097, 1152, 1152, 1152, 1152, 1122, 1137, 1182, 1182, 1219, 1219, 1219, 1219, 1227, 1227, 1227, 1227, 1231, 1259, 1259, 1259, 1259],
     'Rulebasedmodel_Trevenant': [879, 879, 879, 184, 311, 44, 878, 878, 878, 878, 140, 272, 343, 304, 858, 299, 1080, 1171, 1171, 1171, 1171, 1115, 1115, 1115, 1122, 1122, 1152, 1152, 1152, 1152, 1097, 1097, 1193, 1193, 1225, 1225, 1255, 1255, 1255, 1255, 1194, 1213, 1227, 1227, 1227, 1227, 1123, 1121, 1121, 1182, 1182, 1182, 19, 19, 19, 19, 11, 11, 11, 11],
+    'Rulebasedmodel_Hydrapple_Ogerpon': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 93, 93, 96, 96, 96, 96, 140, 149, 149, 150, 150, 655, 709, 710, 710, 917, 917, 918, 920, 1071, 1071, 1079, 1088, 1094, 1094, 1094, 1094, 1097, 1121, 1121, 1121, 1152, 1182, 1182, 1184, 1188, 1201, 1227, 1227, 1227, 1227, 1231, 1261, 1261, 1261, 1261],
+    'Rulebasedmodel_Lopunny': [11, 11, 11, 11, 13, 14, 14, 14, 65, 65, 65, 65, 66, 66, 66, 66, 848, 848, 848, 848, 849, 849, 849, 1086, 1086, 1086, 1086, 1102, 1102, 1102, 1102, 1122, 1122, 1122, 1122, 1152, 1152, 1152, 1152, 1174, 1174, 1174, 1174, 1182, 1225, 1225, 1225, 1225, 1227, 1227, 1227, 1227, 1229, 1229, 1229, 1229, 1264, 1264, 1264, 1264],
+    'Rulebasedmodel_Typhlosion': [2, 2, 2, 2, 2, 119, 119, 119, 119, 120, 120, 120, 120, 140, 352, 352, 352, 352, 353, 353, 353, 353, 354, 354, 354, 354, 1079, 1079, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1097, 1114, 1122, 1122, 1122, 1122, 1129, 1152, 1152, 1152, 1152, 1184, 1213, 1213, 1213, 1213, 1215, 1215, 1215, 1215, 1227, 1227, 1227, 1227],
+    'Rulebasedmodel_Grimmsnarl_ex': [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 104, 104, 112, 112, 112, 112, 646, 646, 646, 646, 647, 647, 647, 648, 648, 648, 860, 860, 1079, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1097, 1097, 1122, 1137, 1152, 1152, 1152, 1152, 1182, 1182, 1219, 1219, 1219, 1219, 1227, 1227, 1227, 1227, 1231, 1259, 1259, 1259, 1259],
+    'Rulebasedmodel_Garchomp_ex': [6, 6, 6, 6, 6, 20, 20, 20, 117, 341, 341, 341, 341, 342, 342, 342, 379, 379, 379, 379, 380, 380, 380, 380, 381, 381, 381, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1122, 1122, 1141, 1141, 1142, 1142, 1142, 1152, 1152, 1152, 1152, 1173, 1173, 1182, 1182, 1182, 1182, 1213, 1213, 1227, 1227, 1227, 1227, 1256, 1261],
+    'Rulebasedmodel_Marnie_Kangaskhan': [1, 11, 11, 11, 11, 14, 14, 14, 14, 18, 18, 18, 18, 344, 344, 344, 345, 345, 345, 756, 756, 756, 756, 1086, 1086, 1087, 1121, 1121, 1122, 1122, 1122, 1123, 1123, 1147, 1147, 1147, 1147, 1159, 1161, 1182, 1182, 1182, 1182, 1186, 1186, 1190, 1197, 1204, 1219, 1219, 1219, 1219, 1225, 1225, 1227, 1227, 1227, 1227, 1242, 1257],
+    'Rulebasedmodel_Hydrapple_ex': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 92, 92, 96, 96, 96, 96, 140, 150, 150, 347, 347, 655, 655, 708, 708, 709, 709, 710, 710, 920, 1071, 1080, 1094, 1094, 1094, 1094, 1097, 1097, 1121, 1121, 1121, 1152, 1152, 1182, 1182, 1184, 1227, 1227, 1227, 1227, 1231, 1261, 1261, 1261],
+    'Rulebasedmodel_Ogerpon_ex': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 42, 42, 42, 42, 96, 96, 96, 150, 150, 150, 347, 347, 347, 666, 666, 666, 666, 1079, 1079, 1079, 1079, 1086, 1086, 1094, 1094, 1094, 1094, 1122, 1122, 1122, 1152, 1152, 1159, 1224, 1224, 1224, 1231, 1231, 1231, 1231],
+    'Rulebasedmodel_Garchomp_ex_2': [6, 6, 6, 6, 6, 20, 20, 20, 117, 341, 341, 341, 341, 342, 342, 342, 379, 379, 379, 379, 380, 380, 380, 380, 381, 381, 381, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1122, 1122, 1141, 1141, 1142, 1142, 1142, 1152, 1152, 1152, 1152, 1173, 1173, 1182, 1182, 1182, 1182, 1213, 1213, 1227, 1227, 1227, 1227, 1256, 1261],
+    'Rulebasedmodel_HoOh_HeartGold': [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 46, 46, 46, 46, 140, 140, 140, 357, 357, 357, 357, 855, 855, 1097, 1097, 1097, 1118, 1118, 1118, 1121, 1121, 1121, 1121, 1122, 1122, 1123, 1123, 1123, 1123, 1182, 1182, 1182, 1182, 1192, 1192, 1215, 1215, 1215, 1224, 1224, 1224, 1224, 1232, 1232, 1236, 1236],
+    'Rulebasedmodel_Starmie_ex_2': [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 721, 721, 721, 721, 1030, 1030, 1030, 1030, 1031, 1031, 1031, 1031, 1086, 1086, 1086, 1086, 1097, 1097, 1097, 1097, 1122, 1122, 1122, 1145, 1145, 1145, 1145, 1152, 1152, 1152, 1152, 1158, 1205, 1205, 1205, 1205, 1227, 1227, 1227, 1227, 1235, 1235, 1235, 1235],
+    'Rulebasedmodel_Metagross_Grass': [5, 5, 5, 5, 5, 5, 5, 8, 8, 8, 8, 8, 8, 8, 8, 272, 272, 272, 272, 547, 547, 639, 639, 639, 639, 640, 640, 641, 641, 641, 804, 804, 835, 835, 835, 1079, 1079, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1102, 1102, 1102, 1102, 1123, 1210, 1210, 1210, 1210, 1219, 1219, 1227, 1227, 1227, 1227],
+    'Rulebasedmodel_Honchkrow': [15, 15, 15, 15, 17, 17, 17, 17, 414, 414, 463, 463, 463, 463, 473, 473, 474, 891, 891, 891, 891, 1097, 1097, 1109, 1122, 1122, 1122, 1122, 1134, 1134, 1134, 1134, 1152, 1152, 1152, 1152, 1216, 1216, 1216, 1216, 1217, 1217, 1217, 1217, 1218, 1218, 1218, 1218, 1219, 1219, 1219, 1219, 1220, 1220, 1220, 1220, 1257, 1257, 1257, 1257],
     'BasicallyBot_85134910': [788, 788, 788, 788, 789, 789, 789, 789, 928, 928, 928, 928, 855, 855, 855, 855, 1079, 1079, 1079, 1079, 1121, 1121, 1121, 1121, 1232, 1232, 1232, 1232, 1225, 1225, 1225, 1231, 1231, 1231, 17, 17, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
     'Cada_85134382': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 121, 140, 184, 235, 1120, 1071, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1097, 131, 131, 132, 133, 1121, 1121, 1121, 1120, 1120, 1152, 1152, 1152, 1182, 1182, 1182, 1198, 1198, 1198, 1198, 1210, 1210, 1227, 1227, 1227, 1227, 1256, 1256, 2, 2, 2, 2, 5, 5, 5, 5],
     'Cotini_85137077': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 131, 131, 132, 132, 133, 235, 140, 1071, 112, 1227, 1227, 1227, 1227, 1198, 1198, 1198, 1182, 1182, 1231, 1121, 1121, 1121, 1121, 1152, 1152, 1152, 1152, 1086, 1086, 1086, 1086, 1120, 1120, 1120, 1120, 1097, 1097, 1080, 1256, 1256, 1161, 343, 2, 2, 2, 5, 5, 5, 7, 7],
@@ -522,11 +535,74 @@ def create_dynamic_opponent_deck(revealed_ids: list[int]) -> list[int]:
     return deck[:60]
 
 
+SIGNATURE_FINGERPRINTS = {
+    # Cynthia's Line -> Garchomp ex
+    379: "Rulebasedmodel_Garchomp_ex",      # Cynthia's Gible
+    380: "Rulebasedmodel_Garchomp_ex",      # Cynthia's Gabite
+    381: "Rulebasedmodel_Garchomp_ex",      # Cynthia's Garchomp ex
+    341: "Rulebasedmodel_Garchomp_ex",      # Cynthia's Roselia
+    1173: "Rulebasedmodel_Garchomp_ex",     # Cynthia's Power Weight
+    
+    # Ho-Oh / Fire Line
+    357: "Rulebasedmodel_HoOh_HeartGold",   # Ethan's Ho-Oh ex
+    46:  "Rulebasedmodel_HoOh_HeartGold",   # Gouging Fire ex
+    1215: "Rulebasedmodel_HoOh_HeartGold",  # Ethan's Adventure
+    
+    # Mega Starmie Line
+    1031: "Rulebasedmodel_Starmie_ex_2",    # Mega Starmie ex
+    721: "Rulebasedmodel_Starmie_ex_2",     # Kyogre
+    1145: "Rulebasedmodel_Starmie_ex_2",    # Mega Signal
+    
+    # Steven's Metagross Line
+    641: "Rulebasedmodel_Metagross_Grass",  # Steven's Metagross ex
+    639: "Rulebasedmodel_Metagross_Grass",  # Steven's Beldum
+    640: "Rulebasedmodel_Metagross_Grass",  # Steven's Metang
+    
+    # Dragapult Line
+    119: "Rulebasedmodel_Dragapult",        # Dreepy
+    120: "Rulebasedmodel_Dragapult",        # Drakloak
+    121: "Rulebasedmodel_Dragapult",        # Dragapult ex
+    
+    # Hydrapple / Ogerpon Line
+    96:  "Rulebasedmodel_Hydrapple_Ogerpon", # Teal Mask Ogerpon ex
+    150: "Rulebasedmodel_Hydrapple_Ogerpon", # Hydrapple ex
+    117: "Rulebasedmodel_Garchomp_ex_2",    # Cornerstone Mask Ogerpon ex
+    
+    # Team Rocket Lines
+    891: "Rulebasedmodel_Honchkrow",        # Team Rocket's Honchkrow
+    463: "Rulebasedmodel_Honchkrow",        # Team Rocket's Murkrow
+    473: "Rulebasedmodel_Honchkrow",        # Team Rocket's Porygon
+    
+    # Typhlosion Line
+    352: "Rulebasedmodel_Typhlosion",       # Cyndaquil
+    354: "Rulebasedmodel_Typhlosion",       # Typhlosion
+    
+    # Lopunny Line
+    65:  "Rulebasedmodel_Lopunny",          # Buneary
+    66:  "Rulebasedmodel_Lopunny",          # Lopunny
+    
+    # Grimmsnarl Line
+    646: "Rulebasedmodel_Grimmsnarl_ex",    # Impidimp
+    648: "Rulebasedmodel_Grimmsnarl_ex",    # Grimmsnarl ex
+    
+    # Alakazam Line
+    265: "Rulebasedmodel_Iono",             # Abra
+    271: "Rulebasedmodel_Iono",             # Alakazam ex
+}
+
+
 def sample_opponent_belief_deck(revealed_ids: list[int], opponent_decks: dict) -> list[int]:
     """Computes Bayesian belief probabilities over known archetypes + dynamic template, sampling a belief deck for MCTS."""
     if not revealed_ids:
         sample_key = random.choice(list(opponent_decks.keys()))
         return opponent_decks[sample_key]
+
+    # Instant Signature Fingerprint Check (Option 3): Lock in 99% confidence on Turn 1!
+    for cid in revealed_ids:
+        if cid in SIGNATURE_FINGERPRINTS:
+            matched_archetype = SIGNATURE_FINGERPRINTS[cid]
+            if matched_archetype in opponent_decks:
+                return opponent_decks[matched_archetype]
 
     scores = {}
     r_counts = Counter(revealed_ids)
@@ -677,32 +753,34 @@ def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_coun
         for i, child in enumerate(root.children):
             child.prob = (1.0 - noise_frac) * child.prob + noise_frac * noise[i]
 
-    # Dynamic Simulation Count based on branch branching factor
-    # Phase-Based Dynamic Search Count:
-    # Opening (Turns 1-3): 60 sims (fast opening setup)
-    # Midgame (Turns 4-10): 120 sims (balanced board development)
-    # Endgame (Turn 11+ or <=2 prizes remaining): 200 sims (maximum tactical precision for KO race)
-    if search_count is None:
+    # Dynamic Simulation Count based on game urgency (Option 2: 350 MCTS Rollout Expansion)
+    # Opening (Turns 1-3): 120 sims (fast opening setup)
+    # Midgame (Turns 4-9): 200 sims (balanced board development)
+    # Critical Endgame / Clutch Turns (Turn 10+ or <=3 prizes remaining or Active HP < 100): 350 sims (Maximum 2x thinking depth)
+    if search_count is None or search_count >= 200:
         turn = state.turn if (state is not None) else 1
         my_prizes = len(state.players[your_index].prize) if (state and len(state.players) > your_index) else 6
         opp_prizes = len(state.players[opp_index].prize) if (state and len(state.players) > opp_index) else 6
         min_prizes = min(my_prizes, opp_prizes)
         
-        if turn <= 3:
-            dynamic_search_count = 60
-        elif turn <= 10 and min_prizes > 2:
-            dynamic_search_count = 120
+        my_active_pk = state.players[your_index].active[0] if (state and len(state.players[your_index].active) > 0 and state.players[your_index].active[0]) else None
+        active_hp = my_active_pk.hp if my_active_pk else 300
+        
+        is_clutch_turn = (min_prizes <= 3) or (active_hp < 100) or (turn >= 10)
+        
+        if is_clutch_turn:
+            dynamic_search_count = 350  # 350 MCTS rollouts for clutch game-deciding turns
+        elif turn <= 3:
+            dynamic_search_count = 120  # Fast setup
         else:
-            dynamic_search_count = 200
+            dynamic_search_count = 200  # Balanced midgame
     else:
         dynamic_search_count = search_count
 
     # Caps simulations in the Kaggle runtime environment if total time is constrained
     IS_KAGGLE = os.path.exists('/kaggle_simulations/agent') or 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
     if IS_KAGGLE and search_count is None:
-        # Scale Kaggle cap slightly for endgame precision while respecting runtime limits
-        if dynamic_search_count > 150:
-            dynamic_search_count = 150
+        dynamic_search_count = min(dynamic_search_count, 250)
 
     # Search loop
     for _ in range(dynamic_search_count):

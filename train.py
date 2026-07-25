@@ -86,19 +86,33 @@ def can_attack(card_id: int, energy_count: int):
     return False
 
 
+def count_effective_energy_cards(cards):
+    if not cards:
+        return 0
+    total = 0
+    for c in cards:
+        if c is not None:
+            cid = getattr(c, "cardId", getattr(c, "id", -1))
+            if cid == 15:  # Team Rocket's Energy provides 2 energies
+                total += 2
+            else:
+                total += 1
+    return total
+
+
 def count_attached_energy(ps):
     count = 0
     if len(ps.active) > 0 and ps.active[0] is not None:
-        count += len(ps.active[0].energyCards)
+        count += count_effective_energy_cards(ps.active[0].energyCards)
     for poke in ps.bench:
         if poke is not None:
-            count += len(poke.energyCards)
+            count += count_effective_energy_cards(poke.energyCards)
     return count
 
 
 def count_active_energy(ps):
     if len(ps.active) > 0 and ps.active[0] is not None:
-        return len(ps.active[0].energyCards)
+        return count_effective_energy_cards(ps.active[0].energyCards)
     return 0
 
 
@@ -198,6 +212,10 @@ def rule_based_opponent_agent(opponent_name, obs):
         "Rulebasedmodel_Mewtwo": ["easy.mewtwo_agent"],
         "Rulebasedmodel_Abomasnow": ["easy.abomasnow_agent"],
         "Rulebasedmodel_Crustle": ["easy.crustle_agent"],
+        "Rulebasedmodel_Lopunny": ["easy.lopunny_agent"],
+        "Rulebasedmodel_Typhlosion": ["easy.typhlosion_agent"],
+        "Rulebasedmodel_Marnie_Kangaskhan": ["easy.marnie_kangaskhan_agent"],
+        "Rulebasedmodel_Honchkrow": ["easy.honchkrow_agent"],
         
         "Rulebasedmodel_Alakazam": ["hard.alakazam_agent"],
         "Rulebasedmodel_Archaludon": ["hard.archaludon_agent"],
@@ -210,7 +228,17 @@ def rule_based_opponent_agent(opponent_name, obs):
         "Rulebasedmodel_Mewtwo_Wobbuffet": ["hard.mewtwo_wobbuffet_agent"],
         "Rulebasedmodel_Starmie": ["hard.starmie_agent"],
         "Rulebasedmodel_Trevenant": ["hard.trevenant_agent"],
-        "Rulebasedmodel_TR_Mewtwo": ["team_rocket_mewtwo_rule_agent"]
+        "Rulebasedmodel_TR_Mewtwo": ["team_rocket_mewtwo_rule_agent"],
+        
+        "Rulebasedmodel_Hydrapple_Ogerpon": ["hard.hydrapple_ogerpon_agent"],
+        "Rulebasedmodel_Grimmsnarl_ex": ["hard.grimmsnarl_ex_agent"],
+        "Rulebasedmodel_Garchomp_ex": ["hard.garchomp_ex_agent"],
+        "Rulebasedmodel_Hydrapple_ex": ["hard.hydrapple_ex_agent"],
+        "Rulebasedmodel_Ogerpon_ex": ["hard.ogerpon_ex_agent"],
+        "Rulebasedmodel_Garchomp_ex_2": ["hard.garchomp_ex_2_agent"],
+        "Rulebasedmodel_HoOh_HeartGold": ["hard.hooh_heartgold_agent"],
+        "Rulebasedmodel_Starmie_ex_2": ["hard.starmie_ex_2_agent"],
+        "Rulebasedmodel_Metagross_Grass": ["hard.metagross_grass_agent"]
     }
     
     modules = mapping.get(opponent_name, [opponent_name])
@@ -459,7 +487,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     
                     active_pk = state_ps.active[0] if (len(state_ps.active) > 0 and state_ps.active[0] is not None) else None
                     active_id = active_pk.id if active_pk else -1
-                    active_energies = len(active_pk.energyCards) if active_pk else 0
+                    active_energies = count_effective_energy_cards(active_pk.energyCards) if active_pk else 0
                     
                     # Track active spot lockout at the episode level
                     active_serial = active_pk.serial if active_pk else None
@@ -512,7 +540,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         "opp_active_hp": opp_active_pk.hp if opp_active_pk else 0,
                         "stadium_id": stadium_id,
                         "bench_ids": bench_ids,
-                        "bench_energies": [len(p.energyCards) for p in state_ps.bench if p is not None],
+                        "bench_energies": [count_effective_energy_cards(p.energyCards) for p in state_ps.bench if p is not None],
                         "bench_damage": [p.maxHp - p.hp for p in state_ps.bench if p is not None],
                         "hand_size": len(state_ps.hand) if state_ps.hand is not None else 0,
                         "hand_ids": [c.id for c in state_ps.hand if c is not None] if state_ps.hand is not None else [],
@@ -773,7 +801,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         final_opp_ps = final_obs.current.players[1 - i]
                         final_active_pk = final_ps.active[0] if (len(final_ps.active) > 0 and final_ps.active[0] is not None) else None
                         final_active_id = final_active_pk.id if final_active_pk else -1
-                        final_active_energies = len(final_active_pk.energyCards) if final_active_pk else 0
+                        final_active_energies = count_effective_energy_cards(final_active_pk.energyCards) if final_active_pk else 0
                         
                         final_opp_active_pk = final_opp_ps.active[0] if (len(final_opp_ps.active) > 0 and final_opp_ps.active[0] is not None) else None
                         final_opp_active_id = final_opp_active_pk.id if final_opp_active_pk else -1
@@ -801,7 +829,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             "opp_active_hp": final_opp_active_pk.hp if final_opp_active_pk else 0,
                             "stadium_id": final_stadium_id,
                             "bench_ids": final_bench_ids,
-                            "bench_energies": [len(p.energyCards) for p in final_ps.bench if p is not None],
+                            "bench_energies": [count_effective_energy_cards(p.energyCards) for p in final_ps.bench if p is not None],
                             "bench_damage": [p.maxHp - p.hp for p in final_ps.bench if p is not None],
                             "hand_size": len(final_ps.hand) if final_ps.hand is not None else 0,
                             "hand_ids": [c.id for c in final_ps.hand if c is not None] if final_ps.hand is not None else [],
@@ -1439,13 +1467,38 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             # Tool attachments
                             elif attached_card.cardType == CardType.TOOL:
                                 opp_active_card = get_card_data(pre.get("opp_active_id"))
-                                is_opp_ex = opp_active_card is not None and opp_active_card.ex
+                                is_opp_ex = opp_active_card is not None and (getattr(opp_active_card, "ex", False) or getattr(opp_active_card, "megaEx", False))
                                 
                                 if "Brave Bangle" in attached_card.name or "Maximum Belt" in attached_card.name:
-                                    if is_opp_ex and pre.get("active_id") == target_card.cardId:
-                                        r_strategic += 0.20
+                                    # Bangle only applies to main heavy attackers (Mewtwo ex 431 & Spidops 401)
+                                    target_is_heavy_attacker = target_card.cardId in [431, 401]
+                                    target_is_excluded = target_card.cardId in [434, 414]  # Exclude Mimikyu (434) & Articuno (414)
+                                    
+                                    if target_is_heavy_attacker and is_opp_ex:
+                                        r_strategic += 0.25  # High reward for Bangle on Mewtwo ex / Spidops vs ex target
+                                    elif target_is_excluded:
+                                        r_strategic -= 0.15  # Direct penalty for wasting Bangle on Mimikyu or Articuno!
+                                    elif not target_is_heavy_attacker:
+                                        r_strategic -= 0.10  # Penalty for attaching Bangle to non-heavy attackers
                                     else:
                                         r_strategic -= 0.05
+                                        
+                                elif "Hero" in attached_card.name or attached_card.cardId == 1159:
+                                    # Hero's Cape (+100 HP) ACE SPEC Logic:
+                                    # 1. Maximum Reward (+0.30) for Mewtwo ex (431) -> turns 280 HP into 380 HP unstoppable raid boss!
+                                    # 2. High Reward (+0.25) for Active Defender under damage pressure (e.g. Mimikyu 434 active or Spidops 401 active)
+                                    target_is_mewtwo = (target_card.cardId == 431)
+                                    is_active_target = (pre.get("active_id") == target_card.cardId)
+                                    target_is_defense = (target_card.cardId in [434, 401] and is_active_target)
+                                    
+                                    if target_is_mewtwo:
+                                        r_strategic += 0.30  # Maximum reward for 380 HP Mewtwo ex tank
+                                    elif target_is_defense:
+                                        r_strategic += 0.25  # High reward for active defensive wall / Spidops tanking
+                                    elif not is_active_target and target_card.cardId in [400, 414]:
+                                        r_strategic -= 0.20  # Penalty for wasting Hero's Cape on bench Tarountula/Articuno!
+                                    else:
+                                        r_strategic += 0.05
                                         
                     elif action_type == 9:  # EVOLVE
                         evolved_id = pre.get("evolved_card_id", -1)
