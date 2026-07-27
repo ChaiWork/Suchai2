@@ -1481,8 +1481,13 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                             r_strategic += 0.25
                                             if pre.get("active_id") != target_card.cardId:
                                                 r_strategic += 0.08
-                                    elif attached_card.cardId == 1: # Grass
-                                        r_strategic -= 0.05
+                                    elif attached_card.cardId == 1: # Grass (Green)
+                                        # Max 1 Green Energy on Mewtwo ex (fulfills 1 Colorless requirement).
+                                        # Attaching a 2nd+ Green Energy to Mewtwo ex is overcharging & starves Spidops!
+                                        if current_energy >= 2:
+                                            r_strategic -= 0.35  # Penalty for 2nd+ Green Energy on Mewtwo ex
+                                        else:
+                                            r_strategic += 0.15  # 1st Green Energy OK for Colorless cost
                                 # Spidops/Tarountula (401/400) requires Grass energy (1)
                                 elif target_card.cardId in [401, 400]:
                                     if attached_card.cardId == 1: # Grass
@@ -1494,7 +1499,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                                 r_strategic += 0.08
                                     elif attached_card.cardId == 5: # Psychic
                                         r_strategic -= 0.03
-                                # Mimikyu (434) requires Psychic energy (5)
+                                 # Mimikyu (434) requires Psychic energy (5)
                                 elif target_card.cardId == 434:
                                     if attached_card.cardId == 5: # Psychic
                                         if is_fully_charged:
@@ -1505,14 +1510,12 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                                 r_strategic += 0.08
                                     elif attached_card.cardId == 1: # Grass
                                         r_strategic -= 0.03
-                                # Articuno (414) powered by any basic energy
+                                # Articuno (414) non-attacker wall: STRICT 1-ENERGY MAX CAP (retreat cost = 1)
                                 elif target_card.cardId == 414:
-                                    if is_fully_charged:
-                                        r_strategic -= 0.03
+                                    if current_energy >= 1:
+                                        r_strategic -= 0.30  # Heavy penalty for attaching 2nd+ energy to Articuno wall!
                                     else:
-                                        r_strategic += 0.25
-                                        if pre.get("active_id") != target_card.cardId:
-                                            r_strategic += 0.08
+                                        r_strategic += 0.15  # 1st energy attachment allowed to enable 1-energy retreat
                                 else:
                                     if is_fully_charged:
                                         r_strategic -= 0.02
@@ -1557,7 +1560,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                     elif target_is_defense:
                                         r_strategic += 0.25  # High reward for active defensive wall / Spidops tanking
                                     elif not is_active_target and target_card.cardId in [400, 414]:
-                                        r_strategic -= 0.20  # Penalty for wasting Hero's Cape on bench Tarountula/Articuno!
+                                        r_strategic -= 0.40  # Strong penalty for wasting Hero's Cape on bench Tarountula/Articuno!
+                                    elif target_card.cardId in [434]:
+                                        r_strategic -= 0.40  # Strong penalty for wasting Hero's Cape on Mimikyu (60 HP non-attacker)!
                                     else:
                                         r_strategic += 0.05
                                         
@@ -1566,13 +1571,15 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         evolved_card = get_card_data(evolved_id)
                         if evolved_card is not None:
                             if evolved_id == 401 or getattr(evolved_card, "cardId", -1) == 401:
-                                r_strategic += 0.25  # High priority Spidops evolution reward
+                                r_strategic += 0.35  # Boosted Spidops evolution reward (50 HP -> 130 HP upgrade!)
+                                if pre.get("active_id") == 400:
+                                    r_strategic += 0.15  # Extra boost for evolving active Tarountula to prevent KO
                                 if pre.get("turn", 1) <= 5:
-                                    r_strategic += 0.15  # Early Spidops Speed Bonus (Turns 2-5): Protects 50 HP Tarountula from bench sniping!
+                                    r_strategic += 0.15  # Early Spidops Speed Bonus (Turns 2-5)
                             elif evolved_card.stage1 or evolved_card.stage2:
-                                r_strategic += 0.15  # Evolution setup reward
+                                r_strategic += 0.20  # General evolution setup reward
                             else:
-                                r_strategic += 0.08
+                                r_strategic += 0.10
                                 
                     elif action_type == 10:  # ABILITY
                         r_strategic += 0.20  # Strong reward for activating Pokemon abilities before attacking
@@ -1752,6 +1759,28 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             # Early Turn 1-3 KO Aggro Rush Bonus
                             if pre.get("turn", 0) <= 3 and prizes_taken > 0:
                                 r_strategic += 0.35  # Calibrated: Early Turn 1-3 Knockout bonus
+                            
+                            # Attack Stalling Basics Immediately (from 88414072 Water Ramp loss)
+                            # Opponent stalling with low-HP basics while building 300-400HP Stage 2 walls.
+                            # Reward attacking if opponent active HP <= 100 in early/mid game.
+                            opp_active_hp_pre = pre.get("opp_active_hp", 999)
+                            opp_active_max_hp = pre.get("opp_active_max_hp", 999)
+                            opp_prizes_pre = pre.get("prizes_remaining_opp", 0)
+                            turn_pre = pre.get("turn", 99)
+                            if opp_active_max_hp <= 100 and turn_pre <= 10 and opp_prizes_pre >= 4:
+                                r_strategic += 0.20  # Attack stalling low-HP basic early!
+                            
+                            # Grimmsnarl-ex Counter: KO Munkidori FIRST (from 88413528/88415303 losses)
+                            # Munkidori (ID 112) spreads Poison while charging Grimmsnarl-ex on bench.
+                            # KO it before it builds 3+ D-Energy to prevent board snowball.
+                            opp_active_id_pre = pre.get("opp_active_id", -1)
+                            opp_bench_ids_pre = pre.get("opp_bench_ids", [])
+                            GRIMMSNARL_EX_ID_TRAIN = 648
+                            MUNKIDORI_ID_TRAIN = 112
+                            is_munkidori_active = (opp_active_id_pre == MUNKIDORI_ID_TRAIN)
+                            is_grimmsnarl_on_bench = (GRIMMSNARL_EX_ID_TRAIN in opp_bench_ids_pre)
+                            if is_munkidori_active and is_grimmsnarl_on_bench:
+                                r_strategic += 0.25  # KO Munkidori before Grimmsnarl-ex sweeps!
                             
                     # Reward attaching Team Rocket's Energy (15) to Articuno (414) for 120 dmg Dark Frost
                     if action_type == 8:  # ATTACH

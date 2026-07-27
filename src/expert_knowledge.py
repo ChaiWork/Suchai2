@@ -12,6 +12,25 @@ ARTICUNO_ID = 414
 TAROUNTULA_ID = 400
 CRUSTLE_ID = 345
 STARMIE_EX_ID = 1031
+GRIMMSNARL_EX_ID = 648
+MUNKIDORI_ID = 112
+FROSLASS_ID = 104
+IMPIDIMP_ID = 646
+MORGREM_ID = 647
+SNORUNT_ID = 860
+
+# Tool card IDs
+HEROS_CAPE_ID    = 1159   # ACE SPEC: +100 HP
+BRAVE_BANGLE_ID  = 1175   # +30 dmg vs ex (non-ex attacker only)
+HANDHELD_FAN_ID  = 1161   # Clears status effects
+
+# Stadium card IDs
+SPIKEMUTH_GYM_ID = 1259   # +30 to all Dark attacks
+TR_FACTORY_ID    = 1257   # TR draw bonus
+
+# Grimmsnarl-ex / Munkidori deck evolution lines
+GRIMMSNARL_LINE_IDS = {646, 647, 648}  # Impidimp -> Morgrem -> Grimmsnarl-ex
+WATER_RAMP_STALL_IDS = frozenset()     # Placeholder — detected by W-energy + low-HP basic stalling
 
 # TR Supporter IDs — synergize with TR Factory (1257) for +2 draw bonus
 TR_SUPPORTER_IDS = frozenset({1216, 1218, 1219, 1220})  # Ariana, Giovanni, Petrel, Proton
@@ -175,18 +194,42 @@ def get_expert_bonus(obs, option, opponent_name="unknown"):
     opp_pokemon_ids = set(opp_bench_ids) | {opp_active_id}
 
     # -------------------------------------------------------------------------
-    # 1. Dragapult Counter — Evolution Denial / Dreepy-Drakloak KO
+    # 1. Dragapult ex Counter — Repelling Veil Bench Shield & Evolution Denial
+    #
+    # Dragapult ex's Phantom Dive attack deals 200 active damage + 60 damage
+    # counters spread across benched Basics (one-shotting 50HP Tarountulas).
+    #
+    # Counter Strategy:
+    # 1. Bench Articuno! Repelling Veil PREVENTS Phantom Dive damage counters
+    #    from being placed on all Basic Team Rocket Pokemon on your bench!
+    # 2. Retreat active Articuno to bench so Repelling Veil protects the board.
+    # 3. Priority evolve Tarountula (50 HP) -> Spidops (130 HP) to survive.
+    # 4. Evolution Denial: KO Dreepy/Drakloak before Dragapult ex sets up.
     # -------------------------------------------------------------------------
-    if "dragapult" in opp_lower:
-        if opt_type in (13, OptionType.ATTACK):
+    is_dragapult_opponent = ("dragapult" in opp_lower) or bool(DRAGAPULT_LINE_IDS & opp_pokemon_ids)
+
+    if is_dragapult_opponent:
+        # 1. Priority Bench Articuno for Repelling Veil bench shield
+        if opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) == ARTICUNO_ID:
+            if my_bench_count < 5:
+                bonus += 0.35
+                triggered = "Articuno_RepellingVeil_Vs_Dragapult"
+
+        # 2. Retreat Active Articuno to Bench so Repelling Veil stays active
+        elif opt_type in (12, OptionType.RETREAT) and my_active_id == ARTICUNO_ID:
+            bonus += 0.30
+            triggered = "Articuno_Retreat_To_Bench_Vs_Dragapult"
+
+        # 3. Priority Evolve Tarountula -> Spidops to exceed 60 HP snipe threshold
+        elif opt_type in (9, OptionType.EVOLVE) and getattr(option, "cardId", -1) == SPIDOPS_ID:
+            bonus += 0.35
+            triggered = "Spidops_Evolve_To_Survive_Phantom_Dive"
+
+        # 4. Evolution Denial: KO Dreepy/Drakloak on opponent bench before Dragapult ex evolves
+        elif opt_type in (13, OptionType.ATTACK):
             target_name = str(getattr(option, "targetName", "")).lower()
             is_denial_target = any(k in target_name for k in ["dreepy", "drakloak"])
-
-            # Context guard: only reward if opponent has meaningful evolution potential
-            opp_has_evolution = bool(DRAGAPULT_LINE_IDS & opp_pokemon_ids)
-
-            if is_denial_target and opp_has_evolution:
-                # Bigger bonus in mid-game when evolution denial has maximum impact
+            if is_denial_target and bool(DRAGAPULT_LINE_IDS & opp_pokemon_ids):
                 bonus += 0.15 if game_phase in ("mid", "late") else 0.08
                 triggered = "KO_Dreepy_Drakloak"
 
@@ -313,22 +356,36 @@ def get_expert_bonus(obs, option, opponent_name="unknown"):
                 triggered = "TR_Factory_Setup"
 
     # -------------------------------------------------------------------------
-    # 4c. Universal Turn 1-2 Emergency Bench Search (Prevent Lone Active Wipe)
+    # 4c. Universal Emergency Bench Search & Basic Placement (Prevent Lone Active Wipe)
+    #
+    # Having 0 benched Pokemon is an existential threat (1 KO = instant loss).
+    # Highest priority when bench is empty is to search and play Basic Pokemon.
     # -------------------------------------------------------------------------
-    if my_bench_count == 0 and opt_type in (7, OptionType.PLAY):
-        card_id = getattr(option, "cardId", -1)
-        if card_id in (1134, 1086, 1220):  # Transceiver, Poffin, Proton
-            bonus += 0.20
-            triggered = "Turn1_Emergency_Bench_Search"
+    if my_bench_count == 0:
+        if opt_type in (7, OptionType.PLAY):
+            card_id = getattr(option, "cardId", -1)
+            if card_id in (1134, 1086, 1220, 1094):  # Transceiver, Poffin, Proton, Bug Catching Set
+                bonus += 0.35
+                triggered = "Turn1_Emergency_Bench_Search"
+            elif card_id in (400, 414, 434, 431):  # Playing any Basic Pokemon from hand to bench
+                bonus += 0.35
+                triggered = "Emergency_Bench_Basic_Placement"
 
     # -------------------------------------------------------------------------
     # 4d. Priority Evolution (Tarountula -> Spidops)
+    #
+    # Evolving Tarountula (50 HP) to Spidops (130 HP) upgrades HP, attack,
+    # and retreat-locking ability. Evolving active Tarountula prevents KO!
     # -------------------------------------------------------------------------
     if opt_type in (9, OptionType.EVOLVE):
         card_id = getattr(option, "cardId", -1)
         if card_id == SPIDOPS_ID:  # Spidops
-            bonus += 0.15
-            triggered = "Priority_Spidops_Evolution"
+            if my_active_id == TAROUNTULA_ID:
+                bonus += 0.40  # Maximum priority: Evolve active 50 HP Tarountula immediately!
+                triggered = "Active_Tarountula_Spidops_Evolution"
+            else:
+                bonus += 0.35  # High priority: Evolve bench Tarountula
+                triggered = "Priority_Spidops_Evolution"
 
     # -------------------------------------------------------------------------
     # 4e. Power Saver Bench Gate — Core Win Condition Guard
@@ -391,23 +448,162 @@ def get_expert_bonus(obs, option, opponent_name="unknown"):
             except Exception:
                 pass  # Fail open — no penalty on access error
 
+        # Mewtwo ex (431) Green Energy Cap: Max 1 Green Energy (card ID 1) allowed!
+        # 1 Green Energy fulfills 1 Colorless energy requirement (e.g. 1 TR Energy + 1 Green Energy = 3E for Psychic Burst).
+        # Overcharging 2+ Green Energies on Mewtwo ex is forbidden (wastes Spidops' Grass energy).
+        try:
+            attached_card_id = getattr(option, "cardId", -1)
+            target_is_mewtwo = False
+            mewtwo_grass_count = 0
+            mewtwo_obj = None
+
+            if attach_index == 0 and my_ps is not None and my_ps.active and my_ps.active[0] is not None:
+                a_obj = my_ps.active[0]
+                aid = a_obj.get("id") if isinstance(a_obj, dict) else getattr(a_obj, "id", -1)
+                if aid == MEWTWO_EX_ID:
+                    target_is_mewtwo = True
+                    mewtwo_obj = a_obj
+            elif attach_index >= 1 and my_ps is not None:
+                b_slot = attach_index - 1
+                bench_list = getattr(my_ps, "bench", []) if not isinstance(my_ps, dict) else my_ps.get("bench", [])
+                if b_slot < len(bench_list) and bench_list[b_slot] is not None:
+                    b_obj = bench_list[b_slot]
+                    bid = b_obj.get("id") if isinstance(b_obj, dict) else getattr(b_obj, "id", -1)
+                    if bid == MEWTWO_EX_ID:
+                        target_is_mewtwo = True
+                        mewtwo_obj = b_obj
+
+            if target_is_mewtwo and mewtwo_obj is not None:
+                energies = mewtwo_obj.get("energyCards", []) if isinstance(mewtwo_obj, dict) else getattr(mewtwo_obj, "energyCards", [])
+                for e in energies:
+                    eid = e.get("id") if isinstance(e, dict) else getattr(e, "id", -1)
+                    if eid == 1:
+                        mewtwo_grass_count += 1
+
+                if attached_card_id == 1:
+                    if mewtwo_grass_count >= 1:
+                        # Overcharging 2nd+ Green Energy on Mewtwo ex is forbidden!
+                        bonus -= 0.35
+                        triggered = "Mewtwo_Grass_Energy_Overcharge_Penalty"
+                    else:
+                        # 1st Green Energy is OK to fulfill 1 Colorless cost
+                        bonus += 0.10
+                        triggered = "Mewtwo_First_Grass_Energy_Colorless_OK"
+        except Exception:
+            pass
+
+        # Articuno Energy Cap (Max 2 Energies): Articuno's Ice Beam attack costs 2 energy.
+        # Attaching a 3rd+ energy to Articuno (Active or Bench) wastes energy.
+        try:
+            target_is_articuno = False
+            articuno_current_e = 0
+            if attach_index == 0 and my_ps is not None and my_ps.active and my_ps.active[0] is not None:
+                a_obj = my_ps.active[0]
+                aid = a_obj.get("id") if isinstance(a_obj, dict) else getattr(a_obj, "id", -1)
+                if aid == ARTICUNO_ID:
+                    target_is_articuno = True
+                    articuno_current_e = len(a_obj.get("energyCards", [])) if isinstance(a_obj, dict) else len(getattr(a_obj, "energyCards", []))
+            elif attach_index >= 1 and my_ps is not None:
+                b_slot = attach_index - 1
+                bench_list = getattr(my_ps, "bench", []) if not isinstance(my_ps, dict) else my_ps.get("bench", [])
+                if b_slot < len(bench_list) and bench_list[b_slot] is not None:
+                    b_obj = bench_list[b_slot]
+                    bid = b_obj.get("id") if isinstance(b_obj, dict) else getattr(b_obj, "id", -1)
+                    if bid == ARTICUNO_ID:
+                        target_is_articuno = True
+                        articuno_current_e = len(b_obj.get("energyCards", [])) if isinstance(b_obj, dict) else len(getattr(b_obj, "energyCards", []))
+
+            if target_is_articuno and articuno_current_e >= 2:
+                bonus -= 0.30
+                triggered = "Articuno_Energy_Cap_Penalty"
+        except Exception:
+            pass
+
+        # -------------------------------------------------------------------------
+        # Articuno Role: NON-ATTACKER Defensive Wall / 1-Energy Pivot
+        # - Articuno retreat cost = 1 energy (only 1 energy needed to retreat)
+        # - STRICT ENERGY CAP = 1 Energy Max on Articuno!
+        # - Attaching a 2nd+ energy to Articuno is a severe waste of energy.
+        # -------------------------------------------------------------------------
+        try:
+            target_is_articuno = False
+            articuno_current_e = 0
+            if attach_index == 0 and my_ps is not None and my_ps.active and my_ps.active[0] is not None:
+                a_obj = my_ps.active[0]
+                aid = a_obj.get("id") if isinstance(a_obj, dict) else getattr(a_obj, "id", -1)
+                if aid == ARTICUNO_ID:
+                    target_is_articuno = True
+                    articuno_current_e = len(a_obj.get("energyCards", [])) if isinstance(a_obj, dict) else len(getattr(a_obj, "energyCards", []))
+            elif attach_index >= 1 and my_ps is not None:
+                b_slot = attach_index - 1
+                bench_list = getattr(my_ps, "bench", []) if not isinstance(my_ps, dict) else my_ps.get("bench", [])
+                if b_slot < len(bench_list) and bench_list[b_slot] is not None:
+                    b_obj = bench_list[b_slot]
+                    bid = b_obj.get("id") if isinstance(b_obj, dict) else getattr(b_obj, "id", -1)
+                    if bid == ARTICUNO_ID:
+                        target_is_articuno = True
+                        articuno_current_e = len(b_obj.get("energyCards", [])) if isinstance(b_obj, dict) else len(getattr(b_obj, "energyCards", []))
+
+            if target_is_articuno:
+                if articuno_current_e >= 1:
+                    # STRICT CAP: Articuno never needs more than 1 energy (retreat cost = 1)
+                    bonus -= 0.35
+                    triggered = "Articuno_Max_1_Energy_Cap_Penalty"
+                elif articuno_current_e == 0 and attach_index == 0:
+                    # 1st energy on active Articuno is OK to enable 1-energy retreat
+                    bonus += 0.05
+                    triggered = "Articuno_1Energy_Retreat_Prep"
+        except Exception:
+            pass
+
     # -------------------------------------------------------------------------
-    # 4f. Articuno Repelling Veil Placement Priority
+    # 4f. Brilliant Articuno Repelling Veil Matchup Play & 1-Energy Pivot
     #
-    # Articuno's Repelling Veil ability prevents all *effects* of attacks on
-    # your Basic TR Pokémon (Tarountula/Mimikyu) while it sits on the bench.
-    # Keeping Articuno on the bench is often correct even without attacking.
+    # Articuno's Repelling Veil ability prevents ALL attack effects (like damage
+    # counters) on your Basic TR Pokémon (Tarountula/Mimikyu/Mewtwo ex).
+    #
+    # Key Matchups where Repelling Veil is ⭐⭐⭐⭐⭐ Brilliant:
+    #   1. Dragapult ex — stops Phantom Dive 6 damage counters on bench Basics
+    #   2. Alakazam ex — blocks damage counter placement / manipulation
+    #   3. Sableye / Spread decks — negates spread damage counter effects
     # -------------------------------------------------------------------------
     if opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) == ARTICUNO_ID:
-        if my_bench_count < 5:  # Don't overextend bench
+        is_snipe_effect_deck = any(kw in opp_lower for kw in ["dragapult", "dreepy", "drakloak", "alakazam", "abra", "sableye", "spread", "shrouded"])
+        if is_snipe_effect_deck:
+            bonus += 0.35  # Brilliant Play: Priority bench Articuno to block Phantom Dive / spread effects!
+            triggered = "Articuno_RepellingVeil_SnipeGuard_BrilliantPlay"
+        elif my_bench_count < 4:
             bonus += 0.15
             triggered = "Articuno_Repelling_Veil_Setup"
 
     # -------------------------------------------------------------------------
-    # 4g. Mimikyu Free-Retreat Pivot
+    # 4f-2. Articuno 1-Energy Pivot Retreat to Bench Attacker
     #
-    # Mimikyu has 0 retreat cost. Retreating Mimikyu to bring Mewtwo ex or
-    # Spidops active is almost always the correct play.
+    # When active Articuno has 1 energy (its retreat cost), retreat it immediately
+    # if a benched attacker (Spidops with >=2E or Mewtwo ex with >=3E) is ready!
+    # -------------------------------------------------------------------------
+    if opt_type in (12, OptionType.RETREAT) and my_active_id == ARTICUNO_ID:
+        if my_active_energy >= 1:
+            benched_attacker_ready = False
+            try:
+                if my_ps is not None:
+                    bench_list = getattr(my_ps, "bench", []) if not isinstance(my_ps, dict) else my_ps.get("bench", [])
+                    for b in bench_list:
+                        if b is not None:
+                            bid = b.get("id") if isinstance(b, dict) else getattr(b, "id", -1)
+                            be = len(b.get("energyCards", [])) if isinstance(b, dict) else len(getattr(b, "energyCards", []))
+                            if (bid == SPIDOPS_ID and be >= 2) or (bid == MEWTWO_EX_ID and be >= 3):
+                                benched_attacker_ready = True
+                                break
+            except Exception:
+                benched_attacker_ready = True
+
+            if benched_attacker_ready:
+                bonus += 0.35  # Retreat Articuno with 1E to bring out ready bench attacker!
+                triggered = "Articuno_Pivot_Retreat_To_Bench_Attacker"
+
+    # -------------------------------------------------------------------------
+    # 4g. Mimikyu Free-Retreat Pivot
     # -------------------------------------------------------------------------
     if opt_type in (12, OptionType.RETREAT) and my_active_id == MIMIKYU_ID:
         bonus += 0.15
@@ -691,7 +887,175 @@ def get_expert_bonus(obs, option, opponent_name="unknown"):
                 bonus -= 0.10
                 triggered = "Alakazam_Bench_Limit_Guard"
 
-    # Bound bonus within [-0.30, +0.40]: allow meaningful penalties for critical errors
+    # -------------------------------------------------------------------------
+    # NEW 1. Hero's Cape Placement Rules (from 88413528 / 88414072 loss analysis)
+    #
+    # Hero's Cape (+100 HP ACE SPEC) MUST go on Mewtwo-ex[TR] (280->380HP).
+    # Placing it on Tarountula (50HP basic with 0 attacks) is a wasted ACE SPEC.
+    # -------------------------------------------------------------------------
+    if opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) == HEROS_CAPE_ID:
+        # Detect the target of the tool attachment
+        try:
+            tool_target_id = -1
+            if my_ps is not None:
+                active_list = getattr(my_ps, "active", []) if not isinstance(my_ps, dict) else my_ps.get("active", [])
+                if active_list and active_list[0] is not None:
+                    tool_target_id = active_list[0].get("id") if isinstance(active_list[0], dict) else getattr(active_list[0], "id", -1)
+        except Exception:
+            tool_target_id = -1
+
+        if tool_target_id == MEWTWO_EX_ID:
+            bonus += 0.35
+            triggered = "HeroCape_Correct_Target_MewtwoEx"
+        elif tool_target_id in (TAROUNTULA_ID, MIMIKYU_ID):
+            # WRONG: Hero's Cape on a basic non-attacker wastes the ACE SPEC
+            bonus -= 0.40
+            triggered = "HeroCape_Wrong_Target_NonAttacker"
+
+    # -------------------------------------------------------------------------
+    # NEW 2. Brave Bangle Correct Placement (from 88415303 loss analysis)
+    #
+    # Brave Bangle (+30 dmg vs ex Pokémon) ONLY works for non-ex attackers.
+    # Mewtwo-ex has a Rule Box so Brave Bangle does NOT apply to it.
+    # Best targets: Spidops (130HP, attacks ex) > Articuno (120HP) > Tarountula.
+    # Worst target: Mimikyu (60HP, no realistic attacking role).
+    # -------------------------------------------------------------------------
+    if opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) == BRAVE_BANGLE_ID:
+        try:
+            bangle_target_id = -1
+            if my_ps is not None:
+                active_list = getattr(my_ps, "active", []) if not isinstance(my_ps, dict) else my_ps.get("active", [])
+                if active_list and active_list[0] is not None:
+                    bangle_target_id = active_list[0].get("id") if isinstance(active_list[0], dict) else getattr(active_list[0], "id", -1)
+        except Exception:
+            bangle_target_id = -1
+
+        if bangle_target_id == SPIDOPS_ID:
+            bonus += 0.25
+            triggered = "BraveBangle_Correct_Spidops"
+        elif bangle_target_id == ARTICUNO_ID:
+            bonus += 0.10
+            triggered = "BraveBangle_Articuno_Acceptable"
+        elif bangle_target_id == MIMIKYU_ID:
+            bonus -= 0.25
+            triggered = "BraveBangle_Wrong_Target_Mimikyu"
+
+    # -------------------------------------------------------------------------
+    # NEW 3. Grimmsnarl-ex Matchup Counter Rules (from 88413528 / 88415303 losses)
+    #
+    # Strategy vs Grimmsnarl-ex / Munkidori spread deck:
+    # 1. KO Munkidori FIRST — it spreads Poison and charges Grimmsnarl-ex on bench.
+    # 2. Replace Spikemuth Gym immediately — it gives +30 to all Dark attacks.
+    # 3. Giovanni gust on Morgrem/Impidimp before they evolve to Grimmsnarl-ex.
+    # -------------------------------------------------------------------------
+    is_grimmsnarl_opponent = (
+        any(kw in opp_lower for kw in ["grimmsnarl", "impidimp", "morgrem", "munkidori"])
+        or bool(GRIMMSNARL_LINE_IDS & opp_pokemon_ids)
+        or MUNKIDORI_ID in opp_pokemon_ids
+    )
+
+    if is_grimmsnarl_opponent:
+        # 3a. Reward attacking Munkidori — Munkidori spread stops when it is KO'd
+        if opt_type in (13, OptionType.ATTACK) and opp_active_id == MUNKIDORI_ID:
+            if my_active_energy >= 1:
+                bonus += 0.30
+                triggered = "Grimmsnarl_Counter_KO_Munkidori_Active"
+
+        # 3b. Reward Giovanni gust on evolving Impidimp/Morgrem (deny Grimmsnarl-ex)
+        elif opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) == 1218:  # TR-Giovanni
+            opp_has_impidimp_morgrem = bool({IMPIDIMP_ID, MORGREM_ID} & set(opp_bench_ids))
+            if opp_has_impidimp_morgrem and game_phase in ("early", "mid"):
+                bonus += 0.30
+                triggered = "Grimmsnarl_Counter_Giovanni_Gust_Evolution_Line"
+
+        # 3c. Reward replacing Spikemuth Gym with TR-Factory (deny +30 Dark)
+        elif opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) == TR_FACTORY_ID:
+            try:
+                current = getattr(obs, "current", None)
+                if current is not None:
+                    stadium_list = getattr(current, "stadium", []) if not isinstance(current, dict) else current.get("stadium", [])
+                    active_stadium_ids = [s.get("id") if isinstance(s, dict) else getattr(s, "id", -1) for s in stadium_list]
+                    if SPIKEMUTH_GYM_ID in active_stadium_ids:
+                        bonus += 0.35
+                        triggered = "Grimmsnarl_Replace_Spikemuth_Gym"
+            except Exception:
+                pass
+
+    # -------------------------------------------------------------------------
+    # NEW 4. Attack Stalling Basics Immediately (from 88414072 water ramp loss)
+    #
+    # Opponent stalling with a 70HP basic for 8 turns while building 400HP
+    # Stage 2 ex walls is a losing line. ATTACK the stalling basic immediately!
+    # If opponent active <= 100 HP and we have energy, attack to take early prizes.
+    # -------------------------------------------------------------------------
+    if opt_type in (13, OptionType.ATTACK) and my_active_energy >= 1:
+        try:
+            current = getattr(obs, "current", None)
+            if current is not None:
+                yi = getattr(current, "yourIndex", 0) if not isinstance(current, dict) else current.get("yourIndex", 0)
+                players = getattr(current, "players", []) if not isinstance(current, dict) else current.get("players", [])
+                if len(players) >= 2:
+                    opp_ps = players[1 - yi]
+                    opp_active_list = getattr(opp_ps, "active", []) if not isinstance(opp_ps, dict) else opp_ps.get("active", [])
+                    if opp_active_list and opp_active_list[0] is not None:
+                        opp_act = opp_active_list[0]
+                        opp_act_hp = opp_act.get("hp", 999) if isinstance(opp_act, dict) else getattr(opp_act, "hp", 999)
+                        opp_act_max_hp = opp_act.get("maxHp", 999) if isinstance(opp_act, dict) else getattr(opp_act, "maxHp", 999)
+                        # Reward attacking if opponent active is a low-HP basic (stalling)
+                        if opp_act_max_hp <= 100 and game_phase in ("early", "mid") and opp_prizes >= 4:
+                            if triggered == "NONE":  # Only apply if no stronger rule already fired
+                                bonus += 0.20
+                                triggered = "Attack_Stalling_Low_HP_Basic"
+        except Exception:
+            pass
+
+    # -------------------------------------------------------------------------
+    # NEW 5. Free-Retreat Pivot When Active Has 0 Energy (from 88415303 loss)
+    #
+    # When active Pokémon has 0 energy and faces a high-HP threat, use Mimikyu
+    # (free retreat) or retreat to preserve position. Staying in active with 0
+    # energy means we cannot attack or deal damage.
+    # -------------------------------------------------------------------------
+    if opt_type in (12, OptionType.RETREAT) and my_active_energy == 0:
+        # Retreating a 0-energy active is almost always correct (it cannot attack)
+        if my_active_id in (TAROUNTULA_ID, MIMIKYU_ID, ARTICUNO_ID):
+            if my_active_id == MIMIKYU_ID:
+                bonus += 0.25  # Free retreat — no energy cost at all
+                triggered = "Pivot_Mimikyu_Free_Retreat_0Energy"
+            elif my_active_id in (TAROUNTULA_ID, ARTICUNO_ID):
+                bonus += 0.15  # 1 energy retreat — small but correct
+                triggered = "Pivot_Basic_Retreat_0Energy"
+
+    # -------------------------------------------------------------------------
+    # NEW 6. Giovanni Gust on Evolving Stage 1 (universal — vs water ramp / other evo decks)
+    #
+    # When opponent has a Stage 1 Pokémon on the bench that could evolve to a
+    # 300-400HP Stage 2 ex, gusting it with Giovanni and KO'ing it is priority.
+    # -------------------------------------------------------------------------
+    if opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) == 1218:  # TR-Giovanni
+        if not is_grimmsnarl_opponent:  # Grimmsnarl rule already handled this above
+            # Check if opponent bench has a Stage 1 evolution Pokémon (medium HP)
+            try:
+                current = getattr(obs, "current", None)
+                if current is not None:
+                    yi = getattr(current, "yourIndex", 0) if not isinstance(current, dict) else current.get("yourIndex", 0)
+                    players = getattr(current, "players", []) if not isinstance(current, dict) else current.get("players", [])
+                    if len(players) >= 2:
+                        opp_ps = players[1 - yi]
+                        opp_bench = getattr(opp_ps, "bench", []) if not isinstance(opp_ps, dict) else opp_ps.get("bench", [])
+                        for b in opp_bench:
+                            if b is not None:
+                                b_hp = b.get("maxHp", 0) if isinstance(b, dict) else getattr(b, "maxHp", 0)
+                                b_cur_hp = b.get("hp", 0) if isinstance(b, dict) else getattr(b, "hp", 0)
+                                # A Stage 1 typically has 80-130 HP range
+                                if 80 <= b_hp <= 150 and game_phase in ("early", "mid") and opp_prizes >= 4:
+                                    bonus += 0.20
+                                    triggered = "Giovanni_Gust_Evolving_Stage1"
+                                    break
+            except Exception:
+                pass
+
+    # Bound bonus within [-0.40, +0.40]: allow meaningful penalties for critical errors
     # (old ceiling was +0.20 which silently truncated important heuristics like Starmie gust +0.25)
-    bonus = max(-0.30, min(0.40, bonus))
+    bonus = max(-0.40, min(0.40, bonus))
     return bonus, triggered
