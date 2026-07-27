@@ -73,7 +73,8 @@ def get_card_data(card_id: int):
 def is_defensive_blocker(c):
     if c is None or c.cardType != CardType.POKEMON:
         return False
-    return c.basic and not c.ex and (c.name not in evolves_from_set)
+    # Exclude Mimikyu (434) — Team Rocket's Mimikyu has 60 HP and NO Safeguard ability!
+    return c.basic and not c.ex and (c.name not in evolves_from_set) and c.cardId != 434
 
 def can_attack(card_id: int, energy_count: int):
     c = get_card_data(card_id)
@@ -238,7 +239,8 @@ def rule_based_opponent_agent(opponent_name, obs):
         "Rulebasedmodel_Garchomp_ex_2": ["hard.garchomp_ex_2_agent"],
         "Rulebasedmodel_HoOh_HeartGold": ["hard.hooh_heartgold_agent"],
         "Rulebasedmodel_Starmie_ex_2": ["hard.starmie_ex_2_agent"],
-        "Rulebasedmodel_Metagross_Grass": ["hard.metagross_grass_agent"]
+        "Rulebasedmodel_Metagross_Grass": ["hard.metagross_grass_agent"],
+        "DRAGOPULT": ["hard.dragapult_agent"]
     }
     
     modules = mapping.get(opponent_name, [opponent_name])
@@ -338,7 +340,12 @@ class GPUInferenceServer:
 
     def _loop(self, device):
         while self.running:
-            ready_conns = mp.connection.wait(self.parent_conns, timeout=self.timeout)
+            try:
+                ready_conns = mp.connection.wait(self.parent_conns, timeout=self.timeout)
+            except OSError:
+                # Catch WinError 1450 (Insufficient system resources on Windows named pipe I/O)
+                time.sleep(0.01)
+                continue
             if not ready_conns or not self.running:
                 continue
 
@@ -769,9 +776,19 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 
                 num_attacks = sum(1 for _, pre in player_samples if pre.get("action_type") == 13)
                 if i == result:
-                    if num_attacks == 0:
-                        # Zero reward for wins without attacking to prevent passive stall exploits.
-                        # Force the model to learn that active attacking is the path to win.
+                    # FIX #1: Allow full terminal reward for deckout wins (opp_deck_size == 0) even
+                    # when num_attacks == 0 — Mimikyu Safeguard stall-to-deckout is a legitimate win.
+                    # Only suppress terminal reward for passive wins where opponent still has deck cards.
+                    opp_decked_out = False
+                    try:
+                        final_obs_check = to_observation_class(obs)
+                        opp_idx = 1 - i
+                        opp_deck_remaining = len(final_obs_check.current.players[opp_idx].deck)
+                        opp_decked_out = (opp_deck_remaining == 0)
+                    except Exception:
+                        opp_decked_out = False
+                    if num_attacks == 0 and not opp_decked_out:
+                        # Suppress reward only for passive wins where opponent still has deck cards.
                         terminal_reward = 0.0
                     else:
                         terminal_reward = 5.0
@@ -790,6 +807,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 has_attacked_flag = False
                 has_taken_prize_flag = False
                 has_lost_prize_flag = False  # FIX #4: symmetric first-prize-lost penalty
+                # FIX #4 (retreat cooldown): track the game-turn of the last Mimikyu retreat so we
+                # can suppress the +0.60 loop reward if the agent retreated to Mimikyu recently.
+                last_mimikyu_retreat_turn = -999
                 for step_idx in range(n_steps):
                     sample_obj, pre = player_samples[step_idx]
                     
@@ -920,9 +940,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         
                         # Anti-Overbenching Penalty (-0.15 for bench >= 3 against Dragapult, >= 4 generic)
                         if played_card is not None and played_card.cardType == CardType.POKEMON and played_card.basic:
-                            opp_b_ids = pre.get("opp_bench_ids", [])
-                            opp_act_id = pre.get("opp_active_id", -1)
-                            is_dragapult = any(get_card_data(cid) is not None and any(kw in get_card_data(cid).name.lower() for kw in ["dreepy", "drakloak", "dragapult"]) for cid in opp_b_ids + [opp_act_id])
+                            # FIX #5: check POST state so penalty doesn't fire the turn Dragapult is KO'd.
+                            opp_b_ids_post = post.get("opp_bench_ids", [])
+                            opp_act_id_post = post.get("opp_active_id", -1)
+                            is_dragapult = any(get_card_data(cid) is not None and any(kw in get_card_data(cid).name.lower() for kw in ["dreepy", "drakloak", "dragapult"]) for cid in opp_b_ids_post + [opp_act_id_post])
                             max_bench_limit = 3 if is_dragapult else 4
                             if post.get("bench_size", 0) >= max_bench_limit:
                                 r_strategic -= 0.15  # Anti-overbenching penalty
@@ -1021,8 +1042,15 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 # Promoted a non-blocker, non-attacker when we had other options
                                 r_strategic -= 0.20
                             elif promoted_is_blocker:
-                                # Promoted a blocker (meaningful play to stall/protect bench)
+                                opp_active_card = get_card_data(pre.get("opp_active_id"))
+                                opp_is_ex = opp_active_card is not None and (getattr(opp_active_card, "ex", False) or getattr(opp_active_card, "megaEx", False) or "ex" in getattr(opp_active_card, "name", "").lower())
                                 r_strategic += 0.20
+                            
+                            # Darkness Weakness Guard: Severe penalty for promoting 60 HP Mimikyu (434)
+                            # against Darkness-type attackers (e.g. Grimmsnarl ex 648) due to 2x weakness!
+                            opp_act_c = get_card_data(pre.get("opp_active_id"))
+                            if promoted_id == 434 and opp_act_c is not None and getattr(opp_act_c, "energyType", None) == EnergyType.DARKNESS:
+                                r_strategic -= 0.50  # Suicidal promotion into Darkness 2x weakness!
                     
                     # 1. Stadium Establishment
                     if pre.get("stadium_id") != post.get("stadium_id") and post.get("stadium_id") != -1:
@@ -1042,14 +1070,18 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 r_strategic += 0.08
                                 
                             # Board development: play basic Pokemon to bench
-                            if played_card.cardType == CardType.POKEMON:
-                                if played_card.basic:
-                                    if played_card.ex:
-                                        r_strategic += 0.10  # Basic ex setup reward
-                                    elif played_card.name in evolves_from_set:
-                                        r_strategic += 0.15  # Basic evolvable setup reward
-                                    else:
-                                        r_strategic += 0.05  # Other basic setup reward
+                            if played_card.cardType == CardType.POKEMON and not getattr(played_card, "stage1", False) and not getattr(played_card, "stage2", False):
+                                pre_bench_count = len(pre.get("bench_ids", []))
+                                if pre_bench_count == 0:
+                                    r_strategic += 0.40  # Emergency bench setup: prevents 0-bench instant wipeout!
+                                elif played_card.cardId == 431:
+                                    r_strategic += 0.35  # Mewtwo ex setup
+                                    if pre.get("turn", 1) <= 5:
+                                        r_strategic += 0.25  # Fast Early Aggro Bonus: Benched Mewtwo ex on Turns 1-5!
+                                elif played_card.cardId in [400, 434, 414]:
+                                    r_strategic += 0.25  # Tarountula / Mimikyu / Articuno setup
+                                else:
+                                    r_strategic += 0.15
                                         
                             # Search efficiency: playing item/supporter with search/draw text
                             elif played_card.cardType in [CardType.ITEM, CardType.SUPPORTER] and any(
@@ -1289,22 +1321,23 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 else:
                                     r_strategic -= 0.15  # Night Stretcher would have been better — wasted single-copy
 
-                            # Giovanni: reward playing with a charged TR active ready to attack
+                            # Team Rocket's Giovanni (1218): Double Switch / Gust (Switches your Active TR Pokemon & Gusts opp bench)
                             elif played_id == 1218:  # Team Rocket's Giovanni
-                                active_c = get_card_data(pre.get("active_id"))
-                                if active_c is not None:
-                                    att_costs = [len(attack_table.get(aid).energies) for aid in active_c.attacks if attack_table.get(aid)]
-                                    min_cost  = min(att_costs) if att_costs else 99
-                                    is_charged = pre.get("active_energies", 0) >= min_cost
-                                    is_tr = getattr(active_c, "name", "").startswith("Team Rocket")
-                                    if is_charged and is_tr:
-                                        r_strategic += 0.20  # Giovanni played with ready-to-attack TR Pokemon
-                                    elif is_charged:
-                                        r_strategic += 0.10  # Charged but non-TR active
-                                    else:
-                                        r_strategic -= 0.10  # Giovanni with un-charged active = wasted Supporter
+                                opp_bench_count = len(pre.get("opp_bench_ids", []))
+                                if opp_bench_count > 0:
+                                    r_strategic += 0.20  # Double Switch / Gust execution onto opp bench target
                                 else:
-                                    r_strategic -= 0.05
+                                    r_strategic += 0.05  # Played for self-switch only
+
+                            # Key Supporters & Search Items Rewards
+                            elif played_id in [1216, 1227]:  # Ariana / Lillie's Determination
+                                r_strategic += 0.15  # Draw / Hand Reset Supporter Execution
+                            elif played_id in [1219, 1220]:  # Petrel / Proton
+                                r_strategic += 0.15  # Deck Search / Topdeck Manipulate Supporter Execution
+                            elif played_id == 1134:  # Team Rocket's Transceiver
+                                r_strategic += 0.12  # Fetch Supporter Item Execution
+                            elif played_id == 1094:  # Bug Catching Set
+                                r_strategic += 0.12  # Grass Search Item Execution
 
                             # Fallback: general Supporter dead usage penalty
                             elif played_card.cardType == CardType.SUPPORTER and played_id not in [1216, 1217, 1218, 1219, 1220, 1227]:
@@ -1321,6 +1354,31 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         attached_card = get_card_data(attached_id)
                         target_card = get_card_data(target_id)
                         
+                        # -------------------------------------------------------
+                        # BENCH OVER-CHARGE GUARD
+                        # Max 2 energies per bench Pokémon (rule from real deck play).
+                        # Retreat costs: Spidops=2, Mewtwo ex=3, Articuno=1, Tarountula=1
+                        # Charging beyond 2 on bench wastes energy that retreating discards.
+                        # Active Pokémon may need up to 4 energies (Power Saver) — excluded.
+                        # -------------------------------------------------------
+                        is_bench_attach = (pre.get("active_id") != target_id)
+                        if is_bench_attach and target_id != -1:
+                            target_bench_idx = pre.get("attached_target_bench_idx", -1)
+                            benched_energies = pre.get("bench_energies", [])
+                            if target_bench_idx >= 0 and target_bench_idx < len(benched_energies):
+                                current_bench_e = benched_energies[target_bench_idx]
+                            else:
+                                benched_ids = pre.get("bench_ids", [])
+                                try:
+                                    b_idx = benched_ids.index(target_id)
+                                    current_bench_e = benched_energies[b_idx] if b_idx < len(benched_energies) else 0
+                                except ValueError:
+                                    current_bench_e = 0
+                            
+                            if current_bench_e >= 2:
+                                # Over-charging bench Pokémon — 3rd+ energy is wasteful
+                                r_strategic -= 0.30  # Bench over-charge penalty
+                        
                         if attached_card is not None and target_card is not None:
                             # FIX #1: Unified Mimikyu charging reward — was two sequential `if` blocks
                             # that both fired simultaneously (double reward +0.45 per step).
@@ -1331,12 +1389,15 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 s.name == "Safeguard" or "ex" in s.text.lower()
                                 for s in getattr(opp_active_card, "skills", [])
                             )
-                            charging_mimikyu = (target_id == 434 and opp_is_ex)
+                            # Mimikyu 434 has Gemstone Mimicry (copies Tera attacks).
+                            # Only reward charging Mimikyu 434 if opponent active is a Tera Pokemon (e.g. Dragapult ex 121)
+                            opp_is_tera = opp_active_card is not None and (any(kw in opp_active_card.name.lower() for kw in ["dragapult", "tera"]) or getattr(opp_active_card, "terastal", False))
+                            charging_mimikyu = (target_id == 434 and opp_is_tera)
                             if target_id == 434 and target_id in pre.get("bench_ids", []):
-                                if opp_has_safeguard:
-                                    r_strategic += 0.15  # Safeguard scenario — smaller bonus (Mimikyu immune but Safeguard covers it)
-                                elif opp_is_ex:
-                                    r_strategic += 0.30  # Standard ex-opponent Mimikyu charging reward
+                                if opp_is_tera:
+                                    r_strategic += 0.30  # Mimikyu charging to copy Tera attack (Gemstone Mimicry)
+                                else:
+                                    r_strategic -= 0.10  # Waste of energy charging 60 HP Mimikyu vs non-Tera opponent
 
                             # Defensive/barrier blockers should never get energy attachments
                             # Exception: Mimikyu acts as an attacker vs ex opponents — don't penalise it
@@ -1506,6 +1567,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         if evolved_card is not None:
                             if evolved_id == 401 or getattr(evolved_card, "cardId", -1) == 401:
                                 r_strategic += 0.25  # High priority Spidops evolution reward
+                                if pre.get("turn", 1) <= 5:
+                                    r_strategic += 0.15  # Early Spidops Speed Bonus (Turns 2-5): Protects 50 HP Tarountula from bench sniping!
                             elif evolved_card.stage1 or evolved_card.stage2:
                                 r_strategic += 0.15  # Evolution setup reward
                             else:
@@ -1519,13 +1582,50 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         opp_active_card = get_card_data(pre.get("opp_active_id"))
                         active_card = get_card_data(pre.get("active_id"))
                         post_active_card = get_card_data(post.get("active_id"))
+                        active_id_pre = pre.get("active_id", -1)
+                        active_energies = pre.get("active_energies", 0)
+                        has_attack_option = pre.get("has_attack_option", False)
                         
-                        # Strategic retreat from ex-immunity (e.g. Safeguard)
-                        opp_has_immunity = opp_active_card is not None and any(s.name == "Safeguard" or "ex" in s.text.lower() for s in getattr(opp_active_card, "skills", []))
+                        # -------------------------------------------------------
+                        # ENERGY WASTE PENALTY — Per-Pokémon Retreat Costs
+                        # Retreat costs: Mimikyu=0 (free), Tarountula=1,
+                        #                Articuno=1, Spidops=2, Mewtwo ex=3
+                        # Energy discarded on retreat = min(attached, retreat_cost)
+                        # -------------------------------------------------------
+                        RETREAT_COSTS = {
+                            434: 0,  # Mimikyu — free retreat, NO penalty
+                            400: 1,  # Tarountula
+                            414: 1,  # Articuno
+                            401: 2,  # Spidops
+                            431: 3,  # Mewtwo ex
+                        }
+                        retreat_cost = RETREAT_COSTS.get(active_id_pre, 1)
+                        energy_discarded = min(active_energies, retreat_cost)
+                        
+                        if retreat_cost > 0 and energy_discarded > 0 and has_attack_option:
+                            # Wasting energy to retreat when attack was available:
+                            # Scale penalty by energies actually discarded.
+                            # Spidops is most critical — it costs 2 to retreat AND
+                            # can attack at 2G (Silky String) or 3G (String Bomb).
+                            if active_id_pre == 401:  # Spidops (retreat cost 2)
+                                # Retreating Spidops with energy wastes attack turns
+                                r_strategic -= 0.40 * energy_discarded  # -0.40 at 1E, -0.80 at 2E+
+                            elif active_id_pre == 431:  # Mewtwo ex (retreat cost 3)
+                                # Handled by existing KO-prevention guard below
+                                pass
+                            else:
+                                # Tarountula / Articuno — smaller penalty
+                                r_strategic -= 0.15 * energy_discarded
+                        
+                        # Strategic retreat from ex-immunity (e.g. Crustle 345, Safeguard)
+                        opp_has_immunity = opp_active_card is not None and (
+                            opp_active_card.cardId == 345 or 
+                            any(getattr(s, "name", "") == "Safeguard" or "ex" in getattr(s, "text", "").lower() for s in getattr(opp_active_card, "skills", []))
+                        )
                         
                         if opp_has_immunity:
                             if active_card is not None and active_card.ex and post_active_card is not None and not post_active_card.ex:
-                                r_strategic += 0.30  # Excellent retreat to non-ex attacker against immune opponent!
+                                r_strategic += 0.35  # Excellent retreat to non-ex attacker (Spidops 401) against Crustle / immune opponent!
                             elif post_active_card is not None and is_defensive_blocker(post_active_card):
                                 r_strategic += 0.20  # Defensive retreat to blocker to stall
                         elif active_card is not None and active_card.ex and pre.get("active_energies", 0) >= 3:
@@ -1536,10 +1636,25 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 if opp_hp <= 280:
                                     r_strategic -= 0.80  # Strong penalty for fleeing when KO is guaranteed
                                     
-                        # Strategic retreat to Mimikyu Wall (434) against opponent ex Pokemon
-                        opp_is_ex = opp_active_card is not None and getattr(opp_active_card, "ex", False)
-                        if opp_is_ex and post_active_card is not None and post_active_card.cardId == 434:
-                            r_strategic += 0.60  # Reward retreating to Mimikyu wall to stall/neutralise opponent ex!
+                        # Anti-Double-KO Bench Safety & Darkness Weakness Guards:
+                        active_hp_pre = pre.get("active_hp", 999)
+                        opp_has_bench_snipe = (opp_active_card is not None and (
+                            opp_active_card.cardId in [648, 121] or 
+                            any(kw in opp_active_card.name.lower() for kw in ["grimmsnarl", "dragapult", "shrouded", "bench"])
+                        ))
+                        
+                        # Guard 1: Do NOT retreat low-HP active (<= 30 HP) to bench if opponent has bench snipe!
+                        if active_hp_pre <= 30 and opp_has_bench_snipe:
+                            r_strategic -= 0.50  # Prevents setting up an easy double-KO bench snipe!
+                            
+                        # Guard 2: Do NOT retreat into 60 HP Mimikyu (434) against Darkness-type attackers!
+                        if post_active_card is not None and post_active_card.cardId == 434:
+                            opp_is_darkness = opp_active_card is not None and (getattr(opp_active_card, "energyType", None) == EnergyType.DARKNESS or "grimmsnarl" in opp_active_card.name.lower())
+                            if opp_is_darkness:
+                                r_strategic -= 0.50  # Suicidal retreat to Mimikyu vs Darkness 2x weakness!
+                            elif opp_active_card is not None and any(kw in opp_active_card.name.lower() for kw in ["dragapult", "tera"]):
+                                if pre.get("active_energies", 0) >= 2:
+                                    r_strategic += 0.30  # Good: Retreat to Mimikyu ready to copy Tera attack!
                             
                         # KO Prevention: Strategic retreat from damaged Mewtwo ex (431) to a defensive blocker (Articuno/Wobbuffet/Mimikyu)
                         if active_card is not None and active_card.cardId == 431:
@@ -1554,8 +1669,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         
                         opp_active_card = get_card_data(pre.get("opp_active_id"))
                         active_card = get_card_data(pre.get("active_id"))
-                        opp_immune = (opp_active_card is not None and active_card is not None and active_card.ex and 
-                                      any(s.name == "Safeguard" or "ex" in s.text.lower() for s in getattr(opp_active_card, "skills", [])))
+                        opp_immune = (opp_active_card is not None and active_card is not None and active_card.ex and (
+                            opp_active_card.cardId == 345 or 
+                            any(getattr(s, "name", "") == "Safeguard" or "ex" in getattr(s, "text", "").lower() for s in getattr(opp_active_card, "skills", []))
+                        ))
                         
                         if has_attack and not opp_immune:
                             r_strategic -= 0.40  # FIX #8: Reduced from -0.80 — was dominating PER sampling
@@ -1577,12 +1694,17 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     elif action_type == 13:  # ATTACK
                         opp_active_card = get_card_data(pre.get("opp_active_id"))
                         active_card = get_card_data(pre.get("active_id"))
-                        opp_immune = (opp_active_card is not None and active_card is not None and active_card.ex and 
-                                      any(s.name == "Safeguard" or "ex" in s.text.lower() for s in getattr(opp_active_card, "skills", [])))
+                        opp_immune = (opp_active_card is not None and active_card is not None and active_card.ex and (
+                            opp_active_card.cardId == 345 or 
+                            any(getattr(s, "name", "") == "Safeguard" or "ex" in getattr(s, "text", "").lower() for s in getattr(opp_active_card, "skills", []))
+                        ))
                         
                         if opp_immune:
-                            r_strategic -= 0.20  # Wastes turn to attack immune opponent
+                            r_strategic -= 0.60  # Wastes turn to attack ex-immune opponent (e.g. Crustle 345)
                         else:
+                            if opp_active_card is not None and opp_active_card.cardId == 345 and active_card is not None and active_card.cardId == 401:
+                                r_strategic += 0.40  # Spidops 1-shots Crustle (ex-killer counter)!
+                            
                             att_id = pre.get("attack_id", -1)
                             if att_id == 560:  # Rocket Rush
                                 # Count Team Rocket Pokemon in play (active + bench) in pre state
@@ -1606,7 +1728,17 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 if healed > 0:
                                     r_strategic += 0.02 * healed
                             elif active_card is not None and active_card.cardId == 431:
-                                r_strategic += 0.35  # Calibrated: reward attacking with Mewtwo ex
+                                # C1 — Power Saver Bench Gate: only reward if 4+ TR Pokémon are in play
+                                tr_count_mewtwo = 0
+                                if is_tr_pokemon(pre.get("active_id", -1)):
+                                    tr_count_mewtwo += 1
+                                for bid in pre.get("bench_ids", []):
+                                    if is_tr_pokemon(bid):
+                                        tr_count_mewtwo += 1
+                                if tr_count_mewtwo >= 4:
+                                    r_strategic += 0.35  # Power Saver fully live — 4+ TR Pokémon in play!
+                                else:
+                                    r_strategic -= 0.20  # Power Saver will fail (< 4 TR Pokémon) — penalize this attack!
                             elif active_card is not None and active_card.cardId == 414:  # Team Rocket's Articuno
                                 r_strategic += 0.30  # Calibrated: reward Articuno Dark Frost rush
                                 if pre.get("turn", 0) <= 3:
@@ -1628,13 +1760,36 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         if (attached_cid == 15 or pre.get("card_id") == 15) and (target_cid == 414 or pre.get("target_id") == 414):
                             r_strategic += 0.20  # Powering up Articuno Dark Frost
 
+                    # H5 — Reward Mimikyu free-retreat pivot (0 retreat cost, bring Mewtwo ex / Spidops active)
+                    if action_type == 12:  # RETREAT
+                        active_id_pre = pre.get("active_id", -1)
+                        if active_id_pre == 434:  # Mimikyu free retreat
+                            r_strategic += 0.10  # Free pivot — brings Mewtwo ex or Spidops active at no energy cost
+
+                    # M4 — Reward Spidops Charging Up ability activation (recycles Basic Energy from discard)
+                    if action_type == 11:  # ABILITY
+                        active_id_pre = pre.get("active_id", -1)
+                        if active_id_pre == 401:  # Spidops Charging Up
+                            r_strategic += 0.10  # Energy recycling from discard — powers up Spidops for free!
+
                     # Reward playing Transceiver/Poffin/Proton when bench_size == 0 (prevent lone active wipe)
                     if action_type in (6, 7):  # PLAY SUPPORTER/CARD
                         played_cid = pre.get("played_card_id", -1)
                         if pre.get("bench_size", 0) == 0 and (played_cid in (1134, 1086, 1220) or pre.get("card_id") in (1134, 1086, 1220)):
                             r_strategic += 0.20  # Emergency bench search on 0 bench
-                        elif (played_cid == 1218 or pre.get("card_id") == 1218) and pre.get("active_energies", 0) >= 1:
-                            r_strategic += 0.10  # Early Giovanni Aggro Damage Boost ONLY if active is charged
+                        elif (played_cid == 1218 or pre.get("card_id") == 1218):
+                            opp_bench_count = len(pre.get("opp_bench_ids", []))
+                            if opp_bench_count > 0:
+                                r_strategic += 0.20  # Reward Giovanni Double Switch / Gust maneuver to switch active & pull opp bench!
+                        elif played_cid == 1159 or pre.get("card_id") == 1159:
+                            r_strategic += 0.20  # Reward equipping Hero's Cape (+100 HP ACE SPEC Tool)
+                        elif played_cid == 1220 or pre.get("card_id") == 1220:  # H4 — Proton bench search
+                            if pre.get("turn", 1) <= 1:
+                                r_strategic += 0.30  # Turn 1 Proton — search 3 TR Basics immediately! Massive tempo play.
+                            elif pre.get("bench_size", 5) < 3:
+                                r_strategic += 0.15  # Urgently build bench for Power Saver threshold
+                            else:
+                                r_strategic += 0.10  # Standard bench search value
                         elif played_cid == 1227 or pre.get("card_id") == 1227:
                             my_deck_size = pre.get("deck_size", 40)
                             my_hand_size = pre.get("hand_size", 5)
@@ -1647,6 +1802,21 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 r_strategic += 0.10  # Good net card draw gain
                             elif my_hand_size >= 6 and hand_diff <= 0:
                                 r_strategic -= 0.05  # Wasteful hand reset on rich hand
+
+                        # H3 — TR Factory + TR Supporter combo: +2 draw bonus synergy
+                        # Detect if Factory was already in play (pre state) and a TR Supporter was played
+                        TR_SUPPORTER_CDS = {1216, 1218, 1219, 1220}
+                        played_cid_now = played_cid if played_cid != -1 else pre.get("card_id", -1)
+                        if played_cid_now in TR_SUPPORTER_CDS:
+                            factory_in_play = (pre.get("stadium_id", -1) == 1257)
+                            if factory_in_play:
+                                r_strategic += 0.15  # TR Factory + TR Supporter combo — draw 2 extra cards!
+
+                        # H2 — Articuno bench placement reward (Repelling Veil protects Basic TR Pokémon)
+                        if played_cid_now == 414:  # Playing Articuno onto the bench
+                            bench_size_pre = pre.get("bench_size", 5)
+                            if bench_size_pre < 5:
+                                r_strategic += 0.10  # Articuno Repelling Veil shields Tarountula/Mimikyu from effects
                             
                     # 3. Bench Quality & Overextension Management
                     r_bench = 0.0
@@ -1670,10 +1840,15 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             if post.get("active_energies", 0) < 2:
                                 r_strategic -= 0.02  # Penalty for having a weak/undercharged attacker active
 
-                            
+                    # 5. Universal Deckout Patience Reward (FIX #6)
+                    # Reward ending turn when opponent is close to decking out, regardless of matchup.
+                    # Previously this only fired for Abomasnow; generalized here so control/stall
+                    # strategies are rewarded against ANY opponent running low on deck cards.
+                    opp_deck_size = pre.get("opp_deck_size", 40)
+                    if action_type == 14 and opp_deck_size <= 10:
+                        r_strategic += 0.15  # Patience pays: opponent near deckout, correct to end turn
 
-                        
-                    # 5. Opponent-Specific Counter Rewards
+                    # 6. Opponent-Specific Counter Rewards
                     if i == 0:
                         opp_active_now = pre.get("opp_active_id", -1)
                         my_active_now = pre.get("active_id", -1)
@@ -1686,13 +1861,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             # Reward attacking Snover (722) or Kyogre (721) -- easy prizes before full setup
                             if action_type == 13 and opp_active_now in [721, 722]:
                                 r_strategic += 0.15
-                            # Tactic 3: Exploit retreat-4 lock & Mimikyu Wall vs Abomasnow ex (723)
+                            # Tactic 3: Exploit retreat-4 lock & Spidops attacker vs Abomasnow ex (723)
                             if opp_active_now == 723:
-                                if my_active_now == 434:  # Mimikyu is active wall
-                                    r_strategic += 0.15
-                                    # Reward attacking with Mimikyu to chip or build pressure
-                                    if action_type == 13: 
-                                        r_strategic += 0.10
+                                if my_active_now == 434:  # 60 HP Mimikyu is fragile vs 250 dmg Abomasnow
+                                    r_strategic -= 0.10
                                 elif my_active_now == 401:  # Spidops is non-ex attacker (deals 180 dmg with Rocket Rush)
                                     # Reward Spidops active when ready to attack
                                     if pre.get("active_energies", 0) >= 2:
@@ -1713,7 +1885,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                     r_strategic += 0.10
                             # Reward patience (end turn) when Abomasnow is close to self-deckout via Hammer-lanche
                             if opp_deck_size <= 10 and action_type == 14:
-                                    r_strategic += 0.15
+                                r_strategic += 0.15
                                     
                         # --- DRAGOPULT COUNTERS ---
                         elif opponent_name == "Rulebasedmodel_Dragapult":
@@ -1763,7 +1935,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     if post["deck_size"] == 0:
                         r_deck -= 0.50  # Penalize imminent deckout only
                         
-                    step_reward = r_stall + r_prize_t + r_prize_l + r_ko + r_own_ko + r_en + r_no_en + r_bench + r_deck + r_strategic
+                    # FIX #3: Scale r_strategic by 0.12 so accumulated step rewards stay well below
+                    # the terminal reward magnitude (±5.0). Without scaling, 100 steps × r_strategic
+                    # can reach ±15.0 and cause the value head to ignore the terminal win/loss signal.
+                    STRATEGIC_SCALE = 0.12
+                    step_reward = r_stall + r_prize_t + r_prize_l + r_ko + r_own_ko + r_en + r_no_en + r_bench + r_deck + (r_strategic * STRATEGIC_SCALE)
                     step_reward = max(-1.0, min(1.0, step_reward))  # Clip step_reward to [-1.0, 1.0] for PER stability
                     
                     if i == 0:
@@ -1801,8 +1977,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     
                 for step_idx in range(n_steps):
                     sample_obj, _ = player_samples[step_idx]
-                    # Widen clip to ±5 so terminal reward (±5.0) signal survives the GAE return
-                    sample_obj.value = max(-5.0, min(5.0, returns[step_idx]))
+                    # FIX #2: Widen clip to ±20 so GAE returns carrying dense step signal
+                    # survive into value training targets. The /5.0 normalisation at L2631
+                    # then maps these into [-4, +4] for the value head — well within its range.
+                    # (Previous ±5 clip discarded all step reward signal above the terminal magnitude.)
+                    sample_obj.value = max(-20.0, min(20.0, returns[step_idx]))
                     td_error = returns[step_idx] - sample_obj.pred_val
                     processed_samples.append((sample_obj, td_error))
 
@@ -2040,7 +2219,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for model training (default: 128)")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate (default: 5e-5)")
     parser.add_argument("--patience", type=int, default=10, help="Patience for early stopping based on evaluation win rate (default: 10)")
-    parser.add_argument("--num-workers", type=int, default=max(1, mp.cpu_count() - 1), help="Number of parallel worker processes")
+    default_workers = min(8, max(1, mp.cpu_count() - 1)) if sys.platform == "win32" else max(1, mp.cpu_count() - 1)
+    parser.add_argument("--num-workers", type=int, default=default_workers, help="Number of parallel worker processes")
     parser.add_argument("--disable-league", action="store_true", help="Disable league play and checkpoint saving in league directory")
     args = parser.parse_args()
 
@@ -2053,12 +2233,19 @@ def main():
 
     opponent_decks = load_all_decks()
     allowed_opponents = [
-        "Current (Self)", "Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo",
-        "Rulebasedmodel_Mewtwo_Wobbuffet", "Rulebasedmodel_Dragapult", "Rulebasedmodel_Abomasnow",
-        "Rulebasedmodel_Lucario", "Rulebasedmodel_Crustle", "Rulebasedmodel_Starmie",
+        "Current (Self)",
+        # --- EASY OPPONENT DECKS ---
+        "Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Abomasnow",
+        "Rulebasedmodel_Crustle", "Rulebasedmodel_Honchkrow", "Rulebasedmodel_Lopunny",
+        "Rulebasedmodel_Marnie_Kangaskhan", "Rulebasedmodel_Typhlosion",
+        # --- HARD OPPONENT DECKS ---
+        "Rulebasedmodel_Dragapult", "Rulebasedmodel_Lucario", "Rulebasedmodel_Starmie",
         "Rulebasedmodel_Dipplin", "Rulebasedmodel_Iono", "Rulebasedmodel_Archaludon",
         "Rulebasedmodel_Alakazam", "Rulebasedmodel_Kangaskhan_Crustle", "Rulebasedmodel_Grimmsnarl",
-        "Rulebasedmodel_Trevenant"
+        "Rulebasedmodel_Trevenant", "Rulebasedmodel_Mewtwo_Wobbuffet", "Rulebasedmodel_Garchomp_ex",
+        "Rulebasedmodel_Garchomp_ex_2", "Rulebasedmodel_Grimmsnarl_ex", "Rulebasedmodel_HoOh_HeartGold",
+        "Rulebasedmodel_Hydrapple_ex", "Rulebasedmodel_Hydrapple_Ogerpon", "Rulebasedmodel_Metagross_Grass",
+        "Rulebasedmodel_Ogerpon_ex", "Rulebasedmodel_Starmie_ex_2"
     ]
     opponent_decks = {k: v for k, v in opponent_decks.items() if k in allowed_opponents}
     if not opponent_decks:
@@ -2195,16 +2382,10 @@ def main():
     
     all_opponent_names = sorted([name for name in opponent_decks.keys() if name != "Current (Self)"])
     
-    # Train against all opponent decks (including Iono) to learn card-specific
-    # counters and strategies, and evaluate against all decks to check progress.
+    # Train against all opponent decks (from Rulebasedmodel/easy and Rulebasedmodel/hard)
+    # to learn card-specific counters and strategies, and evaluate against all decks.
     train_opponent_names = all_opponent_names
-    test_opponent_names = [
-        "Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Mewtwo", "Rulebasedmodel_Mewtwo_Wobbuffet",
-        "Rulebasedmodel_Dragapult", "Rulebasedmodel_Abomasnow", "Rulebasedmodel_Lucario",
-        "Rulebasedmodel_Crustle", "Rulebasedmodel_Starmie", "Rulebasedmodel_Dipplin",
-        "Rulebasedmodel_Iono", "Rulebasedmodel_Archaludon", "Rulebasedmodel_Alakazam",
-        "Rulebasedmodel_Kangaskhan_Crustle", "Rulebasedmodel_Grimmsnarl", "Rulebasedmodel_Trevenant"
-    ]
+    test_opponent_names = all_opponent_names
 
     print(f"Opponent Decks Configuration:")
     print(f"  -> Train Opponent Decks: {train_opponent_names}")
@@ -2362,7 +2543,8 @@ def main():
                 # are nearly random -- 60% league in epoch 1 = 60% random opponents, which stalls.
                 # Ramp from 0% to 50% league over the first 10 epochs, then hold at 50%.
                 can_use_league = bool(league_checkpoints)
-                league_prob = min(0.50, 0.05 * counter)  # 0% at epoch 0, 50% at epoch 10+
+                max_league_prob = getattr(args, "self_play_ratio", 0.10)
+                league_prob = min(max_league_prob, 0.02 * counter)  # Ramp up smoothly to max 10% (args.self_play_ratio)
                 use_league = can_use_league and bool(train_opponent_names) and (random.random() < league_prob)
 
                 if use_league:
