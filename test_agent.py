@@ -54,6 +54,8 @@ HARD_OPPONENTS = [
     "Rulebasedmodel_HoOh_HeartGold",
     "Rulebasedmodel_Starmie_ex_2",
     "Rulebasedmodel_Metagross_Grass",
+    "Rulebasedmodel_Tyranitar",
+    "Rulebasedmodel_Crustle_Stall",
     "DRAGOPULT"
 ]
 

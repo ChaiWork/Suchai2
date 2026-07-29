@@ -448,6 +448,47 @@ def get_expert_bonus(obs, option, opponent_name="unknown"):
             except Exception:
                 pass  # Fail open — no penalty on access error
 
+        # -------------------------------------------------------------------------
+        # TR Energy Conservation Rule: Save TR Energy (15) for Critical Situations
+        # -------------------------------------------------------------------------
+        try:
+            attached_card_id = getattr(option, "cardId", -1)
+            if my_ps is not None:
+                hand_cards = getattr(my_ps, "hand", []) if not isinstance(my_ps, dict) else my_ps.get("hand", [])
+                hand_cids = [c.get("id") if isinstance(c, dict) else getattr(c, "id", -1) for c in hand_cards if c]
+                has_basic_grass_in_hand = (1 in hand_cids)
+
+                # Check if critical situation (active HP <= 60, sole opponent active with 0 bench, or active needs immediate attack)
+                is_critical = False
+                opp_bench_cnt = 99
+                if opp_ps is not None:
+                    opp_bench_list = getattr(opp_ps, "bench", []) if not isinstance(opp_ps, dict) else opp_ps.get("bench", [])
+                    opp_bench_cnt = len([b for b in opp_bench_list if b])
+                
+                if opp_bench_cnt == 0:
+                    is_critical = True  # Instant game-winning KO opportunity!
+
+                if my_ps.active and my_ps.active[0] is not None:
+                    a_obj = my_ps.active[0]
+                    my_hp = a_obj.get("hp", 999) if isinstance(a_obj, dict) else getattr(a_obj, "hp", 999)
+                    if my_hp <= 60 or has_attack_option:
+                        is_critical = True
+
+                # Special Priority: If opponent has 0 bench, attach TR Energy immediately for instant win KO!
+                if attached_card_id == 15 and opp_bench_cnt == 0:
+                    bonus += 0.35
+                    triggered = "Instant_Win_KO_TR_Energy_Bonus"
+                # If attaching Team Rocket Energy (15) while Basic Grass Energy (1) IS in hand and situation is NOT critical
+                elif attached_card_id == 15 and has_basic_grass_in_hand and not is_critical:
+                    bonus -= 0.30
+                    triggered = "TR_Energy_Conservation_Penalty"
+                # If attaching Basic Grass Energy (1) when TR Energy is also in hand, give bonus to conserve TR energy
+                elif attached_card_id == 1 and (15 in hand_cids) and not is_critical:
+                    bonus += 0.20
+                    triggered = "Prefer_Basic_Grass_Energy_Bonus"
+        except Exception:
+            pass
+
         # Mewtwo ex (431) Green Energy Cap: Max 1 Green Energy (card ID 1) allowed!
         # 1 Green Energy fulfills 1 Colorless energy requirement (e.g. 1 TR Energy + 1 Green Energy = 3E for Psychic Burst).
         # Overcharging 2+ Green Energies on Mewtwo ex is forbidden (wastes Spidops' Grass energy).
@@ -1055,7 +1096,225 @@ def get_expert_bonus(obs, option, opponent_name="unknown"):
             except Exception:
                 pass
 
-    # Bound bonus within [-0.40, +0.40]: allow meaningful penalties for critical errors
-    # (old ceiling was +0.20 which silently truncated important heuristics like Starmie gust +0.25)
-    bonus = max(-0.40, min(0.40, bonus))
+    # -------------------------------------------------------------------------
+    # NEW 7. Full Metal Lab / Defense Stadium Contestation (Replay 88472281)
+    # -------------------------------------------------------------------------
+    if opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) in (1257, 1258, 1259):
+        try:
+            current = getattr(obs, "current", None)
+            if current is not None:
+                stadium_list = getattr(current, "stadium", []) if not isinstance(current, dict) else current.get("stadium", [])
+                active_stadium_ids = [s.get("id") if isinstance(s, dict) else getattr(s, "id", -1) for s in stadium_list]
+                if 1244 in active_stadium_ids:  # Full Metal Lab
+                    bonus += 0.30
+                    triggered = "Override_Full_Metal_Lab"
+        except Exception:
+            pass
+
+    # -------------------------------------------------------------------------
+    # NEW 8. Dusknoir Cursed Blast Burst Denial (Replay 88474377 / 88485012)
+    # -------------------------------------------------------------------------
+    is_dusknoir_opponent = any(kw in opp_lower for kw in ["dusknoir", "dusclops", "duskull"])
+    if is_dusknoir_opponent:
+        if opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) == 1218:  # Giovanni Gust
+            if any(k in str(getattr(option, "targetName", "")).lower() for k in ["duskull", "dusclops"]):
+                bonus += 0.30
+                triggered = "Giovanni_Gust_Duskull_Denial"
+
+    # -------------------------------------------------------------------------
+    # NEW 9. Spiky Energy Recoil Suicide Guard (Replay 88505471)
+    # -------------------------------------------------------------------------
+    if opt_type in (13, OptionType.ATTACK):
+        try:
+            current = getattr(obs, "current", None)
+            if current is not None:
+                yi = getattr(current, "yourIndex", 0) if not isinstance(current, dict) else current.get("yourIndex", 0)
+                players = getattr(current, "players", []) if not isinstance(current, dict) else current.get("players", [])
+                if len(players) >= 2:
+                    my_ps = players[yi]
+                    opp_ps = players[1 - yi]
+                    my_act = my_ps.active[0] if my_ps.active and my_ps.active[0] else None
+                    opp_act = opp_ps.active[0] if opp_ps.active and opp_ps.active[0] else None
+                    if my_act and opp_act:
+                        my_hp = my_act.get("hp", 999) if isinstance(my_act, dict) else getattr(my_act, "hp", 999)
+                        tools = opp_act.get("tools", []) if isinstance(opp_act, dict) else getattr(opp_act, "tools", [])
+                        tool_names = [str(t.get("name", "")).lower() for t in tools if t]
+                        if any("spiky" in tn for tn in tool_names) and my_hp <= 50:
+                            bonus -= 0.40
+                            triggered = "Spiky_Energy_Recoil_Suicide_Guard"
+        except Exception:
+            pass
+
+    # -------------------------------------------------------------------------
+    # NEW 10. Mega Lucario ex Counter Blueprint (Psychic Weakness & Riolu Gust)
+    # -------------------------------------------------------------------------
+    is_lucario_opp = any(kw in opp_lower for kw in ["lucario", "riolu", "solrock", "lunatone"])
+    if is_lucario_opp:
+        card_id = getattr(option, "cardId", -1)
+        # Priority 1: Gust Riolu or Solrock/Lunatone via Giovanni Gust before Lucario ex evolves
+        if opt_type in (7, OptionType.PLAY) and card_id == 1218:  # Giovanni Gust
+            target_name = str(getattr(option, "targetName", "")).lower()
+            if any(k in target_name for k in ["riolu", "solrock", "lunatone"]):
+                bonus += 0.30
+                triggered = "Giovanni_Gust_Riolu_Solrock_Denial"
+        # Priority 2: Charge TR Mewtwo ex (431) to exploit Lucario's 2x Psychic Weakness for 3-prize KO
+        elif opt_type in (8, OptionType.ATTACH):
+            target_area = getattr(option, "targetArea", None)
+            # If target card is Mewtwo ex (431)
+            target_cid = getattr(option, "cardIdTarget", -1)
+            if target_cid == 431 or target_area == 0:
+                bonus += 0.35
+                triggered = "Mewtwo_Psychic_Weakness_Vs_Lucario"
+        # Priority 3: Promote TR Mewtwo ex to Active when loaded to take 3-prize KO
+        elif opt_type in (11, OptionType.RETREAT):
+            promote_cid = getattr(option, "cardId", -1)
+            if promote_cid == 431:
+                bonus += 0.30
+                triggered = "Mewtwo_Promote_3Prize_Vs_Lucario"
+
+    # -------------------------------------------------------------------------
+    # NEW 11. Cynthia's Gible Evolution Denial (Replay 88477096)
+    # -------------------------------------------------------------------------
+    if "garchomp" in opp_lower or "gible" in opp_lower:
+        if opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) == 1218:  # Giovanni Gust
+            if "gible" in str(getattr(option, "targetName", "")).lower():
+                bonus += 0.25
+                triggered = "Giovanni_Gust_Gible_Denial"
+
+    # -------------------------------------------------------------------------
+    # NEW 12. Grimmsnarl / Froslass Engine Denial (Match Analysis)
+    # -------------------------------------------------------------------------
+    is_grimmsnarl_froslass_opp = any(kw in opp_lower for kw in ["grimmsnarl", "froslass", "munkidori", "snorunt"])
+    if is_grimmsnarl_froslass_opp:
+        # Priority 1: Target Froslass or Snorunt via Giovanni Gust to shut down damage spread
+        if opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) == 1218:  # Giovanni Gust
+            target_name = str(getattr(option, "targetName", "")).lower()
+            if any(k in target_name for k in ["froslass", "snorunt"]):
+                bonus += 0.35
+                triggered = "Giovanni_Gust_Froslass_Denial"
+        # Priority 2: Maintain full bench resilience vs Devolution TM plays
+        elif opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) in (400, 401, 414, 434):
+            try:
+                current = getattr(obs, "current", None)
+                if current is not None:
+                    yi = getattr(current, "yourIndex", 0) if not isinstance(current, dict) else current.get("yourIndex", 0)
+                    players = getattr(current, "players", []) if not isinstance(current, dict) else current.get("players", [])
+                    if len(players) >= 2:
+                        my_ps = players[yi]
+                        bench_cnt = len([b for b in my_ps.bench if b]) if hasattr(my_ps, "bench") else 0
+                        if bench_cnt < 4:
+                            bonus += 0.20
+                            triggered = "Grimmsnarl_Bench_Resilience"
+            except Exception:
+                pass
+
+    # -------------------------------------------------------------------------
+    # NEW 13. Dragapult ex Tabletop Counter (Articuno Shield, Mimikyu Wall & 320 KO)
+    # -------------------------------------------------------------------------
+    is_dragapult_opp = any(kw in opp_lower for kw in ["dragapult", "dreepy", "drakloak"])
+    if is_dragapult_opp:
+        card_id = getattr(option, "cardId", -1)
+        # Priority 1: Bench TR Articuno (414) for Repelling Veil bench damage shield vs Phantom Dive
+        if opt_type in (7, OptionType.PLAY) and card_id == 414:
+            bonus += 0.35
+            triggered = "Articuno_Bench_Shield_Vs_Dragapult"
+        # Priority 2: Bench/Search TR Mimikyu (434) as an ex-wall in mid/late game
+        elif opt_type in (7, OptionType.PLAY) and card_id == 434:
+            bonus += 0.30
+            triggered = "Mimikyu_Ex_Wall_Vs_Dragapult"
+        # Priority 3: Attach Brave Bangle (1175) to TR Mewtwo ex for 320 damage one-shot KO on Dragapult ex
+        elif opt_type in (7, OptionType.PLAY) and card_id == 1175:
+            bonus += 0.30
+            triggered = "Brave_Bangle_320KO_Vs_Dragapult"
+        # Priority 4: Play TR Proton (1220) early for setup consistency
+        elif opt_type in (7, OptionType.PLAY) and card_id == 1220 and game_phase == "early":
+            bonus += 0.25
+            triggered = "Proton_Early_Consistency"
+
+    # -------------------------------------------------------------------------
+    # NEW 14. Universal Tactical Anti-Mistake Guards (Replay 88624710)
+    # -------------------------------------------------------------------------
+    try:
+        current = getattr(obs, "current", None)
+        if current is not None:
+            yi = getattr(current, "yourIndex", 0) if not isinstance(current, dict) else current.get("yourIndex", 0)
+            players = getattr(current, "players", []) if not isinstance(current, dict) else current.get("players", [])
+            if len(players) >= 2:
+                my_ps = players[yi]
+                deck_cnt = my_ps.get("deckCount", 60) if isinstance(my_ps, dict) else getattr(my_ps, "deckCount", 60)
+                
+                # 14A. Self Deck-Out Danger Guard (-0.40 / -0.50 penalty)
+                if deck_cnt <= 6:
+                    card_id = getattr(option, "cardId", -1)
+                    if opt_type in (7, OptionType.PLAY) and card_id in (1227, 1094, 1152, 1257, 1216, 1219, 1220):
+                        bonus -= 0.45 if deck_cnt <= 4 else 0.35
+                        triggered = "Self_Deckout_Danger_Guard"
+                
+                # 14B. Pointless Retreat Without Attacking Guard (-0.35 penalty)
+                if opt_type in (11, OptionType.RETREAT):
+                    if has_attack_option:
+                        bonus -= 0.35
+                        triggered = "Pointless_Retreat_Guard"
+
+                # 14C. Energy Overcharging Guard (-0.35 penalty for 4+ energy on single unit)
+                if opt_type in (8, OptionType.ATTACH):
+                    my_act = my_ps.active[0] if my_ps.active and my_ps.active[0] else None
+                    if my_act:
+                        act_en = len(my_act.get("energies", [])) if isinstance(my_act, dict) else len(getattr(my_act, "energies", []))
+                        target_area = getattr(option, "targetArea", None)
+                        # If attaching to active that already has 3+ energies when bench has 0 energy Pokémon
+                        if target_area in (0, AreaType.ACTIVE) or getattr(option, "area", None) == 0:
+                            if act_en >= 3:
+                                bench_list = getattr(my_ps, "bench", []) if not isinstance(my_ps, dict) else my_ps.get("bench", [])
+                                uncharged_bench = any((len(b.get("energies", [])) == 0 if isinstance(b, dict) else len(getattr(b, "energies", [])) == 0) for b in bench_list if b)
+                                if uncharged_bench:
+                                    bonus -= 0.35
+                                    triggered = "Overcharge_Energy_Guard"
+    except Exception:
+        pass
+
+    # -------------------------------------------------------------------------
+    # NEW 15. Simbozz TR Mewtwo Domination Blueprint (Power Saver & Board Flood)
+    # -------------------------------------------------------------------------
+    try:
+        current = getattr(obs, "current", None)
+        if current is not None:
+            yi = getattr(current, "yourIndex", 0) if not isinstance(current, dict) else current.get("yourIndex", 0)
+            players = getattr(current, "players", []) if not isinstance(current, dict) else current.get("players", [])
+            if len(players) >= 2:
+                my_ps = players[yi]
+                # Count total Team Rocket Pokemon in play (active + bench)
+                tr_pkmn_ids = (400, 401, 414, 431, 434)
+                my_act_id = my_ps.active[0].get("id") if (my_ps.active and my_ps.active[0]) else -1
+                bench_list = getattr(my_ps, "bench", []) if not isinstance(my_ps, dict) else my_ps.get("bench", [])
+                bench_ids = [b.get("id") if isinstance(b, dict) else getattr(b, "id", -1) for b in bench_list if b]
+                
+                all_board_ids = ([my_act_id] if my_act_id > 0 else []) + bench_ids
+                tr_board_cnt = sum(1 for cid in all_board_ids if cid in tr_pkmn_ids)
+                
+                # Rule 15A. Power Saver Bench Fill: Prioritize boarding TR Pokemon when TR count < 4
+                if tr_board_cnt < 4 and opt_type in (7, OptionType.PLAY) and getattr(option, "cardId", -1) in (400, 414, 434):
+                    bonus += 0.35
+                    triggered = "Power_Saver_Bench_Fill_Bonus"
+                
+                # Rule 15B. Power Saver Safety: Avoid promoting Mewtwo ex if TR count < 4
+                if tr_board_cnt < 4 and opt_type in (11, OptionType.RETREAT):
+                    # If promoting Mewtwo ex while Power Saver is unsatisfied
+                    target_cid = getattr(option, "cardId", -1)
+                    if target_cid == 431:
+                        bonus -= 0.30
+                        triggered = "Power_Saver_Unsatisfied_Promote_Penalty"
+                        
+                # Rule 15C. Turn 1-2 Explosive Board Flood (Proton 1220 & Transceiver 1134)
+                if game_phase == "early" and tr_board_cnt < 4 and opt_type in (7, OptionType.PLAY):
+                    card_id = getattr(option, "cardId", -1)
+                    if card_id in (1220, 1134):
+                        bonus += 0.35
+                        triggered = "Turn1_Board_Flood_Proton_Transceiver"
+    except Exception:
+        pass
+
+    # Bound bonus within [-0.50, +0.40]: allow meaningful penalties for critical errors
+    bonus = max(-0.50, min(0.40, bonus))
     return bonus, triggered
+

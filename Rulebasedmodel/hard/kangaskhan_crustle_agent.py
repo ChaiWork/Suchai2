@@ -127,12 +127,18 @@ def agent(obs_dict: dict) -> list[int]:
                     score += 60
                 elif card.id in [Grow_Grass_Energy, Spiky_Energy, Mist_Energy, Basic_Grass_Energy]:
                     score += 40
+                elif card.id == Hand_Trimmer:
+                    opp_hand_len = len(state.players[1 - my_index].hand) if (state.players[1 - my_index] and state.players[1 - my_index].hand is not None) else 0
+                    if opp_hand_len >= 6:
+                        score += 55
+                    else:
+                        score += 20
+                elif card.id == Xerosic_Machinations:
+                    score += 50
                 elif card.id in [Hilda, Lillie_Determination]:
                     score += 35
                 elif card.id == Buddy_Buddy_Poffin:
                     score += 38
-                elif card.id == Xerosic_Machinations:
-                    score += 32
                 elif card.id == Battle_Cage:
                     score += 25
                 elif card.id == Jumbo_Ice_Cream:
