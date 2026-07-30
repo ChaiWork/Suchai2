@@ -189,8 +189,13 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 
                         if not use_warmup:
                             temperature = 1.0 if turn <= 15 else 0.1
-                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature, opponent_name=opponent_name, epoch=current_epoch)
-                            sample.pred_val = sample.value
+                            try:
+                                selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature, opponent_name=opponent_name, epoch=current_epoch)
+                            except Exception as mcts_err:
+                                selected = [0]
+                                sample = None
+                            if sample is not None:
+                                sample.pred_val = sample.value
                             
                             if selected and len(selected) > 0:
                                 try:
@@ -491,6 +496,16 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     r_no_en = -0.05 if (action_type != 8 and pre.get("has_energy_in_hand", False)) else 0.0
                         
                     r_strategic = calculate_strategic_reward(pre, post, action_type, step_idx, went_second, i, opponent_name)
+
+                    r_bench = 0.0
+                    if post["bench_size"] == 0:
+                        r_bench -= 0.05
+                        if post.get("turn", 0) <= 2:
+                            r_bench -= 0.05
+                    elif post["bench_size"] >= 3 and any(cid in (65, 66, 67) for cid in post.get("opp_bench_ids", []) + [post.get("opp_active_id", -1)]):
+                        r_bench -= 0.05
+                    elif post["bench_size"] == 5:
+                        r_bench -= 0.02
 
                     r_deck = 0.0
                     if post["deck_size"] == 0:

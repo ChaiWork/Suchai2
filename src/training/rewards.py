@@ -66,7 +66,51 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
         if played_id in (1159, 1175):
             r_strategic += 0.15
 
+        if played_id == 1156:  # Lucky Helmet (draw on damage)
+            attached_target = pre.get("attached_target_id", post.get("active_id", -1))
+            if attached_target in (434, 414) or attached_target == post.get("active_id"):
+                r_strategic += 0.12  # Optimal draw engine on defensive wall/active
+            else:
+                r_strategic += 0.05
+
+        if played_id == 1092:  # Secret Box (ACE SPEC: Discard 3 cards to search Supporter/Item/Tool/Stadium)
+            hand_before = pre.get("hand_size", 0)
+            discarded = pre.get("discarded_card_ids", [])
+            reckless_discards = [cid for cid in discarded if cid in (431, 401)]
+            has_sacred_ash = 1129 in post.get("hand_ids", []) or 1129 in pre.get("hand_ids", [])
+            if hand_before >= 4 and not (reckless_discards and not has_sacred_ash):
+                r_strategic += 0.12 if pre.get("turn", 0) <= 2 else 0.06
+            else:
+                r_strategic -= 0.08  # Reckless Secret Box usage discarding key attackers
+        elif played_id == 1129:  # Sacred Ash late-game recovery
+            discard_targets = [cid for cid in pre.get("discard_ids", []) if cid in (401, 431, 414, 272)]
+            if len(discard_targets) >= 2:
+                r_strategic += 0.06
+            else:
+                r_strategic -= 0.04  # Penalize wasteful early usage
+        elif played_id in (1086, 1094) and pre.get("turn", 0) <= 3:
+            r_strategic += 0.06  # Reward early zero-discard setup items (Poffin / Bug Catching Set)
+        elif played_id == 1227 and pre.get("hand_size", 5) <= 4:
+            r_strategic += 0.08  # Reward Lillie's Determination on low hand count
+        elif played_id == 1116 and post.get("active_energy", 0) > pre.get("active_energy", 0):
+            r_strategic += 0.08  # Reward Energy Switch energy acceleration to active attacker
+        elif played_id in (1257, 50, 51):
+            r_strategic += 0.06  # Reward Team Rocket's Factory stadium placement
+
+        if played_id == 1218 and post.get("opp_active_id") in (120, 121):  # Giovanni gust Staryu / Starmie
+            r_strategic += 0.12
+        elif played_id == 1158 and pre.get("opp_active_id") in (121, 1031):  # Maximum Belt vs Starmie ex
+            r_strategic += 0.18
+
     elif action_type == 13:  # ATTACK
+        if pre.get("active_id") == 272:  # Clefairy ex attack penalty
+            r_strategic -= 0.10
+        elif pre.get("active_id") == 464:  # Sneasel late-game bench snipe
+            if pre.get("game_phase") == "late" and post.get("opp_prizes_remaining", 6) < pre.get("opp_prizes_remaining", 6):
+                r_strategic += 0.10
+            elif pre.get("turn", 0) <= 3:
+                r_strategic -= 0.08
+
         opp_act_id = pre.get("opp_active_id", -1)
         opp_act_card = get_card_data(opp_act_id)
         if opp_act_card and getattr(opp_act_card, "name", None) and any(kw in opp_act_card.name.lower() for kw in ["riolu", "lucario"]):
@@ -79,6 +123,119 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
         opp_act_id = pre.get("opp_active_id", -1)
         if opp_act_id in (723, 722, 1145):
             r_strategic -= 0.20
+
+    # Fire Deck Matchup Rewards & Penalties (Cyndaquil, Typhlosion, Centiskorch, Fire Decks)
+    FIRE_PKS = {352, 353, 354, 717, 934, 18, 19, 20}
+    is_fire_opp = any(cid in FIRE_PKS for cid in pre.get("opp_bench_ids", []) + [pre.get("opp_active_id", -1)])
+    if is_fire_opp:
+        if action_type == 7 and pre.get("played_card_id") in (414, 272, 434) and pre.get("turn", 0) <= 3:
+            r_strategic += 0.12  # Reward benching non-Grass walls (Articuno, Clefairy ex, Mimikyu) vs Fire decks
+        elif action_type == 7 and pre.get("played_card_id") in (400, 401) and pre.get("turn", 0) <= 3:
+            r_strategic -= 0.15  # Penalize benching 2x Fire Weakness Grass Pokemon early vs Fire decks
+
+    # -------------------------------------------------------------------------
+    # Strict Penalties for Dumb Mistakes & Tactical Blunders
+    # -------------------------------------------------------------------------
+    # 0. Single-Active Bench-Out Vulnerability Guard (-0.45)
+    # Severe penalty for having 0 bench Pokemon on Turn 1+ when holding basic/search cards in hand
+    if post.get("bench_size", 0) == 0:
+        has_search_or_basic = any(cid in pre.get("hand_ids", []) for cid in (400, 414, 434, 464, 272, 1086, 1121, 1134, 1094, 1092, 1216, 1220))
+        if has_search_or_basic:
+            r_strategic -= 0.45  # Severe penalty for risking instant bench-out loss
+
+    # 0a. Emergency Bench Setup Reward (+0.45)
+    # Rewards benching a basic Pokemon or playing a search card when bench size is 0
+    if action_type == 7 and pre.get("bench_size", 0) == 0:
+        played_cid = pre.get("played_card_id", -1)
+        if played_cid in (400, 414, 434, 464, 272, 1086, 1121, 1134, 1094, 1092, 1216):
+            r_strategic += 0.45  # High reward for deploying bench protection
+
+    # 0b. Benching Clefairy ex vs Dragapult ex without Articuno Bench Shield (-0.12)
+    if action_type == 7 and pre.get("played_card_id") == 272:
+        opp_b_ids_post = post.get("opp_bench_ids", [])
+        opp_act_id_post = post.get("opp_active_id", -1)
+        is_dragapult = any(get_card_data(cid) is not None and any(kw in get_card_data(cid).name.lower() for kw in ["dreepy", "drakloak", "dragapult"]) for cid in opp_b_ids_post + [opp_act_id_post])
+        if is_dragapult and 414 not in post.get("bench_ids", []) and 414 != post.get("active_id", -1):
+            r_strategic -= 0.12  # Exposes 120 HP Clefairy ex to Phantom Dive bench snipe without Articuno shield
+
+    # 0c. Pre-Attack Setup Reward (+0.04)
+    # Rewards performing setup actions (Play/Attach) before declaring Attack
+    if action_type in (7, 8) and pre.get("has_attack_option", False):
+        r_strategic += 0.04
+
+    # 0d. Voluntary Promotion of 2-Prize Clefairy ex / Mewtwo ex from 1-Prize Wall (-0.25)
+    if action_type == 12:  # RETREAT
+        pre_active = pre.get("active_id", -1)
+        post_active = post.get("active_id", -1)
+        if pre_active in (434, 414, 464, 400) and post_active in (272, 431):
+            r_strategic -= 0.25  # Severe penalty for retreating 1-Prize wall to expose 2-Prize ex
+        elif pre_active in (431, 464) and post_active in (414, 434, 400) and pre.get("turn", 0) <= 4:
+            r_strategic += 0.15  # Reward rescuing early exposed Mewtwo ex / Sneasel back to 1-Prize wall
+
+    # 1. Promoting Locked Mewtwo ex with < 4 TR Pokemon (-0.15)
+    if post.get("active_id") == 431 and pre.get("tr_in_play", 0) < 4:
+        r_strategic -= 0.15
+
+    # 1b. Mewtwo ex & Sneasel Late-Game Finisher Role Rewards & Penalties
+    if action_type == 13:  # ATTACK
+        act_id = pre.get("active_id", -1)
+        my_prizes_rem = pre.get("my_prizes", 6)
+        opp_prizes_rem = pre.get("opp_prizes", 6)
+        is_late_game = (my_prizes_rem <= 3 or opp_prizes_rem <= 3 or pre.get("turn", 0) >= 8)
+
+        if act_id == 431:  # Mewtwo ex
+            if is_late_game and pre.get("tr_in_play", 0) >= 4:
+                r_strategic += 0.12  # Optimal late-game Mewtwo ex finisher execution
+            elif pre.get("tr_in_play", 0) < 4 or not is_late_game:
+                r_strategic -= 0.15  # Penalize attacking with Mewtwo ex early / locked
+
+        elif act_id == 464:  # Sneasel
+            if is_late_game:
+                r_strategic += 0.10  # Optimal late-game Sneasel snipe execution
+            else:
+                r_strategic -= 0.12  # Penalize exposing 60 HP Sneasel early
+
+    # 2. Leaving Staryu / Dreepy alive when a KO was available (-0.12)
+    if pre.get("had_ko_available_on_pre_evolution", False) and action_type != 13:
+        r_strategic -= 0.12
+
+    # 3. Unnecessary Retreat with Attack Ready (-0.10)
+    if action_type == 12 and pre.get("has_valid_attack_option", False):
+        if not pre.get("opp_has_safeguard_immunity", False):
+            r_strategic -= 0.10
+
+    # 4. Overcharging 1-Cost Attackers (-0.10)
+    if action_type == 8:
+        target_id = pre.get("attached_target_id", -1)
+        target_energies = pre.get("target_current_energy", 0)
+        if target_id in (401, 414) and target_energies >= 3:
+            r_strategic -= 0.10
+
+    # 4b. Basic Psychic Energy Targeting (ID: 5)
+    if action_type == 8 and pre.get("attached_energy_id") == 5:
+        target_id = pre.get("attached_target_id", -1)
+        if target_id == 272:  # Lillie's Clefairy ex (272)
+            r_strategic += 0.08  # Optimal Psychic energy placement for Clefairy ex
+        elif target_id in (400, 401):  # Tarountula / Spidops
+            r_strategic -= 0.12  # Penalize wasting Psychic energy on Grass Pokemon
+
+    # 4c. Tarountula Hopeless Attack vs High-HP Target (-0.15)
+    if action_type == 13 and pre.get("active_id") == 400:
+        opp_hp = pre.get("opp_active_hp", 999)
+        has_draw_supporter = any(cid in pre.get("hand_ids", []) for cid in (1216, 1227, 1134, 1094))
+        if opp_hp >= 80 and has_draw_supporter:
+            r_strategic -= 0.15  # Severe penalty for wasting turn attacking with 40 HP Tarountula instead of playing draw Supporter
+
+    # 5. Premature End Turn Penalty (-0.20)
+    if action_type == 14:
+        hand_ids = pre.get("hand_ids", [])
+        has_playable_setup = any(cid in hand_ids for cid in (400, 414, 434, 464, 272, 401, 678, 1086, 1094, 1121, 1134, 1092, 1216, 1227, 1220, 1219, 1156, 1175, 1257, 1, 5, 15))
+        if has_playable_setup:
+            r_strategic -= 0.20  # Severe penalty for ending turn with unplayed setup cards in hand
+
+    # 5. Wasteful Supporter Hand Reset with Large Hand (-0.06)
+    if action_type == 7 and pre.get("played_card_id") in (1227, 1216) and pre.get("hand_size", 0) >= 6:
+        r_strategic -= 0.06
 
     if went_second and step_idx == 0:
         if action_type == 13:
@@ -99,11 +256,14 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
         if is_tr_pokemon(bid):
             tr_count += 1
     
-    if tr_count < 4:
+    if tr_count < 5:
         if action_type == 7:
             played_id = pre.get("played_card_id", -1)
             if is_tr_pokemon(played_id):
-                r_strategic += 0.25
+                if tr_count == 4:
+                    r_strategic += 0.30  # High reward for filling 5th Team Rocket slot for max Spidops damage
+                else:
+                    r_strategic += 0.25
         if action_type == 8 and tr_count < 3:
             attached_target = pre.get("attached_target_id", -1)
             if attached_target == 431:
@@ -698,11 +858,11 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
         ))
         
         if has_attack and not opp_immune:
-            r_strategic -= 0.40
+            r_strategic -= 0.50  # Severe penalty for ending turn when valid attack is ready
         elif has_attach and not energy_already_attached:
-            r_strategic -= 0.40
+            r_strategic -= 0.40  # Penalty for ending turn without attaching energy
         else:
-            r_strategic += 0.02
+            r_strategic -= 0.02  # Passive turn decay penalty to prevent endless stall reward hacking
             
         if post.get("bench_size", 0) == 0:
             r_strategic -= 0.60
@@ -744,7 +904,20 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
                 healed = pre_dmg - post_dmg
                 if healed > 0:
                     r_strategic += 0.02 * healed
-            elif active_card is not None and active_card.cardId == 431:
+            elif active_card is not None and active_card.cardId == 401:  # Team Rocket's Spidops (#401)
+                tr_count_spidops = 0
+                if is_tr_pokemon(pre.get("active_id", -1)):
+                    tr_count_spidops += 1
+                for bid in pre.get("bench_ids", []):
+                    if is_tr_pokemon(bid):
+                        tr_count_spidops += 1
+                if tr_count_spidops >= 5:
+                    r_strategic += 0.35  # Maximum Spidops damage scaling reward with 5 Team Rocket Pokemon in play
+                elif tr_count_spidops == 4:
+                    r_strategic += 0.22
+                else:
+                    r_strategic += 0.12
+            elif active_card is not None and active_card.cardId == 431:  # Team Rocket's Mewtwo ex (#431)
                 tr_count_mewtwo = 0
                 if is_tr_pokemon(pre.get("active_id", -1)):
                     tr_count_mewtwo += 1
@@ -752,9 +925,33 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
                     if is_tr_pokemon(bid):
                         tr_count_mewtwo += 1
                 if tr_count_mewtwo >= 4:
-                    r_strategic += 0.35
+                    r_strategic += 0.35  # Power Saver satisfied, full power attack
+                    opp_act = get_card_data(pre.get("opp_active_id"))
+                    if opp_act and any(kw in getattr(opp_act, "name", "").lower() for kw in ["dragapult", "dreepy", "drakloak", "garchomp", "dragon"]):
+                        if 272 in pre.get("bench_ids", []) or pre.get("active_id") == 272:
+                            r_strategic += 0.20  # Extra reward for 2x Fairy Zone weakness damage output
                 else:
-                    r_strategic -= 0.20
+                    r_strategic -= 0.30  # Penalize attacking while locked by Power Saver (<4 TR Pokemon)
+
+            elif active_card is not None and active_card.cardId == 272:  # Lillie's Clefairy ex (#272)
+                r_strategic += 0.25
+                opp_act = get_card_data(pre.get("opp_active_id"))
+                if opp_act and any(kw in getattr(opp_act, "name", "").lower() for kw in ["dragapult", "dreepy", "drakloak", "garchomp", "dragon"]):
+                    r_strategic += 0.25  # Fairy Zone 2x weakness attack multiplier
+
+            elif active_card is not None and active_card.cardId == 464:  # Team Rocket's Sneasel (#464)
+                tr_count_sneasel = 0
+                if is_tr_pokemon(pre.get("active_id", -1)):
+                    tr_count_sneasel += 1
+                for bid in pre.get("bench_ids", []):
+                    if is_tr_pokemon(bid):
+                        tr_count_sneasel += 1
+                if tr_count_sneasel >= 4:
+                    r_strategic += 0.30  # High damage Sneasel attack with 4+ TR Pokemon
+                else:
+                    r_strategic += 0.15
+                if pre.get("my_prizes", 6) <= 2 or pre.get("opp_prizes", 6) <= 2:
+                    r_strategic += 0.15  # Late game finisher role bonus
             elif active_card is not None and active_card.cardId == 414:
                 r_strategic += 0.30
                 if pre.get("turn", 0) <= 3:

@@ -610,33 +610,34 @@ def main():
             epoch_val_losses = []
             epoch_pol_losses = []
             for i in range(batch_count):
-                beta = min(1.0, 0.4 + 0.6 * (counter / args.epochs))
-                samples, indices, is_weights = replay_buffer.sample(args.batch_size, beta=beta)
-                
-                input_enc = LearnInput()
-                input_dec = LearnInput()
-                mask = []
-                label_enc = []
-                label_dec = []
-                
-                for sample in samples:
-                    input_enc.add(sample.sv_enc)
-                    input_dec.add(sample.sv_dec)
-                    label_enc.append(sample.value)
-                    label_dec.extend(sample.policy)
-                    for _ in range(len(sample.policy)):
-                        mask.append(1.0)
-                    for _ in range(256 - len(sample.policy)):
-                        mask.append(0.0)
-                        label_dec.append(0.0)
-                        input_dec.offset.append(len(input_dec.index))
+                try:
+                    beta = min(1.0, 0.4 + 0.6 * (counter / args.epochs))
+                    samples, indices, is_weights = replay_buffer.sample(args.batch_size, beta=beta)
+                    
+                    input_enc = LearnInput()
+                    input_dec = LearnInput()
+                    mask = []
+                    label_enc = []
+                    label_dec = []
+                    
+                    for sample in samples:
+                        input_enc.add(sample.sv_enc)
+                        input_dec.add(sample.sv_dec)
+                        label_enc.append(sample.value)
+                        label_dec.extend(sample.policy)
+                        for _ in range(len(sample.policy)):
+                            mask.append(1.0)
+                        for _ in range(256 - len(sample.policy)):
+                            mask.append(0.0)
+                            label_dec.append(0.0)
+                            input_dec.offset.append(len(input_dec.index))
 
-                mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device).view(args.batch_size, -1)
-                label_tensor_enc = torch.tensor(label_enc, dtype=torch.float32, device=device).view(args.batch_size, -1)
-                label_tensor_dec = torch.tensor(label_dec, dtype=torch.float32, device=device).view(args.batch_size, -1)
+                    mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device).view(args.batch_size, -1)
+                    label_tensor_enc = torch.tensor(label_enc, dtype=torch.float32, device=device).view(args.batch_size, -1)
+                    label_tensor_dec = torch.tensor(label_dec, dtype=torch.float32, device=device).view(args.batch_size, -1)
 
-                with model_lock:
-                    optimizer.zero_grad()
+                    with model_lock:
+                        optimizer.zero_grad()
 
                     with torch.amp.autocast(device_type=device.type, enabled=(scaler is not None)):
                         out_enc, out_dec = model(
@@ -659,7 +660,12 @@ def main():
                         loss_dec_ce = -(label_tensor_dec * log_probs * mask_tensor)
                         loss_dec_ce = (loss_dec_ce.sum(dim=-1, keepdim=True) * is_weight_tensor).mean()
 
-                        loss = loss_enc + loss_dec_ce
+                        # Policy Entropy Regularization: H(pi) = -sum(p * log_p) to prevent policy collapse
+                        probs = torch.exp(log_probs) * mask_tensor
+                        policy_entropy = -(probs * log_probs * mask_tensor).sum(dim=-1, keepdim=True).mean()
+                        ENTROPY_WEIGHT = 0.01
+
+                        loss = loss_enc + loss_dec_ce - ENTROPY_WEIGHT * policy_entropy
 
                     if scaler is not None:
                         scaler.scale(loss).backward()
@@ -671,21 +677,33 @@ def main():
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
-                        
-                epoch_losses.append(loss.item())
-                epoch_val_losses.append(loss_enc.item())
-                epoch_pol_losses.append(loss_dec_ce.item())
 
-                errors = (out_enc - label_tensor_enc).abs().squeeze().tolist()
-                if isinstance(errors, float):
-                    errors = [errors]
-                replay_buffer.update_priorities(indices, errors)
+                    epoch_losses.append(loss.item())
+                    epoch_val_losses.append(loss_enc.item())
+                    epoch_pol_losses.append(loss_dec_ce.item())
 
-                last_loss_enc_val = loss_enc.item()
-                last_loss_dec_ce_val = loss_dec_ce.item()
+                    errors = (out_enc.detach() - label_tensor_enc).abs().squeeze().cpu().tolist()
+                    if isinstance(errors, float):
+                        errors = [errors]
+                    replay_buffer.update_priorities(indices, errors)
 
-                del out_enc, out_dec, loss, loss_enc, loss_dec_ce
-                del mask_tensor, label_tensor_enc, label_tensor_dec, is_weight_tensor
+                    last_loss_enc_val = loss_enc.item()
+                    last_loss_dec_ce_val = loss_dec_ce.item()
+
+                    del out_enc, out_dec, loss, loss_enc, loss_dec_ce
+                    del mask_tensor, label_tensor_enc, label_tensor_dec, is_weight_tensor
+                    if device.type == 'cuda' and i % 10 == 0:
+                        torch.cuda.empty_cache()
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                        import gc
+                        gc.collect()
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        print(f"[WARNING] CUDA Out of Memory on training batch {i}. Cleared CUDA cache & continuing safely.")
+                        continue
+                    else:
+                        raise e
                 
             avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
             avg_val_loss = sum(epoch_val_losses) / len(epoch_val_losses) if epoch_val_losses else 0.0

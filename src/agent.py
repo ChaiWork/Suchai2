@@ -85,8 +85,16 @@ class GPUInferenceClient:
         self.conn = conn
 
     def eval_nn(self, sv_enc: SparseVector, sv_dec: SparseVector) -> tuple[float, list[float]]:
-        self.conn.send((sv_enc, sv_dec))
-        return self.conn.recv()
+        try:
+            self.conn.send((sv_enc, sv_dec))
+            return self.conn.recv()
+        except Exception:
+            num_actions = len(getattr(sv_dec, "offset", []))
+            if num_actions <= 0:
+                num_actions = 1
+            uniform_prob = 1.0 / num_actions
+            return 0.0, [uniform_prob] * num_actions
+
 
 
 class Child:
@@ -255,6 +263,10 @@ def create_node(parent: Node | None,
                             played_cid = hand[opt.index].id
                     
                     played_card = card_table.get(played_cid)
+                    bench_len = len(obs.current.players[your_index].bench) if (obs.current and len(obs.current.players) > your_index) else 0
+                    if bench_len == 0 and played_cid in (400, 414, 434, 464, 272, 1086, 1121, 1134, 1094, 1092, 1216, 1220):
+                        score += 10.0  # Top candidate priority for bench protection when bench is empty
+
                     if played_card:
                         # Generic Feature 1: High priority for ex attackers early
                         if getattr(played_card, "ex", False):
@@ -391,16 +403,21 @@ def create_node(parent: Node | None,
                     elif opt.type == OptionType.END:
                         has_end = True
             
-            if has_attack:
-                bias += 1.5
+            bench_size_curr = len(obs.current.players[your_index].bench) if (obs.current and len(obs.current.players) > your_index) else 0
+            has_setup_actions = has_play or has_attach or has_evolve or has_ability
+            if has_play:
+                bias += 2.5 if bench_size_curr == 0 else 1.2  # Massive priority prior to deploy bench protection when bench is empty
             if has_evolve:
                 bias += 1.0
             if has_attach:
                 bias += 0.8
             if has_ability:
                 bias += 1.0  # High priority prior for activating Pokemon abilities before attacking
-            if has_play:
-                bias += 0.3
+            if has_attack:
+                if has_setup_actions:
+                    bias += 0.5  # Lower attack bias while setup actions remain so Trainers are used first
+                else:
+                    bias += 1.5  # High attack bias when no setup actions remain
             if has_end and has_constructive:
                 bias -= 5.0  # Penalize passing turn if constructive actions are possible
                 
