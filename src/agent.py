@@ -318,22 +318,26 @@ def create_node(parent: Node | None,
         k = obs.select.maxCount
         
         # Generate combinations using sorted_indices
-        if k <= n:
-            comb_positions = list(range(k))
+        k_valid = min(k, n)
+        if k_valid > 0:
+            comb_positions = list(range(k_valid))
             for _ in range(256):
                 # Map combination positions to sorted_indices
                 actions.append([sorted_indices[p] for p in comb_positions])
                 
                 # Standard next combination algorithm on positions [0, n-1]
-                for i in range(k):
-                    index = k - i - 1
+                for i in range(k_valid):
+                    index = k_valid - i - 1
                     if comb_positions[index] < n - i - 1:
                         comb_positions[index] += 1
-                        for j in range(index + 1, k):
+                        for j in range(index + 1, k_valid):
                             comb_positions[j] = comb_positions[j - 1] + 1
                         break
                 else:
                     break
+
+        if not actions and n > 0:
+            actions = [[i] for i in range(min(n, max(1, k)))]
                     
         # Instrumentation: check if any options were truncated
         if len(options) > 256 and len(actions) == 256:
@@ -414,10 +418,7 @@ def create_node(parent: Node | None,
             if has_ability:
                 bias += 1.0  # High priority prior for activating Pokemon abilities before attacking
             if has_attack:
-                if has_setup_actions:
-                    bias += 0.5  # Lower attack bias while setup actions remain so Trainers are used first
-                else:
-                    bias += 1.5  # High attack bias when no setup actions remain
+                bias += 2.5  # Top attack prior bias so MCTS always evaluates attacking immediately alongside setup
             if has_end and has_constructive:
                 bias -= 5.0  # Penalize passing turn if constructive actions are possible
                 
@@ -1026,13 +1027,13 @@ def agent(obs_dict: dict) -> list[int]:
     elif IS_KAGGLE:
         # Standard Kaggle budget with comfortable time remaining (>300s)
         if active_is_walled or is_main_context:
-            search_count = 35  # Boost budget for critical decisions on Kaggle
+            search_count = 100  # Deep search for critical main context choices
         elif turn <= 3:
-            search_count = 20
+            search_count = 70
         elif turn <= 8:
-            search_count = 15
+            search_count = 50
         else:
-            search_count = 10
+            search_count = 40
     else:
         # Standard local/eval budget
         if active_is_walled or is_main_context:
@@ -1047,10 +1048,12 @@ def agent(obs_dict: dict) -> list[int]:
     try:
         with torch.inference_mode():
             action, _ = mcts_agent(obs_dict, _deck, _model, search_count=search_count)
-        return action
+        return action if (action or not obs.select or not obs.select.option) else list(range(min(getattr(obs.select, "maxCount", 1), len(obs.select.option))))
     except Exception as e:
         print(f"MCTS Agent crashed: {e}. Falling back to default action.", file=sys.stderr)
         obs = to_observation_class(obs_dict)
         if obs.select and obs.select.option:
-            return random.sample(list(range(len(obs.select.option))), obs.select.maxCount)
+            n_opts = len(obs.select.option)
+            k_opts = min(getattr(obs.select, "maxCount", 1), n_opts)
+            return list(range(k_opts))
         return []

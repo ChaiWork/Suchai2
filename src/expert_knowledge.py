@@ -223,18 +223,31 @@ def get_expert_bonus(obs, option, opponent_name="unknown"):
 
     # -------------------------------------------------------------------------
     # 00. Emergency Bench-Out Prevention Guard (Fixes 80% of Tournament Losses)
-    # When bench size is 0, give massive priority to benching basic Pokemon
+    # When bench size is 0 or 1, give massive priority to benching basic Pokemon
     # or playing search/tutor cards (Poffin, Ultra Ball, Bug Catching Set, Ariana).
     # -------------------------------------------------------------------------
+    opt_card_id = getattr(option, "cardId", -1)
     if my_bench_count == 0:
-        opt_card_id = getattr(option, "cardId", -1)
         if opt_type in (7, OptionType.PLAY):
-            if opt_card_id in (400, 414, 434, 464, 272, 1086, 1121, 1134, 1094, 1092, 1216, 1220):
-                bonus += 0.45
+            if opt_card_id in (400, 414, 434, 464, 272, 431, 1086, 1121, 1134, 1094, 1092, 1216, 1220):
+                bonus += 0.50
                 triggered = "Emergency_Bench_Out_Protection_Prior"
-        elif opt_type in (14, OptionType.END):
-            bonus -= 0.40
+        elif opt_type in (14, getattr(OptionType, "END", 14)):
+            bonus -= 0.50
             triggered = "Penalize_End_Turn_With_Zero_Bench"
+    elif my_bench_count == 1:
+        if opt_type in (7, OptionType.PLAY):
+            if opt_card_id in (400, 414, 434, 464, 272, 431, 1086, 1121, 1134, 1094, 1092, 1216, 1220):
+                bonus += 0.30
+                triggered = "Secondary_Bench_Expansion_Prior"
+        elif opt_type in (14, getattr(OptionType, "END", 14)) and turn <= 4:
+            bonus -= 0.35
+            triggered = "Penalize_End_Turn_With_One_Bench"
+
+    # Card search/tutor selection option check when bench count is 0 or 1
+    if my_bench_count <= 1 and opt_card_id in (400, 414, 434, 464, 272, 431):
+        bonus += 0.35
+        triggered = "Search_Select_Basic_Pokemon_For_Bench"
 
     # -------------------------------------------------------------------------
     # 0a. Spidops Team Rocket 5-Pokemon Max Damage Scaling Heuristic
@@ -463,22 +476,39 @@ def get_expert_bonus(obs, option, opponent_name="unknown"):
                 bonus += 0.20
                 triggered = "Search_To_Evolve_Benched_Tarountula_Prior"
 
+        # Early Turn Supporter/Search setup for Tarountula (400), Mewtwo ex (431), Clefairy ex (272)
+        if turn <= 4 and card_id in (1216, 1227, 1218, 1220, 1086, 1094, 1121, 1134):
+            has_attacker = any(cid in my_bench_ids or my_active_id == cid for cid in (400, 431, 272))
+            if not has_attacker or my_bench_count < 3:
+                bonus += 0.25
+                triggered = "Early_Turn_Supporter_Attacker_Setup"
+
     elif opt_type in (8, OptionType.ATTACH):
         card_id = getattr(option, "cardId", -1)
-        if card_id == 5:  # Basic Psychic Energy
-            target_id = getattr(option, "targetCardId", getattr(option, "targetId", -1))
-            if target_id == 272:  # Lillie's Clefairy ex (272)
-                bonus += 0.12
-                triggered = "Psychic_Energy_Clefairy_Prior"
-            elif target_id in (400, 401):  # Tarountula (400) or Spidops (401)
-                bonus -= 0.10
+        target_id = getattr(option, "targetCardId", getattr(option, "targetId", -1))
+        if target_id == 414:  # Target is Articuno (414)
+            if card_id == 15 or "rocket" in str(getattr(option, "name", "")).lower():
+                bonus -= 0.30
+                triggered = "TR_Energy_Articuno_Waste_Penalty"
+            elif card_id == 1:  # Basic {G} Energy
+                bonus += 0.15
+                triggered = "Grass_Energy_Articuno_Prior"
+        elif target_id == 272:  # Target is Lillie's Clefairy ex (272)
+            if card_id == 15 or "rocket" in str(getattr(option, "name", "")).lower():
+                bonus -= 0.50  # TR Energy cannot be attached to non-TR Clefairy ex!
+                triggered = "TR_Energy_Illegal_Clefairy_Penalty"
+            elif card_id in (1, 5):  # Basic Green (1) or Basic Psychic (5) Energy
+                bonus += 0.20
+                triggered = "Clefairy_Green_Psychic_Energy_Prior"
+        elif card_id == 5:  # Basic Psychic Energy (#5)
+            if target_id in (400, 401):  # Tarountula (400) or Spidops (401)
+                bonus -= 0.25  # Save Psychic Energy for Clefairy ex & Mewtwo ex!
                 triggered = "Psychic_Energy_Spidops_Penalty"
+            elif target_id in (272, 431):  # Clefairy ex (272) or Mewtwo ex (431)
+                bonus += 0.18
+                triggered = "Psychic_Energy_Attacker_Prior"
 
-        # Emergency Bench Expansion when Bench Count is 0 (+0.18)
-        if my_bench_count == 0 and card_id in (400, 414, 434, 464, 272, 1086, 1121, 1134, 1094):
-            bonus += 0.18
-            triggered = "Empty_Bench_Emergency_Setup_Prior"
-            
+
         # Dragapult ex vs Clefairy ex Unprotected Guard (-0.10)
         if card_id == 272 and "dragapult" in opp_lower and 414 not in my_bench_ids and my_active_id != 414:
             bonus -= 0.10
@@ -509,9 +539,15 @@ def get_expert_bonus(obs, option, opponent_name="unknown"):
             triggered = "Premature_End_Turn_Penalty"
 
     elif opt_type in (13, OptionType.ATTACK):
-        if my_active_id == 272:  # Clefairy ex attack guard
-            bonus -= 0.10
-            triggered = "Clefairy_EX_Attack_Penalty"
+        if my_active_id == 272:  # Clefairy ex attack priority
+            opp_active_card = get_card_data(opp_active_id)
+            opp_name = str(getattr(opp_active_card, "name", "")).lower() if opp_active_card else ""
+            if any(kw in opp_name for kw in ["dragapult", "dreepy", "drakloak", "garchomp", "dragon"]):
+                bonus += 0.25
+                triggered = "Clefairy_EX_Fairy_Zone_Dragon_Attack_Prior"
+            else:
+                bonus += 0.15
+                triggered = "Clefairy_EX_Attack_Bonus"
         elif my_active_id == 431:  # Mewtwo ex late-game finisher
             if game_phase == "late" and tr_in_play >= 4:
                 bonus += 0.15

@@ -1,6 +1,10 @@
+import numpy as np
+
+
 def compute_gae_advantages(player_samples, rewards, terminal_reward, gamma=0.99, lam=0.95):
     """
     Computes Generalized Advantage Estimation (GAE) returns and targets for a sequence of player steps.
+    Applies running mean/std advantage normalization for stable PPO policy updates.
 
     Args:
         player_samples: List of (sample_obj, pre_metrics) tuples for one player.
@@ -18,6 +22,7 @@ def compute_gae_advantages(player_samples, rewards, terminal_reward, gamma=0.99,
 
     # MCTS value estimates and model predictions are natively bounded in [-1.0, +1.0]
     pred_values = [player_samples[s][0].pred_val for s in range(n_steps)]
+    advantages = [0.0] * n_steps
     returns = [0.0] * n_steps
     gae = 0.0
 
@@ -28,14 +33,24 @@ def compute_gae_advantages(player_samples, rewards, terminal_reward, gamma=0.99,
         else:
             delta = step_rew + gamma * pred_values[step_idx + 1] - pred_values[step_idx]
         gae = delta + gamma * lam * gae
+        advantages[step_idx] = gae
         returns[step_idx] = gae + pred_values[step_idx]
+
+    # Dynamic Advantage Normalization: Zero-mean, unit-variance scaling for PPO
+    adv_array = np.array(advantages, dtype=np.float32)
+    std = adv_array.std()
+    if std > 1e-8:
+        norm_advantages = (adv_array - adv_array.mean()) / (std + 1e-8)
+    else:
+        norm_advantages = adv_array
 
     processed_samples = []
     for step_idx in range(n_steps):
         sample_obj, _ = player_samples[step_idx]
         # Enforce strict [-1.0, +1.0] target bounds for Value Network
-        sample_obj.value = max(-1.0, min(1.0, returns[step_idx]))
-        td_error = returns[step_idx] - sample_obj.pred_val
+        sample_obj.value = float(max(-1.0, min(1.0, returns[step_idx])))
+        # Use normalized advantage as td_error for PPO & priority weighting
+        td_error = float(norm_advantages[step_idx])
         processed_samples.append((sample_obj, td_error))
 
     return processed_samples

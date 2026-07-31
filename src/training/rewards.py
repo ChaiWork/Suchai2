@@ -24,12 +24,15 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
     if deck_cnt_post <= 6 and action_type == 7:
         r_strategic -= 0.35
 
-    if step_idx <= 2:
-        bench_size_curr = post.get("bench_size", 0)
-        if bench_size_curr == 0:
-            r_strategic -= 0.50
-        elif bench_size_curr >= 2:
-            r_strategic += 0.25
+    # Bench Size Protection Guard across ALL turns (prevents Donk / Bench Wipe)
+    bench_size_curr = post.get("bench_size", 0)
+    turn_curr = post.get("turn", 0)
+    if bench_size_curr == 0:
+        r_strategic -= 0.60 if turn_curr <= 5 else 0.40
+    elif bench_size_curr == 1:
+        r_strategic -= 0.25 if turn_curr <= 4 else 0.10
+    elif bench_size_curr >= 2:
+        r_strategic += 0.20
 
     opp_pk_lost = pre.get("opp_pokemon", 0) - post.get("opp_pokemon", 0)
     if opp_pk_lost > 0:
@@ -103,8 +106,13 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
             r_strategic += 0.18
 
     elif action_type == 13:  # ATTACK
-        if pre.get("active_id") == 272:  # Clefairy ex attack penalty
-            r_strategic -= 0.10
+        if pre.get("active_id") == 272:  # Clefairy ex attack reward
+            opp_act = get_card_data(pre.get("opp_active_id"))
+            opp_name = str(getattr(opp_act, "name", "")).lower() if opp_act else ""
+            if any(kw in opp_name for kw in ["dragapult", "dreepy", "drakloak", "garchomp", "dragon"]):
+                r_strategic += 0.25  # Extra reward for 2x Fairy Zone weakness attack
+            else:
+                r_strategic += 0.15  # Reward Clefairy ex attacking
         elif pre.get("active_id") == 464:  # Sneasel late-game bench snipe
             if pre.get("game_phase") == "late" and post.get("opp_prizes_remaining", 6) < pre.get("opp_prizes_remaining", 6):
                 r_strategic += 0.10
@@ -136,19 +144,28 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
     # -------------------------------------------------------------------------
     # Strict Penalties for Dumb Mistakes & Tactical Blunders
     # -------------------------------------------------------------------------
-    # 0. Single-Active Bench-Out Vulnerability Guard (-0.45)
-    # Severe penalty for having 0 bench Pokemon on Turn 1+ when holding basic/search cards in hand
+    # 0. Single-Active / Fragile Bench Vulnerability Guard (-0.50 / -0.25)
+    # Severe penalty for having 0 or 1 bench Pokemon when holding basic/search cards in hand
+    # -------------------------------------------------------------------------
     if post.get("bench_size", 0) == 0:
-        has_search_or_basic = any(cid in pre.get("hand_ids", []) for cid in (400, 414, 434, 464, 272, 1086, 1121, 1134, 1094, 1092, 1216, 1220))
+        has_search_or_basic = any(cid in pre.get("hand_ids", []) for cid in (400, 414, 434, 464, 272, 431, 1086, 1121, 1134, 1094, 1092, 1216, 1220))
         if has_search_or_basic:
-            r_strategic -= 0.45  # Severe penalty for risking instant bench-out loss
+            r_strategic -= 0.50  # Severe penalty for risking instant bench-out loss
+    elif post.get("bench_size", 0) == 1 and pre.get("turn", 0) <= 4:
+        has_search_or_basic = any(cid in pre.get("hand_ids", []) for cid in (400, 414, 434, 464, 272, 431, 1086, 1121, 1134, 1094, 1092, 1216, 1220))
+        if has_search_or_basic:
+            r_strategic -= 0.25  # Penalty for holding basic/search cards while leaving bench at 1
 
-    # 0a. Emergency Bench Setup Reward (+0.45)
-    # Rewards benching a basic Pokemon or playing a search card when bench size is 0
+    # 0a. Emergency Bench Setup Reward (+0.50 / +0.25)
+    # Rewards benching a basic Pokemon or playing a search card when bench size is 0 or 1
     if action_type == 7 and pre.get("bench_size", 0) == 0:
         played_cid = pre.get("played_card_id", -1)
-        if played_cid in (400, 414, 434, 464, 272, 1086, 1121, 1134, 1094, 1092, 1216):
-            r_strategic += 0.45  # High reward for deploying bench protection
+        if played_cid in (400, 414, 434, 464, 272, 431, 1086, 1121, 1134, 1094, 1092, 1216, 1220):
+            r_strategic += 0.50  # High reward for deploying bench protection
+    elif action_type == 7 and pre.get("bench_size", 0) == 1:
+        played_cid = pre.get("played_card_id", -1)
+        if played_cid in (400, 414, 434, 464, 272, 431, 1086, 1121, 1134, 1094, 1092, 1216, 1220):
+            r_strategic += 0.25  # Reward for expanding bench from 1 to 2+
 
     # 0b. Benching Clefairy ex vs Dragapult ex without Articuno Bench Shield (-0.12)
     if action_type == 7 and pre.get("played_card_id") == 272:
@@ -572,7 +589,7 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
                 if hand_diff < 0:
                     r_strategic -= 0.05
             else:
-                r_strategic += 0.02
+                pass
             
     elif action_type == 8:  # ATTACH
         attached_id = pre.get("attached_card_id", -1)
@@ -712,10 +729,14 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
                     elif attached_card.cardId == 1:
                         r_strategic -= 0.03
                 elif target_card.cardId == 414:
-                    if current_energy >= 1:
-                        r_strategic -= 0.30
+                    if attached_card.cardId == 15 or "rocket" in getattr(attached_card, "name", "").lower():
+                        r_strategic -= 0.35  # Penalty: Don't waste 2-in-1 TR Energy on Articuno
+                    elif current_energy >= 1:
+                        r_strategic -= 0.30  # Heavy penalty for >1 energy on Articuno
+                    elif attached_card.cardId == 1:
+                        r_strategic += 0.20  # Prefer Green Energy (Basic G Energy) on Articuno
                     else:
-                        r_strategic += 0.15
+                        r_strategic += 0.10
                 else:
                     if is_fully_charged:
                         r_strategic -= 0.02
@@ -777,7 +798,12 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
                 r_strategic += 0.10
                 
     elif action_type == 10:  # ABILITY
-        r_strategic += 0.20
+        hand_diff = post.get("hand_size", 0) - pre.get("hand_size", 0)
+        energy_diff = (post.get("active_energy", 0) + sum(post.get("bench_energies", []))) - (pre.get("active_energy", 0) + sum(pre.get("bench_energies", [])))
+        if hand_diff > 0 or energy_diff > 0:
+            r_strategic += 0.10
+        else:
+            r_strategic += 0.0
         
     elif action_type == 12:  # RETREAT
         r_strategic -= 0.40
@@ -862,7 +888,13 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
         elif has_attach and not energy_already_attached:
             r_strategic -= 0.40  # Penalty for ending turn without attaching energy
         else:
-            r_strategic -= 0.02  # Passive turn decay penalty to prevent endless stall reward hacking
+            turn_num = pre.get("turn", 1)
+            prizes_taken = pre.get("prizes", 6) - post.get("prizes", 6)
+            if turn_num >= 8 and prizes_taken == 0:
+                decay_pen = min(0.15, 0.01 * (turn_num - 7))
+                r_strategic -= decay_pen
+            else:
+                r_strategic -= 0.02
             
         if post.get("bench_size", 0) == 0:
             r_strategic -= 0.60
@@ -962,8 +994,15 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
                 r_strategic += 0.10
 
             prizes_taken = pre["prizes"] - post["prizes"]
+            if prizes_taken == 1:
+                r_strategic += 0.15
+            elif prizes_taken == 2:
+                r_strategic += 0.30
+            elif prizes_taken >= 3:
+                r_strategic += 0.45
+
             if pre.get("turn", 0) <= 3 and prizes_taken > 0:
-                r_strategic += 0.35
+                r_strategic += 0.20
             
             opp_active_hp_pre = pre.get("opp_active_hp", 999)
             opp_active_max_hp = pre.get("opp_active_max_hp", 999)
@@ -984,7 +1023,20 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
     if action_type == 8:
         attached_cid = pre.get("attached_card_id", -1)
         target_cid = pre.get("attached_target_id", -1)
-        if (attached_cid == 15 or pre.get("card_id") == 15) and (target_cid == 414 or pre.get("target_id") == 414):
+        # Team Rocket Energy (#15) restriction on Clefairy ex (#272) & Articuno (#414)
+        if (attached_cid == 15 or pre.get("card_id") == 15):
+            if target_cid in (272, 414) or pre.get("target_id") in (272, 414):
+                r_strategic -= 0.50  # TR Energy cannot be attached to non-TR Clefairy ex or wall Articuno!
+        
+        # Save Basic Psychic Energy (#5) for Clefairy ex (#272) and Mewtwo ex (#431)
+        if (attached_cid == 5 or pre.get("card_id") == 5):
+            if target_cid in (400, 401):
+                r_strategic -= 0.25  # Penalty for wasting Psychic Energy on Spidops
+            elif target_cid in (272, 431):
+                r_strategic += 0.20  # Reward for attaching Psychic Energy to Clefairy ex / Mewtwo ex
+
+        # Clefairy ex (#272) prefers 1 Green (#1) and 1 Psychic (#5) Energy
+        if (target_cid == 272 or pre.get("target_id") == 272) and attached_cid in (1, 5):
             r_strategic += 0.20
 
     if action_type == 12:
@@ -1105,4 +1157,5 @@ def calculate_strategic_reward(pre, post, action_type, step_idx, went_second, pl
             if prizes_taken > 0 and opp_active_now in [265, 268, 269, 270, 271]:
                 r_strategic += 0.20
 
+    r_strategic = max(-0.25, min(0.25, r_strategic))
     return r_strategic
