@@ -67,8 +67,11 @@ def calculate_lillie_strategic_reward(pre: dict, post: dict, action_type: int, s
 
         # --- A. Opening Setup & Basic Benching ---
         if played_id in (CLEFAIRY_EX_ID, TOGEPI_ID, SMOOCHUM_ID, LATIAS_EX_ID):
+            # Penalty for risky 2-prize ex Pokémon play/benching early against Lucario fast physical aggro
+            if played_id in (CLEFAIRY_EX_ID, LATIAS_EX_ID) and (is_lucario and post.get("turn", 0) <= 5):
+                r_strategic -= 0.25
             # Penalty for over-benching against Dragapult spread threat
-            if is_dragapult and post.get("bench_size", 0) > 3:
+            elif is_dragapult and post.get("bench_size", 0) > 3:
                 r_strategic -= 0.10
             else:
                 r_strategic += 0.15

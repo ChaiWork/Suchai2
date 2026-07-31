@@ -57,6 +57,28 @@ def rule_based_opponent_agent(opponent_name, obs):
     raise ValueError(f"Unknown rule-based opponent: {opponent_name}")
 
 
+def get_active_deck_csv_path() -> str:
+    try:
+        from src.configs.active_deck import get_active_deck_name
+        deck_name = get_active_deck_name()
+    except Exception:
+        deck_name = os.getenv("ACTIVE_DECK", "MEWTWO").upper()
+
+    if deck_name == "GRIMMSNARL":
+        for path in ["deckgrimnai.csv", "deck_grimmsnarl.csv", "deck.csv"]:
+            if os.path.exists(path):
+                return path
+    elif deck_name == "LILLIE":
+        for path in ["deck clefairy.csv", "deck_lillie.csv", "deck.csv"]:
+            if os.path.exists(path):
+                return path
+    else:  # MEWTWO
+        for path in ["deck copy BARU CARD TAPI KECEWA.csv", "deck_mewtwo.csv", "deck.csv"]:
+            if os.path.exists(path):
+                return path
+    return "deck.csv"
+
+
 def load_all_decks():
     """Scans the workspace directories for deck.csv files and loads them.
     
@@ -66,11 +88,12 @@ def load_all_decks():
     base_path = "decks"
     decks = {}
     
-    # 1. Load root deck (our agent's main deck)
-    root_deck_path = "deck.csv"
+    # 1. Load active root deck (our agent's main deck)
+    root_deck_path = get_active_deck_csv_path()
     if os.path.exists(root_deck_path):
         with open(root_deck_path, "r", encoding="utf-8-sig") as f:
             decks["Current (Self)"] = [int(line.strip()) for line in f if line.strip()]
+            print(f"Active Deck Loaded for Current (Self): {root_deck_path}")
             
     # 2. Scan decks directory recursively for deck.csv files
     if os.path.exists(base_path):

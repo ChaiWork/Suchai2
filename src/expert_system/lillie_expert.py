@@ -204,22 +204,27 @@ def evaluate_lillie_expert_bonus(obs, option, opponent_name: str) -> tuple[float
     # 3. MATCHUP 3: VS LUCARIO (Fast Fighting Aggro Counterplay)
     # -------------------------------------------------------------------------
     if is_lucario:
-        # A. Priority Togekiss setup to out-scale Lucario early
+        # A. Avoid premature 2-prize ex (Clefairy ex, Latias ex) exposure early against fast physical KOs
+        if IS_PLAY and card_id in (CLEFAIRY_EX_ID, LATIAS_EX_ID):
+            if turn <= 5 or my_active_energy == 0:
+                bonus -= 0.35
+                triggered = "Lucario_Matchup_Avoid_Premature_2Prize_ex_Risk"
+
+        # B. Prioritize 1-prize basic buffer Pokemon (Togepi, Smoochum, Mimikyu, Psyduck)
+        if IS_PLAY and card_id in (TOGEPI_ID, SMOOCHUM_ID, MIMIKYU_ID, PSYDUCK_ID, SHAYMIN_ID):
+            bonus += 0.35
+            triggered = "Lucario_Matchup_Single_Prize_Buffer"
+
+        # C. Priority Togekiss setup to out-scale Lucario early
         if IS_EVOLVE and card_id == TOGEKISS_ID:
             bonus += 0.45
             triggered = "Lucario_Matchup_Fast_Togekiss_Evolution"
 
-        # B. Target Riolu (447) before evolving to Lucario
+        # D. Target Riolu (447) before evolving to Lucario
         if IS_PLAY and card_id in (BOSS_ORDERS_ID, POKEMON_CATCHER_ID):
             if 447 in opp_bench_ids:
                 bonus += 0.35
                 triggered = "Lucario_Matchup_Gust_Riolu_Target"
-
-        # C. Maintain steady attacker stream (at least 2 Clefairy ex)
-        if IS_PLAY and card_id == CLEFAIRY_EX_ID:
-            if sum(1 for cid in my_bench_ids if cid == CLEFAIRY_EX_ID) < 2:
-                bonus += 0.30
-                triggered = "Lucario_Matchup_Maintain_Clefairy_Stream"
 
     # -------------------------------------------------------------------------
     # 4. MATCHUP 4: VS GRIMMSNARL EX (High-HP Dark Tank Counterplay)

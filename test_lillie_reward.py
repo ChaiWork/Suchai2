@@ -76,6 +76,21 @@ class TestLillieReward(unittest.TestCase):
         )
         self.assertGreaterEqual(reward, 0.25)
 
+    def test_lucario_2prize_ex_penalty(self):
+        """Test playing 2-prize ex Pokemon early against Lucario gives a penalty."""
+        pre = {"played_card_id": CLEFAIRY_EX_ID}
+        post = {"bench_size": 1, "turn": 2}
+        reward = calculate_lillie_strategic_reward(
+            pre=pre,
+            post=post,
+            action_type=7,  # PLAY
+            step_idx=1,
+            went_second=False,
+            player_idx=0,
+            opponent_name="Rulebasedmodel_Lucario"
+        )
+        self.assertLess(reward, 0.0, "Playing 2-prize ex early vs Lucario should yield a negative reward")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 """
 Active Deck Configuration for Pokémon TCG RL Agent.
 Select active deck archetype via environment variable or default configuration.
-Supported values: "MEWTWO", "LILLIE"
+Supported values: "MEWTWO", "LILLIE", "GRIMMSNARL"
 """
 import os
 

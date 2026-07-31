@@ -31,4 +31,9 @@ def calculate_base_strategic_reward(pre: dict, post: dict, action_type: int, ste
     if opp_pk_lost > 0:
         r_strategic += 0.15
 
+    # 4. Multi-Prize Card Loss Penalty (Deck-Agnostic Guard)
+    prizes_lost = pre.get("opp_prizes", 6) - post.get("opp_prizes", 6)
+    if prizes_lost >= 2:
+        r_strategic -= 0.30  # Heavy deck-agnostic penalty for losing a 2-prize / Rule Box Pokémon
+
     return r_strategic

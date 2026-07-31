@@ -726,13 +726,22 @@ def main():
             }
         torch.save(checkpoint, epoch_model_path)
         torch.save(checkpoint, "model.pth")
+
+        try:
+            from src.configs.active_deck import get_active_deck_name
+            active_deck_tag = get_active_deck_name().lower()
+        except Exception:
+            active_deck_tag = os.getenv("ACTIVE_DECK", "MEWTWO").lower()
+
+        deck_model_name = f"model_{active_deck_tag}.pth"
+        torch.save(checkpoint, deck_model_name)
         
         if not args.disable_league:
             league_model_path = os.path.join(league_dir, f"model_epoch_{counter}_run_{version}.pth")
             torch.save(checkpoint, league_model_path)
-            print(f"Saved checkpoint: {epoch_model_path}, model.pth, and {league_model_path}")
+            print(f"Saved checkpoint: {epoch_model_path}, model.pth, {deck_model_name}, and {league_model_path}")
         else:
-            print(f"Saved checkpoint: {epoch_model_path} and model.pth (League saving disabled)")
+            print(f"Saved checkpoint: {epoch_model_path}, model.pth, and {deck_model_name}")
 
         MAX_LEAGUE_SIZE = 30
         league_files = sorted(
@@ -831,10 +840,19 @@ def main():
     torch.save(final_checkpoint, "model.pth")
     torch.save(final_checkpoint, os.path.join(run_dir, "model.pth"))
     
+    try:
+        from src.configs.active_deck import get_active_deck_name
+        active_deck_tag = get_active_deck_name().lower()
+    except Exception:
+        active_deck_tag = os.getenv("ACTIVE_DECK", "MEWTWO").lower()
+
+    deck_final_name = f"model_{active_deck_tag}.pth"
+    torch.save(final_checkpoint, deck_final_name)
+    
     if tb_writer is not None:
         tb_writer.close()
         
-    print(f"\nTraining complete. Final weights saved to model.pth and inside {run_dir}")
+    print(f"\nTraining complete. Final weights saved to model.pth, {deck_final_name}, and inside {run_dir}")
     print(f"Best model (peak win rate) preserved in best_model.pth")
 
     print("Generating learning curves...")
