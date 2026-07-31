@@ -201,10 +201,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 try:
                                     chosen_opt = obs_class.select.option[selected[0]]
                                     exp_bonus, exp_trigger = get_expert_bonus(obs_class, chosen_opt, opponent_name=opponent_name)
-                                    if exp_trigger != "NONE":
+                                    if exp_trigger and str(exp_trigger).lower() not in ("none", "disabled") and abs(exp_bonus) > 1e-6:
                                         expert_log.append({
                                             "trigger":     exp_trigger,
-                                            "action_type": chosen_opt.type,
+                                            "action_type": getattr(chosen_opt, "type", getattr(chosen_opt, "optionType", -1)),
                                             "bonus":       exp_bonus,
                                             "turn":        obs_class.current.turn,
                                             "my_prizes":   len(obs_class.current.players[curr_player].prize),

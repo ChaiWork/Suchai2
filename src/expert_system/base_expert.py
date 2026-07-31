@@ -66,6 +66,16 @@ def extract_board_context(obs) -> dict:
                     if p is not None:
                         bench_ids.append(p.get("cardId", p.get("id", -1)) if isinstance(p, dict) else getattr(p, "cardId", getattr(p, "id", -1)))
                 ctx["opp_bench_ids"] = bench_ids
+                ctx["opp_bench_count"] = len(bench_ids)
+
+                if opp_active_list and opp_active_list[0] is not None:
+                    a = opp_active_list[0]
+                    if isinstance(a, dict):
+                        ctx["opp_active_id"] = a.get("cardId", a.get("id", -1))
+                        ctx["opp_active_hp"] = a.get("hp", 999)
+                    else:
+                        ctx["opp_active_id"] = getattr(a, "cardId", getattr(a, "id", -1))
+                        ctx["opp_active_hp"] = getattr(a, "hp", 999)
 
                 prizes = ctx["my_prizes"]
                 if prizes <= 2:
@@ -74,6 +84,13 @@ def extract_board_context(obs) -> dict:
                     ctx["game_phase"] = "mid"
                 else:
                     ctx["game_phase"] = "early"
+
+                my_hand = getattr(my_ps, "hand", []) if not isinstance(my_ps, dict) else my_ps.get("hand", [])
+                hand_ids = []
+                for card in my_hand:
+                    if card is not None:
+                        hand_ids.append(card.get("cardId", card.get("id", -1)) if isinstance(card, dict) else getattr(card, "cardId", getattr(card, "id", -1)))
+                ctx["my_hand_ids"] = hand_ids
 
                 my_bench = getattr(my_ps, "bench", []) if not isinstance(my_ps, dict) else my_ps.get("bench", [])
                 my_bench_ids = []
