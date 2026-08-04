@@ -222,12 +222,29 @@ def run_benchmark(opponents: list[str], games_per_opp: int = 1):
     print(f"Average Game Length   : {avg_turns:.1f} Turns")
     print("==================================================================")
 
+def test_step_0_deck_registration():
+    """Verifies that the agent returns a valid 60-card deck list when select is None (Kaggle Step 0)."""
+    step_0_obs = {
+        "step": 0,
+        "remainingOverageTime": 600.0,
+        "current": None,
+        "select": None,
+        "search_begin_input": None,
+        "logs": []
+    }
+    res = my_agent(step_0_obs)
+    assert isinstance(res, list), f"Expected list from step 0, got {type(res)}"
+    assert len(res) == 60, f"Expected 60 card IDs at step 0 deck registration, got {len(res)}"
+    print(f"✅ Step 0 Deck Registration Test Passed: agent returned valid {len(res)}-card deck!")
+
 def main():
     parser = argparse.ArgumentParser(description="Test your AI Agent locally against rule-based opponents.")
     parser.add_argument("--opp", type=str, default="Rulebasedmodel_Hydrapple_Ogerpon", help="Opponent name, or 'all', 'easy', 'hard'")
     parser.add_argument("--games", type=int, default=1, help="Number of games per opponent")
     parser.add_argument("--all", action="store_true", help="Run benchmark against all easy and hard opponents")
     args = parser.parse_args()
+
+    test_step_0_deck_registration()
 
     opp_arg = args.opp.lower()
     
@@ -242,3 +259,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

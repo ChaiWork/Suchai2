@@ -9,6 +9,7 @@ def main():
         ("src/model.py",              "model.py"),
         ("src/agent.py",              "agent.py"),
         ("src/expert_knowledge.py",   "expert_knowledge.py"),  # Required: agent.py imports this at startup
+        ("src",                       "src"),
         ("cg",                        "cg"),
     ]
     

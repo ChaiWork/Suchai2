@@ -436,6 +436,57 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
     my_prizes = len(state.players[your_index].prize)
     opp_prizes = len(state.players[1 - your_index].prize)
     sv.add_single((opp_prizes - my_prizes) / 6.0)
+    # Action Economy Features (Supporter played, Energy attached, Retreated, Stadium played)
+    sv.add_single(float(getattr(state, "supporterPlayed", False)))
+    sv.add_single(float(getattr(state, "energyAttached", False)))
+    sv.add_single(float(getattr(state, "retreated", False)))
+    sv.add_single(float(getattr(state, "stadiumPlayed", False)))
+
+    # Enhanced Global Features (Stadium in hand, Deck exhaustion, Attack readiness, Energy efficiency)
+    my_hand = getattr(state.players[your_index], "hand", []) or []
+    # Stadium IDs: 1264 (Battle Cage), 1257 (TR Factory), 1180 (Prism Tower)
+    has_stadium_in_hand = any(getattr(c, "id", -1) in (1264, 1257, 1180) for c in my_hand if c is not None)
+    sv.add_single(float(has_stadium_in_hand))
+
+    my_deck = getattr(state.players[your_index], "deck", []) or []
+    deck_count = len(my_deck) if isinstance(my_deck, (list, tuple)) else getattr(state.players[your_index], "deckCount", 60)
+    sv.add_single(min(1.0, deck_count / 60.0))
+
+    # Active attack readiness
+    my_active = getattr(state.players[your_index], "active", []) or []
+    act_ready = 0.0
+    if my_active and len(my_active) > 0 and my_active[0] is not None:
+        act_card = my_active[0]
+        act_id = getattr(act_card, "id", -1)
+        energies = getattr(act_card, "energyCards", []) or getattr(act_card, "energies", []) or []
+        num_e = len(energies) if isinstance(energies, (list, tuple)) else 0
+        req_e = 3 if act_id == 431 else (2 if act_id in (401, 272, 414) else 1)
+        if num_e >= req_e:
+            act_ready = 1.0
+    sv.add_single(act_ready)
+
+    # Opponent Stadium Active feature
+    stadium_list = getattr(state, "stadium", []) or []
+    opp_stadium_active = 0.0
+    if stadium_list and len(stadium_list) > 0 and stadium_list[0] is not None:
+        st_card = stadium_list[0]
+        st_owner = getattr(st_card, "playerIndex", -1)
+        if st_owner == (1 - your_index):
+            opp_stadium_active = 1.0
+    sv.add_single(opp_stadium_active)
+
+    # Powered Attackers Count (Active + Bench)
+    powered_count = 0
+    my_bench = getattr(state.players[your_index], "bench", []) or []
+    for pk in (my_active + my_bench):
+        if pk is not None:
+            pk_id = getattr(pk, "id", -1)
+            energies = getattr(pk, "energyCards", []) or getattr(pk, "energies", []) or []
+            num_e = len(energies) if isinstance(energies, (list, tuple)) else 0
+            req_e = 3 if pk_id == 431 else (2 if pk_id in (401, 272, 414) else 1)
+            if num_e >= req_e:
+                powered_count += 1
+    sv.add_single(min(1.0, powered_count / 3.0))
     return sv
 
 

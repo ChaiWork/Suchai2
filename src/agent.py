@@ -7,42 +7,51 @@ import torch
 from collections import Counter
 
 """
-RL Strategy: Pokémon TCG AI Agent
-==================================
-Primary Objective: Maximize long-term win rate against diverse deck archetypes.
+Pure AlphaZero Inference & MCTS Strategy Engine for Pokémon TCG AI Agent
+=========================================================================
+Architecture: Pure AlphaZero (DeepMind Architecture)
+  1. Game State Observation -> Encoded via Transformer State Encoder
+  2. Neural Network Evaluation -> (Value V(s) in [-1, +1], Policy Logits P(s, a))
+  3. MCTS PUCT Search -> Guided by Neural Network Policy & Value Predictions
+  4. Final Action Selection -> Visit Count Distribution N(s, a)^(1/tau)
 
-Decision Priorities (encoded in reward shaping):
-  1. Win the game           — terminal reward ±1.0
-  2. Take prizes efficiently — r_prize_taken * 0.20 (key win condition)
-  3. Prevent opponent setup — r_prize_lost * 0.15 (opponent taking prizes)
-  4. Attach energy first    — r_energy * 0.03 (prerequisite to attacking)
-  5. Maintain attackers     — bench reward (+0.10 recovery, -0.02 danger)
-  6. Play efficiently       — r_stall -0.005/step (anti-stall pressure)
-
-Tactical Action Sequence (optimal turn order):
-  Abilities → Items/Search → Energy Attachment → Supporter → Attack
-
-Key Principle: Every action must increase P(win), not just deal damage.
+Decoupling Principle:
+  - Inference-time decisions in agent.py are driven by best_model.pth & MCTS.
+  - Hardcoded move ordering and overpowering logit offsets are removed.
+  - Legality constraints & Kaggle interfaces are 100% preserved.
 """
 
-
-from model import (
-    MyModel,
-    SparseVector,
-    get_encoder_input,
-    get_decoder_input,
-    eval_nn,
-    MODEL_D_MODEL,
-    MODEL_NUM_HEADS,
-    MODEL_D_FEEDFORWARD,
-    MODEL_NUM_LAYERS_ENCODER,
-    MODEL_NUM_LAYERS_DECODER,
-)
+try:
+    from model import (
+        MyModel,
+        SparseVector,
+        get_encoder_input,
+        get_decoder_input,
+        eval_nn,
+        MODEL_D_MODEL,
+        MODEL_NUM_HEADS,
+        MODEL_D_FEEDFORWARD,
+        MODEL_NUM_LAYERS_ENCODER,
+        MODEL_NUM_LAYERS_DECODER,
+    )
+except ImportError:
+    from src.model import (
+        MyModel,
+        SparseVector,
+        get_encoder_input,
+        get_decoder_input,
+        eval_nn,
+        MODEL_D_MODEL,
+        MODEL_NUM_HEADS,
+        MODEL_D_FEEDFORWARD,
+        MODEL_NUM_LAYERS_ENCODER,
+        MODEL_NUM_LAYERS_DECODER,
+    )
 
 try:
-    from expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE
+    from expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE, expert_scale
 except ImportError:
-    from src.expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE
+    from src.expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE, expert_scale
 
 # Resolve cg-lib path dynamically for Kaggle vs Local environments
 try:
@@ -65,16 +74,21 @@ from cg.api import (
 )
 
 card_table = {c.cardId: c for c in all_card_data()}
+evolves_from_map: dict[str, list] = {}
+for _c in card_table.values():
+    _ef = getattr(_c, "evolvesFrom", None)
+    if _ef:
+        evolves_from_map.setdefault(_ef, []).append(_c)
 
-SEARCH_COUNT = 200  # MCTS Search count — ≥200 needed for meaningful visit differentiation (audit: was 50, policy targets were noise)
-C_PUCT = 1.25       # AlphaZero PUCT exploration constant (fixed, per original paper)
+SEARCH_COUNT = 200  # MCTS Search count — ≥200 needed for meaningful visit differentiation
+C_PUCT = 1.25       # AlphaZero PUCT exploration constant (fixed, per DeepMind AlphaZero)
 
 
 class LearnSample:
     """Single Training Sample collected during gameplay/self-play."""
     def __init__(self, value: float, policy: list[float], sv_enc: SparseVector, sv_dec: SparseVector):
-        self.value = value        # Encoder output (expected outcome)
-        self.policy = policy      # Decoder output (action probability distribution)
+        self.value = value        # Expected win outcome in [-1, +1]
+        self.policy = policy      # Action probability distribution
         self.sv_enc = sv_enc
         self.sv_dec = sv_dec
 
@@ -96,7 +110,6 @@ class GPUInferenceClient:
             return 0.0, [uniform_prob] * num_actions
 
 
-
 class Child:
     """Edge in the MCTS search tree pointing to a child node."""
     def __init__(self, select: list[int], prob: float, select_option=None):
@@ -108,9 +121,9 @@ class Child:
 
 class Node:
     """MCTS Node representing a game state in the search tree."""
-    value: float          # Self value
-    total: float          # Total accumulated value
-    visit: int            # Visit count
+    value: float          # Self value from Neural Network
+    total: float          # Total accumulated value from backpropagation
+    visit: int            # Visit count N(s)
     parent: 'Node | None' # Parent node
     children: list[Child]
     state: SearchState    # Search State of this node
@@ -131,66 +144,72 @@ class Node:
             self.parent.backprop(value)
 
 
+def _extract_obs_info(obs_input):
+    """Safely extracts (obs_obj, current_state, result, your_index) from dict, SearchState, or Observation."""
+    if hasattr(obs_input, "observation"):
+        obs_obj = obs_input.observation
+    else:
+        obs_obj = obs_input
+
+    if hasattr(obs_obj, "current"):
+        current_state = obs_obj.current
+    elif isinstance(obs_input, dict) and "current" in obs_input:
+        current_state = obs_input["current"]
+    else:
+        current_state = obs_obj
+
+    result = getattr(current_state, "result", -1)
+    if isinstance(current_state, dict):
+        result = current_state.get("result", -1)
+
+    your_index = getattr(current_state, "yourIndex", 0)
+    if isinstance(current_state, dict):
+        your_index = current_state.get("yourIndex", 0)
+
+    return obs_obj, current_state, result, your_index
+
+
 def detect_opponent_archetype(obs, your_index: int) -> str:
     """Detect opponent deck archetype from revealed active, bench, and discard cards."""
-    if obs is None or obs.current is None:
+    obs_obj, current_state, _, _ = _extract_obs_info(obs)
+    if current_state is None:
         return "GENERIC"
     try:
         opp_index = 1 - your_index
-        opp_player = obs.current.players[opp_index]
-        visible_cards = []
-        for card in opp_player.active + opp_player.bench + opp_player.discard:
-            name = getattr(card, 'name', '').lower()
-            visible_cards.append(name)
-        card_str = " ".join(visible_cards)
-        if "dreepy" in card_str or "drakloak" in card_str or "dragapult" in card_str:
-            return "DRAGAPULT"
-        elif "snover" in card_str or "abomasnow" in card_str:
-            return "ABOMASNOW"
-        elif "iono" in card_str or "pidgeot" in card_str or "snorlax" in card_str:
-            return "IONO_CONTROL"
+        players = getattr(current_state, "players", [])
+        if isinstance(current_state, dict):
+            players = current_state.get("players", [])
+
+        if len(players) > opp_index:
+            opp_player = players[opp_index]
+            visible_cards = []
+            active = getattr(opp_player, "active", []) if not isinstance(opp_player, dict) else opp_player.get("active", [])
+            bench = getattr(opp_player, "bench", []) if not isinstance(opp_player, dict) else opp_player.get("bench", [])
+            discard = getattr(opp_player, "discard", []) if not isinstance(opp_player, dict) else opp_player.get("discard", [])
+
+            for card in list(active) + list(bench) + list(discard):
+                if card:
+                    name = getattr(card, 'name', '').lower() if not isinstance(card, dict) else card.get('name', '').lower()
+                    if name:
+                        visible_cards.append(name)
+            card_str = " ".join(visible_cards)
+            if any(k in card_str for k in ("dreepy", "drakloak", "dragapult", "froslass", "dusknoir", "dusclops", "munkidori")):
+                return "DRAGAPULT"
+            elif any(k in card_str for k in ("snover", "abomasnow")):
+                return "ABOMASNOW"
+            elif any(k in card_str for k in ("grimmsnarl", "grim", "impidimp")):
+                return "GRIMMSNARL"
+            elif any(k in card_str for k in ("charizard", "zard", "charmander")):
+                return "CHARIZARD"
+            elif any(k in card_str for k in ("regidrago", "giratina", "roaring", "dragon", "koraidon", "miraidon")):
+                return "DRAGON"
+            elif any(k in card_str for k in ("iono", "pidgeot", "snorlax")):
+                return "IONO_CONTROL"
+            elif card_str:
+                return card_str
     except Exception:
         pass
     return "GENERIC"
-
-
-def get_target_card_priority_score(opt, obs, archetype: str) -> float:
-    """Calculate strategic priority score for targeting opponent cards based on matchup prompt."""
-    if opt.type != OptionType.CARD:
-        return 1.0
-    
-    card_name = ""
-    try:
-        if hasattr(opt, 'area') and hasattr(opt, 'index') and hasattr(opt, 'playerIndex'):
-            target_player = obs.current.players[opt.playerIndex]
-            if opt.area == AreaType.ACTIVE and target_player.active:
-                card_name = getattr(target_player.active[0], 'name', '').lower()
-            elif opt.area == AreaType.BENCH and opt.index < len(target_player.bench):
-                card_name = getattr(target_player.bench[opt.index], 'name', '').lower()
-    except Exception:
-        pass
-
-    if not card_name:
-        return 1.0
-
-    if archetype == "DRAGAPULT":
-        if "dreepy" in card_name:
-            return 10.0   # Highest Priority 1: KO Dreepy immediately
-        elif "drakloak" in card_name:
-            return 8.0    # Priority 2: KO Drakloak before Dragapult evolves
-        elif "dragapult" in card_name:
-            return 5.0    # Priority 3: Dragapult ex
-    elif archetype == "ABOMASNOW":
-        if "snover" in card_name:
-            return 10.0   # Highest Priority 1: KO Snover immediately
-        elif "abomasnow" in card_name:
-            return 7.0    # Priority 2: Abomasnow
-    elif archetype == "IONO_CONTROL":
-        if "iono" in card_name or "pidgeot" in card_name or "bibarel" in card_name:
-            return 8.0    # Draw/Support engine
-            
-    # Universal Rule: Target evolving pre-evolutions (Basic Pokémon) over fully evolved forms
-    return 3.0
 
 
 def create_node(parent: Node | None,
@@ -200,248 +219,165 @@ def create_node(parent: Node | None,
                 model: MyModel,
                 epoch: int = 1
 ) -> tuple[Node, LearnSample | None]:
-    """Create a new node and evaluate its state using the neural network."""
+    """
+    Creates a new MCTS node and evaluates state & candidate actions using Neural Network.
+    Follows Pure AlphaZero architecture:
+      - Valid options enumerated cleanly.
+      - Neural Network policy logits P(s, a) and value V(s) drive exploration.
+      - Optional soft expert priors decay smoothly over training epochs.
+    """
     node = Node(parent, search_state)
-    obs = search_state.observation
-    state = obs.current
-    
-    if state.result >= 0:
-        # Battle finished
-        if state.result == 2:
+    obs_obj, state, result, your_idx = _extract_obs_info(search_state)
+    if your_index is None:
+        your_index = your_idx
+
+    if result >= 0:
+        # Battle finished: Terminal Node Valuation
+        if result == 2:
             node.value = 0.0
-        elif state.result == your_index:
+        elif result == your_index:
             node.value = 1.0
         else:
             node.value = -1.0
-        # Backpropagation is handled exclusively during tree expansion in mcts_agent
         sample = None
     else:
-        # Enumerate up to 128 potential action combinations prioritizing high-value options
+        # Layer 1: Legality Masking & Action Combination Enumeration
         actions = []
-        options = obs.select.option
-        
-        archetype = detect_opponent_archetype(obs, your_index)
-        
-        # High priority option types to guarantee evaluation
-        HIGH_PRIORITY_TYPES = {
-            OptionType.ATTACK,
-            OptionType.EVOLVE,
-            OptionType.ABILITY,
-            OptionType.ATTACH,
-            OptionType.RETREAT,
-            OptionType.PLAY,
-            OptionType.SPECIAL_CONDITION,
-            OptionType.YES,
-            OptionType.NO,
-            OptionType.NUMBER,
-            OptionType.SKILL,
-            OptionType.END
-        }
-        
-        scored_options = []
-        for idx, opt in enumerate(options):
-            score = 1.0
-            if opt.type in HIGH_PRIORITY_TYPES:
-                score += 2.0
-            
-            # Smooth Decision Hierarchy
-            if opt.type == OptionType.ATTACK:
-                score += 5.0
-            elif opt.type == OptionType.EVOLVE:
-                score += 4.0
-            elif opt.type == OptionType.ABILITY:
-                score += 4.0
-            elif opt.type == OptionType.ATTACH:
-                score += 3.0
-            elif opt.type in (OptionType.PLAY, OptionType.CARD):
-                score += 3.0
-                try:
-                    played_cid = getattr(opt, "cardId", -1)
-                    if played_cid == -1 and hasattr(opt, "index") and obs.current:
-                        hand = obs.current.players[your_index].hand
-                        if 0 <= opt.index < len(hand) and hand[opt.index]:
-                            played_cid = hand[opt.index].id
-                    
-                    played_card = card_table.get(played_cid)
-                    bench_len = len(obs.current.players[your_index].bench) if (obs.current and len(obs.current.players) > your_index) else 0
-                    if bench_len == 0 and played_cid in (400, 414, 434, 464, 272, 1086, 1121, 1134, 1094, 1092, 1216, 1220):
-                        score += 10.0  # Top candidate priority for bench protection when bench is empty
+        select_obj = getattr(obs_obj, "select", None)
+        options = getattr(select_obj, "option", []) if select_obj else []
+        archetype = detect_opponent_archetype(obs_obj, your_index)
 
-                    if played_card:
-                        # Generic Feature 1: High priority for ex attackers early
-                        if getattr(played_card, "ex", False):
-                            score += 5.0
-                        # Generic Feature 2: Hand recovery for Supporters/Stadiums/Items when low on cards
-                        hand_len = len(obs.current.players[your_index].hand) if obs.current else 5
-                        if hand_len <= 2 and played_card.cardType in (CardType.SUPPORTER, CardType.STADIUM, CardType.ITEM):
-                            score += 4.0
-                        # Generic Feature 3: Tool attachment survivability
-                        if played_card.cardType == CardType.TOOL:
-                            score += 3.0
-                    
-                    # Supporter Contingency: Only play damage-buff supporters if active has energy to attack
-                    if played_card and played_card.cardType == CardType.SUPPORTER and getattr(played_card, "damageBuff", False):
-                        active_en = len(obs.current.players[your_index].active[0].energyCards) if (obs.current and obs.current.players[your_index].active) else 0
-                        if active_en == 0:
-                            score -= 5.0  # Soft penalty for playing damage buff without energy
-                except Exception:
-                    pass
-                
-            # Active Spot Promotion Safeguards against Heavy Threats (e.g. Mega Abomasnow ex)
-            if obs.select and obs.select.context == SelectContext.TO_ACTIVE:
-                try:
-                    cand_cid = getattr(opt, "cardId", -1)
-                    if cand_cid == -1 and hasattr(opt, "index") and obs.current:
-                        players = obs.current.players[your_index]
-                        if 0 <= opt.index < len(players.bench) and players.bench[opt.index]:
-                            cand_cid = players.bench[opt.index].id
-                    
-                    opp_active = obs.current.players[1 - your_index].active
-                    opp_is_heavy = False
-                    if len(opp_active) > 0 and opp_active[0]:
-                        opp_is_heavy = getattr(opp_active[0], "maxHp", 0) >= 200
+        # Enumerate valid combinations respecting minCount <= len(selected) <= maxCount
+        n = len(options)
+        min_k = getattr(select_obj, "minCount", 1) if select_obj else 1
+        max_k = getattr(select_obj, "maxCount", 1) if select_obj else 1
+        if isinstance(obs_obj, dict):
+            sel_dict = obs_obj.get("select", {})
+            min_k = sel_dict.get("minCount", min_k)
+            max_k = sel_dict.get("maxCount", max_k)
 
-                    cand_card = card_table.get(cand_cid)
-                    if cand_card and not getattr(cand_card, "ex", False) and getattr(cand_card, "hp", 150) <= 100 and opp_is_heavy:
-                        # Avoid floating low-HP non-ex Pokémon against heavy 200+ HP threat
-                        score -= 10.0
-                    elif cand_card and (getattr(cand_card, "ex", False) or getattr(cand_card, "stage1", False) or getattr(cand_card, "stage2", False)):
-                        score += 3.0
-                except Exception:
-                    pass
-            
-            scored_options.append((idx, score))
-            
-        scored_options.sort(key=lambda x: x[1], reverse=True)
-        sorted_indices = [idx for idx, _ in scored_options]
-        n = len(sorted_indices)
-        k = obs.select.maxCount
-        
-        # Generate combinations using sorted_indices
-        k_valid = min(k, n)
-        if k_valid > 0:
-            comb_positions = list(range(k_valid))
-            for _ in range(256):
-                # Map combination positions to sorted_indices
-                actions.append([sorted_indices[p] for p in comb_positions])
+        max_k_valid = min(max_k, n)
+        min_k_valid = max(0, min(min_k, max_k_valid))
+
+        for k_val in range(min_k_valid, max_k_valid + 1):
+            if k_val == 0:
+                actions.append([])
+                if len(actions) >= 256:
+                    break
+                continue
+
+            comb_positions = list(range(k_val))
+            while True:
+                actions.append(list(comb_positions))
+                if len(actions) >= 256:
+                    break
                 
-                # Standard next combination algorithm on positions [0, n-1]
-                for i in range(k_valid):
-                    index = k_valid - i - 1
-                    if comb_positions[index] < n - i - 1:
-                        comb_positions[index] += 1
-                        for j in range(index + 1, k_valid):
+                # Standard next combination algorithm of size k_val over options [0, n-1]
+                for i in range(k_val):
+                    idx = k_val - i - 1
+                    if comb_positions[idx] < n - i - 1:
+                        comb_positions[idx] += 1
+                        for j in range(idx + 1, k_val):
                             comb_positions[j] = comb_positions[j - 1] + 1
                         break
                 else:
                     break
-
-        if not actions and n > 0:
-            actions = [[i] for i in range(min(n, max(1, k)))]
-                    
-        # Instrumentation: check if any options were truncated
-        if len(options) > 256 and len(actions) == 256:
-            included_indices = set()
-            for act in actions:
-                for idx in act:
-                    included_indices.add(idx)
-            dropped_types = set()
-            for idx in range(len(options)):
-                if idx not in included_indices:
-                    dropped_types.add(options[idx].type)
-            if dropped_types:
-                dropped_type_names = []
-                for t in dropped_types:
-                    try:
-                        dropped_type_names.append(OptionType(t).name)
-                    except Exception:
-                        dropped_type_names.append(str(t))
-                try:
-                    os.makedirs("out", exist_ok=True)
-                    with open("out/truncated_options.log", "a", encoding="utf-8") as log_f:
-                        ctx_name = obs.select.context.name if hasattr(obs.select.context, 'name') else str(obs.select.context)
-                        log_f.write(f"Total: {len(options)}, Context: {ctx_name}, Dropped types: {dropped_type_names}\n")
-                except Exception:
-                    pass
-                print(f"[DEBUG] Truncated options. Total: {len(options)}. Dropped OptionTypes: {dropped_type_names}", file=sys.stderr)
-            
-        sv_enc = get_encoder_input(obs, your_deck)
-        sv_dec = get_decoder_input(obs, actions)
-        value, policy = eval_nn(sv_enc, sv_dec, model)
-        v = value
-        if state.yourIndex != your_index:
-            v = -v
-        node.value = v
-        # Backpropagation is handled exclusively during tree expansion in mcts_agent
-
-        # Apply a prior bias to guide MCTS exploration towards constructive actions
-        has_constructive = False
-        for opt in options:
-            if opt.type in [OptionType.ATTACK, OptionType.ATTACH, OptionType.EVOLVE, OptionType.PLAY, OptionType.ABILITY]:
-                has_constructive = True
+            if len(actions) >= 256:
                 break
 
-        policy_biased = list(policy[:len(actions)])
-        for i in range(len(actions)):
-            bias = 0.0
-            has_attack = False
-            has_attach = False
-            has_evolve = False
-            has_play = False
-            has_ability = False
-            has_end = False
-            
-            for opt_idx in actions[i]:
-                if opt_idx < len(options):
-                    opt = options[opt_idx]
-                    if opt.type == OptionType.ATTACK:
-                        has_attack = True
-                    elif opt.type == OptionType.ATTACH:
-                        has_attach = True
-                    elif opt.type == OptionType.EVOLVE:
-                        has_evolve = True
-                    elif opt.type == OptionType.PLAY:
-                        has_play = True
-                    elif opt.type == OptionType.ABILITY:
-                        has_ability = True
-                    elif opt.type == OptionType.END:
-                        has_end = True
-            
-            bench_size_curr = len(obs.current.players[your_index].bench) if (obs.current and len(obs.current.players) > your_index) else 0
-            has_setup_actions = has_play or has_attach or has_evolve or has_ability
-            if has_play:
-                bias += 2.5 if bench_size_curr == 0 else 1.2  # Massive priority prior to deploy bench protection when bench is empty
-            if has_evolve:
-                bias += 1.0
-            if has_attach:
-                bias += 0.8
-            if has_ability:
-                bias += 1.0  # High priority prior for activating Pokemon abilities before attacking
-            if has_attack:
-                bias += 2.5  # Top attack prior bias so MCTS always evaluates attacking immediately alongside setup
-            if has_end and has_constructive:
-                bias -= 5.0  # Penalize passing turn if constructive actions are possible
-                
-            prior_scale = 1.0 / math.sqrt(max(1, epoch))
-            policy_biased[i] += bias * prior_scale
+        if not actions:
+            if min_k == 0:
+                actions = [[]]
+            elif n > 0:
+                actions = [[i] for i in range(min(n, max(1, min_k)))]
+            else:
+                actions = [[0]]
 
-        # Convert raw policy logits to probabilities via numerically stable softmax.
+
+        # Layer 3: Neural Network Evaluation (State Encoder + Action Decoder)
+        sv_enc = get_encoder_input(obs_obj, your_deck)
+        sv_dec = get_decoder_input(obs_obj, actions)
+        value, policy = eval_nn(sv_enc, sv_dec, model)
+
+        v = value
+        curr_index = getattr(state, "yourIndex", 0) if not isinstance(state, dict) else state.get("yourIndex", 0)
+        if curr_index != your_index:
+            v = -v
+        node.value = v
+
+        # Layer 2: Soft Prior Integration (Probability-Space Blending: NN Logits + Soft Expert Curriculum Prior)
         n_actions = len(actions)
-        max_logit = max(policy_biased) if policy_biased else 0.0
-        prob_sum = 0.0
+        nn_logits = list(policy[:n_actions]) if n_actions > 0 else []
+
+        # 1. Compute raw NN prior probabilities via Softmax over neural logits
+        if nn_logits:
+            max_nn_logit = max(nn_logits)
+            exp_nn = [math.exp(l - max_nn_logit) for l in nn_logits]
+            sum_exp_nn = sum(exp_nn)
+            nn_probs = [e / sum_exp_nn for e in exp_nn] if sum_exp_nn > 0 else [1.0 / n_actions] * n_actions
+        else:
+            nn_probs = []
+
+        curriculum_scale = expert_scale(epoch) if USE_EXPERT_GUIDANCE else 0.0
+
+        if curriculum_scale > 0.0 and nn_probs:
+            has_constructive = False
+            for opt in options:
+                opt_type = getattr(opt, "type", -1) if not isinstance(opt, dict) else opt.get("type", -1)
+                if opt_type in (OptionType.ATTACK, OptionType.ATTACH, OptionType.EVOLVE, OptionType.PLAY, OptionType.ABILITY):
+                    has_constructive = True
+                    break
+
+            expert_scores = [0.0] * n_actions
+            for i in range(n_actions):
+                bias = 0.0
+                has_end = False
+
+                for opt_idx in actions[i]:
+                    if opt_idx < len(options):
+                        opt = options[opt_idx]
+                        opt_type = getattr(opt, "type", -1) if not isinstance(opt, dict) else opt.get("type", -1)
+                        if opt_type == OptionType.END:
+                            has_end = True
+
+                        try:
+                            exp_bonus, _ = get_expert_bonus(obs_obj, opt, opponent_name=archetype, epoch=epoch)
+                            if exp_bonus <= -0.20:
+                                bias -= 2.0
+                            else:
+                                bias += exp_bonus * 1.0
+                        except Exception:
+                            pass
+
+                if has_end and has_constructive:
+                    bias -= 1.0
+
+                expert_scores[i] = bias
+
+            max_exp_score = max(expert_scores) if expert_scores else 0.0
+            exp_e = [math.exp(s - max_exp_score) for s in expert_scores]
+            sum_exp_e = sum(exp_e)
+            expert_probs = [e / sum_exp_e for e in exp_e] if sum_exp_e > 0 else [1.0 / n_actions] * n_actions
+
+            # Soft Probability Blend (Max 15% expert prior weight, 85% neural network)
+            alpha_blend = 0.15 * curriculum_scale
+            final_priors = [(1.0 - alpha_blend) * p_nn + alpha_blend * p_exp for p_nn, p_exp in zip(nn_probs, expert_probs)]
+        else:
+            final_priors = nn_probs
+
         for i in range(n_actions):
-            p = math.exp(policy_biased[i] - max_logit)
             first_opt = options[actions[i][0]] if (options and actions[i] and actions[i][0] < len(options)) else None
-            node.children.append(Child(actions[i], p, select_option=first_opt))
-            prob_sum += p
-        if prob_sum > 0.0:
-            for c in node.children:
-                c.prob /= prob_sum
-        sample = LearnSample(value, policy, sv_enc, sv_dec)
+            node.children.append(Child(actions[i], final_priors[i] if i < len(final_priors) else 1.0 / n_actions, select_option=first_opt))
+
+        target_policy_probs = [c.prob for c in node.children]
+        sample = LearnSample(value, target_policy_probs, sv_enc, sv_dec)
+
+
 
     return (node, sample)
 
-# --- Opponent Deck Database & Belief State Identification ---
+
+# --- Opponent Deck Database for Self-Play & Matchup Simulation ---
 OPPONENT_DECKS = {
     'Rulebasedmodel': [673, 673, 674, 674, 675, 675, 676, 676, 676, 677, 677, 677, 678, 678, 678, 678, 1102, 1102, 1102, 1102, 1123, 1123, 1141, 1141, 1141, 1141, 1142, 1142, 1142, 1142, 1152, 1152, 1152, 1152, 1159, 1182, 1182, 1192, 1192, 1192, 1192, 1227, 1227, 1227, 1227, 1252, 1252, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
     'Rulebasedmodel_Abomasnow': [721, 721, 722, 722, 722, 722, 723, 723, 723, 723, 1121, 1121, 1121, 1121, 1126, 1192, 1192, 1192, 1192, 1227, 1227, 1227, 1227, 1262, 1262, 1262, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
@@ -475,46 +411,113 @@ OPPONENT_DECKS = {
     'Cotini_85137077': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 131, 131, 132, 132, 133, 235, 140, 1071, 112, 1227, 1227, 1227, 1227, 1198, 1198, 1198, 1182, 1182, 1231, 1121, 1121, 1121, 1121, 1152, 1152, 1152, 1152, 1086, 1086, 1086, 1086, 1120, 1120, 1120, 1120, 1097, 1097, 1080, 1256, 1256, 1161, 343, 2, 2, 2, 5, 5, 5, 7, 7],
     'DarkLayer_85136498': [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 57, 169, 169, 169, 169, 190, 190, 190, 190, 666, 666, 666, 666, 1097, 1097, 1097, 1121, 1121, 1121, 1121, 1122, 1122, 1122, 1122, 1147, 1147, 1147, 1147, 1152, 1152, 1152, 1152, 1159, 1182, 1182, 1182, 1185, 1185, 1185, 1185, 1213, 1227, 1227, 1227, 1227, 1244, 1244, 1244, 1244],
     'DRAGOPULT': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 121, 131, 131, 132, 133, 112, 140, 184, 1086, 1086, 1086, 1086, 1121, 1121, 1121, 1121, 1079, 1079, 1097, 1097, 1182, 1182, 1182, 1227, 1227, 1227, 1198, 1198, 1201, 1240, 1231, 1152, 1152, 1152, 1152, 1080, 1246, 1246, 5, 5, 5, 5, 2, 2, 2, 7, 1079, 1123, 1119, 1122],
-    'ek': [1158, 721, 721, 722, 722, 722, 722, 723, 723, 723, 723, 1145, 1145, 1145, 1145, 1205, 1205, 1227, 1227, 1227, 1227, 1235, 1235, 1235, 1235, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
-    'Gholdengo Lunatone': [186, 186, 186, 186, 191, 676, 676, 675, 675, 311, 547, 140, 695, 1182, 1182, 1182, 1184, 1142, 1142, 1142, 1086, 1088, 1174, 1174, 6, 6, 6, 6, 6, 6, 6, 6, 8, 8, 8, 8, 700, 700, 700, 1213, 1213, 1213, 1213, 1123, 1123, 1118, 1118, 1118, 1118, 1121, 1121, 1121, 1121, 1119, 1119, 1097, 1171, 1177, 1086, 1086],
+    'ek': [1158, 721, 721, 722, 722, 722, 723, 723, 723, 723, 1145, 1145, 1145, 1145, 1205, 1205, 1227, 1227, 1227, 1227, 1235, 1235, 1235, 1235, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+    'Gholdengo Lunatone': [186, 186, 186, 186, 191, 676, 676, 675, 675, 311, 547, 140, 695, 1182, 1182, 1182, 1184, 1142, 1142, 1142, 1086, 1088, 1174, 1174, 6, 6, 6, 6, 6, 6, 6, 6, 8, 8, 8, 8, 700, 700, 700, 1213, 1213, 1213, 1213, 1123, 1123, 1118, 1118, 1118, 1118, 1121, 1121, 1121, 1121, 1119, 1119, 1097, 1177, 1086, 1086],
     'Hermes Lu': [119, 119, 119, 119, 120, 120, 120, 120, 121, 121, 121, 140, 184, 235, 235, 1071, 1079, 1079, 1080, 1086, 1086, 1086, 1086, 1097, 1097, 1120, 1120, 1120, 1120, 1121, 1121, 1121, 1121, 1152, 1152, 1152, 1156, 1182, 1182, 1182, 1198, 1198, 1198, 1198, 1210, 1210, 1227, 1227, 1227, 1227, 1256, 1256, 2, 2, 2, 2, 5, 5, 5, 5],
-    'itofuki': [65, 65, 65, 66, 66, 66, 878, 878, 878, 878, 879, 879, 879, 879, 304, 304, 1227, 1227, 1227, 1227, 1182, 1182, 1182, 1213, 1213, 1086, 1086, 1086, 1086, 1152, 1152, 1152, 1152, 1097, 1097, 1097, 1097, 1080, 1123, 1123, 1115, 1115, 1122, 1122, 1171, 1171, 1171, 1171, 1255, 1255, 1255, 1255, 19, 19, 19, 19, 11, 11, 11, 11],
-    'JBMetrix': [1030, 1030, 1030, 1030, 1031, 1031, 1031, 1031, 726, 726, 727, 727, 728, 478, 1086, 1086, 1086, 1086, 1145, 1145, 1145, 1145, 1227, 1227, 1227, 1227, 1182, 1182, 1205, 1205, 1122, 1122, 1122, 1122, 1097, 1097, 1123, 1123, 1235, 1235, 1213, 1158, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
-    'Penguin': [756, 756, 756, 756, 344, 344, 344, 345, 345, 345, 1227, 1227, 1227, 1227, 1182, 1182, 1182, 1182, 1219, 1219, 1219, 1219, 1225, 1225, 1225, 1186, 1186, 1197, 1204, 1147, 1147, 1147, 1147, 1122, 1122, 1122, 1086, 1086, 1121, 1123, 1087, 1159, 1161, 1257, 1242, 1123, 14, 14, 14, 14, 18, 18, 18, 18, 11, 11, 11, 11, 1, 1086],
-    'Raging Bolt Ogerpon': [172, 172, 172, 173, 173, 173, 63, 63, 96, 96, 174, 174, 171, 184, 140, 176, 75, 209, 1182, 1198, 1201, 1213, 1121, 1121, 1121, 1121, 1097, 1097, 1097, 1097, 1098, 1088, 1250, 1250, 1250, 1, 1, 1, 1, 1, 6, 6, 6, 4, 4, 4, 478, 171, 1198, 1198, 1198, 1132, 1132, 1132, 1132, 1119, 1119, 1119, 1124, 1152],
-    'Ryan Talcoff': [149, 149, 149, 149, 93, 93, 150, 150, 150, 96, 96, 96, 920, 920, 920, 1079, 1079, 1079, 1079, 1086, 1086, 1086, 1086, 1121, 1121, 1121, 1121, 1152, 1152, 1227, 1227, 1227, 1227, 1192, 1192, 1182, 1182, 1182, 1123, 1123, 1116, 1116, 1097, 1097, 1175, 1175, 1158, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    'Saikattyo_85136004': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 11, 11, 11, 11, 14, 14, 14, 14, 18, 18, 18, 18, 344, 344, 344, 344, 345, 345, 345, 345, 1086, 1086, 1086, 1086, 1147, 1147, 1147, 1147, 1159, 1212, 1212, 1212, 1212, 1227, 1227, 1227, 1227, 1235, 1235, 1235, 1235],
-    'Terapagos Noctowl': [176, 176, 176, 172, 172, 172, 173, 173, 173, 175, 175, 65, 65, 66, 66, 140, 1086, 1086, 1086, 1086, 1121, 1121, 1121, 1121, 1097, 1097, 1097, 1152, 1152, 1152, 1152, 1082, 1182, 1182, 1182, 1227, 1227, 1227, 1227, 1250, 1250, 1250, 1246, 1246, 1123, 1123, 1123, 1123, 1122, 1122, 1, 1, 1, 3, 3, 3, 4, 4, 4, 4],
 }
+
+
+def rule_based_opponent_agent(deck_name: str, obs: dict) -> list[int]:
+    """Fallback rule-based opponent baseline for training self-play warmups."""
+    options = obs.get("select", {}).get("option", []) if isinstance(obs, dict) else getattr(obs.select, "option", [])
+    if not options:
+        return [0]
+
+    for idx, opt in enumerate(options):
+        opt_type = opt.get("type", -1) if isinstance(opt, dict) else getattr(opt, "type", -1)
+        if opt_type == OptionType.ATTACK:
+            return [idx]
+    for idx, opt in enumerate(options):
+        opt_type = opt.get("type", -1) if isinstance(opt, dict) else getattr(opt, "type", -1)
+        if opt_type == OptionType.EVOLVE:
+            return [idx]
+    for idx, opt in enumerate(options):
+        opt_type = opt.get("type", -1) if isinstance(opt, dict) else getattr(opt, "type", -1)
+        if opt_type == OptionType.ATTACH:
+            return [idx]
+    for idx, opt in enumerate(options):
+        opt_type = opt.get("type", -1) if isinstance(opt, dict) else getattr(opt, "type", -1)
+        if opt_type == OptionType.PLAY:
+            return [idx]
+
+    return [0]
+
+
+def random_agent(obs: dict) -> list[int]:
+    """Random baseline action selector respecting minCount and maxCount bounds."""
+    options = obs.get("select", {}).get("option", []) if isinstance(obs, dict) else getattr(getattr(obs, "select", None), "option", [])
+    min_k = obs.get("select", {}).get("minCount", 1) if isinstance(obs, dict) else getattr(getattr(obs, "select", None), "minCount", 1)
+    max_k = obs.get("select", {}).get("maxCount", 1) if isinstance(obs, dict) else getattr(getattr(obs, "select", None), "maxCount", 1)
+
+    n = len(options)
+    if n == 0:
+        return [0]
+
+    k_val = min_k if min_k <= max_k else max_k
+    k_val = max(0, min(k_val, n))
+
+    if k_val == 0:
+        return []
+
+    return list(range(k_val))
+
 
 
 def get_opponent_revealed_card_ids(obs, opponent_index: int) -> list[int]:
     """Scans visible zones (active, bench, discard) to find cards played by the opponent."""
     revealed = []
-    ps = obs.current.players[opponent_index]
+    obs_obj, state, _, _ = _extract_obs_info(obs)
+    if state is None or not hasattr(state, "players"):
+        return revealed
+    ps = state.players[opponent_index]
     
-    # Active Pokémon + attached cards (energies, tools)
-    for poke in ps.active:
+    # Active Pokémon + attached cards
+    active = getattr(ps, "active", []) if not isinstance(ps, dict) else ps.get("active", [])
+    for poke in list(active):
         if poke is not None:
-            revealed.append(poke.id)
-            if poke.tools:
-                revealed.extend(t.id for t in poke.tools if t)
-            if poke.energyCards:
-                revealed.extend(e.id for e in poke.energyCards if e)
+            pid = getattr(poke, 'id', None) if not isinstance(poke, dict) else poke.get('id')
+            if pid:
+                revealed.append(pid)
+            tools = getattr(poke, 'tools', []) if not isinstance(poke, dict) else poke.get('tools', [])
+            for t in list(tools):
+                if t:
+                    tid = getattr(t, 'id', None) if not isinstance(t, dict) else t.get('id')
+                    if tid:
+                        revealed.append(tid)
+            energies = getattr(poke, 'energyCards', []) if not isinstance(poke, dict) else poke.get('energyCards', [])
+            for e in list(energies):
+                if e:
+                    eid = getattr(e, 'id', None) if not isinstance(e, dict) else e.get('id')
+                    if eid:
+                        revealed.append(eid)
                 
     # Bench Pokémon + attached cards
-    for poke in ps.bench:
+    bench = getattr(ps, "bench", []) if not isinstance(ps, dict) else ps.get("bench", [])
+    for poke in list(bench):
         if poke is not None:
-            revealed.append(poke.id)
-            if poke.tools:
-                revealed.extend(t.id for t in poke.tools if t)
-            if poke.energyCards:
-                revealed.extend(e.id for e in poke.energyCards if e)
+            pid = getattr(poke, 'id', None) if not isinstance(poke, dict) else poke.get('id')
+            if pid:
+                revealed.append(pid)
+            tools = getattr(poke, 'tools', []) if not isinstance(poke, dict) else poke.get('tools', [])
+            for t in list(tools):
+                if t:
+                    tid = getattr(t, 'id', None) if not isinstance(t, dict) else t.get('id')
+                    if tid:
+                        revealed.append(tid)
+            energies = getattr(poke, 'energyCards', []) if not isinstance(poke, dict) else poke.get('energyCards', [])
+            for e in list(energies):
+                if e:
+                    eid = getattr(e, 'id', None) if not isinstance(e, dict) else e.get('id')
+                    if eid:
+                        revealed.append(eid)
                 
     # Discard pile
-    for card in ps.discard:
+    discard = getattr(ps, "discard", []) if not isinstance(ps, dict) else ps.get("discard", [])
+    for card in list(discard):
         if card is not None:
-            revealed.append(card.id)
+            cid = getattr(card, 'id', None) if not isinstance(card, dict) else card.get('id')
+            if cid:
+                revealed.append(cid)
             
     return revealed
 
@@ -522,29 +525,24 @@ def get_opponent_revealed_card_ids(obs, opponent_index: int) -> list[int]:
 def create_dynamic_opponent_deck(revealed_ids: list[int]) -> list[int]:
     """Generates a realistic 60-card deck template using revealed cards & energy/evolution line inference."""
     deck = []
-    card_db = {c.cardId: c for c in all_card_data()}
-    
-    # 1. Include revealed cards (up to 4 copies for plausible deck reconstruction)
     seen_counts = Counter(revealed_ids)
     for cid, count in seen_counts.items():
         deck.extend([cid] * min(4, max(count, 3)))
         
-    # 2. Auto-infer evolution chain completion (e.g. Dreepy 119 -> Drakloak 120 -> Dragapult ex 121)
-    revealed_mons = [card_db[cid] for cid in revealed_ids if cid in card_db and card_db[cid].cardType == CardType.POKEMON]
+    revealed_mons = [card_table[cid] for cid in revealed_ids if cid in card_table and card_table[cid].cardType == CardType.POKEMON]
     for m in revealed_mons:
-        for c in card_db.values():
-            if getattr(c, "evolvesFrom", None) == m.name and c.cardId not in deck:
+        evos = evolves_from_map.get(m.name, [])
+        for c in evos:
+            if c.cardId not in deck:
                 deck.extend([c.cardId] * 2)
 
-    # 3. Add High-Value Competitive Trainer Staples (Ultra Ball 1121, Switch 1123, Supporters)
     trainers = [1121, 1121, 1121, 1121, 1123, 1123, 1227, 1227, 1227, 1227, 1097, 1097, 1086, 1086, 1152, 1152, 1129, 1159]
     for t_id in trainers:
         if len(deck) >= 48:
             break
         deck.append(t_id)
 
-    # 4. Fill Remaining with Energy Types up to exactly 60 Cards
-    energy_pool = [2, 5, 1, 3]  # Fire, Psychic, Grass, Water
+    energy_pool = [2, 5, 1, 3]
     idx = 0
     while len(deck) < 60:
         deck.append(energy_pool[idx % len(energy_pool)])
@@ -554,58 +552,37 @@ def create_dynamic_opponent_deck(revealed_ids: list[int]) -> list[int]:
 
 
 SIGNATURE_FINGERPRINTS = {
-    # Cynthia's Line -> Garchomp ex
-    379: "Rulebasedmodel_Garchomp_ex",      # Cynthia's Gible
-    380: "Rulebasedmodel_Garchomp_ex",      # Cynthia's Gabite
-    381: "Rulebasedmodel_Garchomp_ex",      # Cynthia's Garchomp ex
-    341: "Rulebasedmodel_Garchomp_ex",      # Cynthia's Roselia
-    1173: "Rulebasedmodel_Garchomp_ex",     # Cynthia's Power Weight
-    
-    # Ho-Oh / Fire Line
-    357: "Rulebasedmodel_HoOh_HeartGold",   # Ethan's Ho-Oh ex
-    46:  "Rulebasedmodel_HoOh_HeartGold",   # Gouging Fire ex
-    1215: "Rulebasedmodel_HoOh_HeartGold",  # Ethan's Adventure
-    
-    # Mega Starmie Line
-    1031: "Rulebasedmodel_Starmie_ex_2",    # Mega Starmie ex
-    721: "Rulebasedmodel_Starmie_ex_2",     # Kyogre
-    1145: "Rulebasedmodel_Starmie_ex_2",    # Mega Signal
-    
-    # Steven's Metagross Line
-    641: "Rulebasedmodel_Metagross_Grass",  # Steven's Metagross ex
-    639: "Rulebasedmodel_Metagross_Grass",  # Steven's Beldum
-    640: "Rulebasedmodel_Metagross_Grass",  # Steven's Metang
-    
-    # Dragapult Line
-    119: "Rulebasedmodel_Dragapult",        # Dreepy
-    120: "Rulebasedmodel_Dragapult",        # Drakloak
-    121: "Rulebasedmodel_Dragapult",        # Dragapult ex
-    
-    # Hydrapple / Ogerpon Line
-    96:  "Rulebasedmodel_Hydrapple_Ogerpon", # Teal Mask Ogerpon ex
-    150: "Rulebasedmodel_Hydrapple_Ogerpon", # Hydrapple ex
-    117: "Rulebasedmodel_Garchomp_ex_2",    # Cornerstone Mask Ogerpon ex
-    
-    # Team Rocket Lines
-    891: "Rulebasedmodel_Honchkrow",        # Team Rocket's Honchkrow
-    463: "Rulebasedmodel_Honchkrow",        # Team Rocket's Murkrow
-    473: "Rulebasedmodel_Honchkrow",        # Team Rocket's Porygon
-    
-    # Typhlosion Line
-    352: "Rulebasedmodel_Typhlosion",       # Cyndaquil
-    354: "Rulebasedmodel_Typhlosion",       # Typhlosion
-    
-    # Lopunny Line
-    65:  "Rulebasedmodel_Lopunny",          # Buneary
-    66:  "Rulebasedmodel_Lopunny",          # Lopunny
-    
-    # Grimmsnarl Line
-    646: "Rulebasedmodel_Grimmsnarl_ex",    # Impidimp
-    648: "Rulebasedmodel_Grimmsnarl_ex",    # Grimmsnarl ex
-    
-    # Alakazam Line
-    265: "Rulebasedmodel_Iono",             # Abra
-    271: "Rulebasedmodel_Iono",             # Alakazam ex
+    379: "Rulebasedmodel_Garchomp_ex",
+    380: "Rulebasedmodel_Garchomp_ex",
+    381: "Rulebasedmodel_Garchomp_ex",
+    341: "Rulebasedmodel_Garchomp_ex",
+    1173: "Rulebasedmodel_Garchomp_ex",
+    357: "Rulebasedmodel_HoOh_HeartGold",
+    46:  "Rulebasedmodel_HoOh_HeartGold",
+    1215: "Rulebasedmodel_HoOh_HeartGold",
+    1031: "Rulebasedmodel_Starmie_ex_2",
+    721: "Rulebasedmodel_Starmie_ex_2",
+    1145: "Rulebasedmodel_Starmie_ex_2",
+    641: "Rulebasedmodel_Metagross_Grass",
+    639: "Rulebasedmodel_Metagross_Grass",
+    640: "Rulebasedmodel_Metagross_Grass",
+    119: "Rulebasedmodel_Dragapult",
+    120: "Rulebasedmodel_Dragapult",
+    121: "Rulebasedmodel_Dragapult ex",
+    96:  "Rulebasedmodel_Hydrapple_Ogerpon",
+    150: "Rulebasedmodel_Hydrapple_Ogerpon",
+    117: "Rulebasedmodel_Garchomp_ex_2",
+    891: "Rulebasedmodel_Honchkrow",
+    463: "Rulebasedmodel_Honchkrow",
+    473: "Rulebasedmodel_Honchkrow",
+    352: "Rulebasedmodel_Typhlosion",
+    354: "Rulebasedmodel_Typhlosion",
+    65:  "Rulebasedmodel_Lopunny",
+    66:  "Rulebasedmodel_Lopunny",
+    646: "Rulebasedmodel_Grimmsnarl_ex",
+    648: "Rulebasedmodel_Grimmsnarl_ex",
+    265: "Rulebasedmodel_Iono",
+    271: "Rulebasedmodel_Iono",
 }
 
 
@@ -615,7 +592,6 @@ def sample_opponent_belief_deck(revealed_ids: list[int], opponent_decks: dict) -
         sample_key = random.choice(list(opponent_decks.keys()))
         return opponent_decks[sample_key]
 
-    # Instant Signature Fingerprint Check (Option 3): Lock in 99% confidence on Turn 1!
     for cid in revealed_ids:
         if cid in SIGNATURE_FINGERPRINTS:
             matched_archetype = SIGNATURE_FINGERPRINTS[cid]
@@ -632,11 +608,8 @@ def sample_opponent_belief_deck(revealed_ids: list[int], opponent_decks: dict) -
         scores[name] = matches / r_len
 
     max_score = max(scores.values()) if scores else 0.0
-    
-    # Low max_score means low confidence in known archetypes -> favors dynamic template
     dynamic_score = max(0.0, 1.0 - max_score * 1.5)
     
-    # Softmax temperature-scaled belief probabilities
     temp = 4.0
     exp_scores = {k: math.exp(v * temp) for k, v in scores.items()}
     exp_scores["__DYNAMIC__"] = math.exp(dynamic_score * temp)
@@ -656,404 +629,344 @@ def sample_opponent_belief_deck(revealed_ids: list[int], opponent_decks: dict) -
 def get_own_visible_card_ids(obs, your_index: int) -> list[int]:
     """Scans all visible own zones (active, bench, discard, hand) to find card IDs."""
     visible = []
-    ps = obs.current.players[your_index]
+    obs_obj, state, _, _ = _extract_obs_info(obs)
+    if state is None or not hasattr(state, "players"):
+        return visible
+    ps = state.players[your_index]
     
     # Hand
-    for card in ps.hand:
+    hand = getattr(ps, "hand", []) if not isinstance(ps, dict) else ps.get("hand", [])
+    for card in list(hand):
         if card is not None:
-            visible.append(card.id)
+            cid = getattr(card, 'id', None) if not isinstance(card, dict) else card.get('id')
+            if cid:
+                visible.append(cid)
             
-    # Active Pokémon + attached cards (energies, tools)
-    for poke in ps.active:
+    # Active Pokémon + attached cards
+    active = getattr(ps, "active", []) if not isinstance(ps, dict) else ps.get("active", [])
+    for poke in list(active):
         if poke is not None:
-            visible.append(poke.id)
-            if poke.tools:
-                visible.extend(t.id for t in poke.tools if t)
-            if poke.energyCards:
-                visible.extend(e.id for e in poke.energyCards if e)
+            pid = getattr(poke, 'id', None) if not isinstance(poke, dict) else poke.get('id')
+            if pid:
+                visible.append(pid)
+            tools = getattr(poke, 'tools', []) if not isinstance(poke, dict) else poke.get('tools', [])
+            for t in list(tools):
+                if t:
+                    tid = getattr(t, 'id', None) if not isinstance(t, dict) else t.get('id')
+                    if tid:
+                        visible.append(tid)
+            energies = getattr(poke, 'energyCards', []) if not isinstance(poke, dict) else poke.get('energyCards', [])
+            for e in list(energies):
+                if e:
+                    eid = getattr(e, 'id', None) if not isinstance(e, dict) else e.get('id')
+                    if eid:
+                        visible.append(eid)
                 
     # Bench Pokémon + attached cards
-    for poke in ps.bench:
+    bench = getattr(ps, "bench", []) if not isinstance(ps, dict) else ps.get("bench", [])
+    for poke in list(bench):
         if poke is not None:
-            visible.append(poke.id)
-            if poke.tools:
-                visible.extend(t.id for t in poke.tools if t)
-            if poke.energyCards:
-                visible.extend(e.id for e in poke.energyCards if e)
+            pid = getattr(poke, 'id', None) if not isinstance(poke, dict) else poke.get('id')
+            if pid:
+                visible.append(pid)
+            tools = getattr(poke, 'tools', []) if not isinstance(poke, dict) else poke.get('tools', [])
+            for t in list(tools):
+                if t:
+                    tid = getattr(t, 'id', None) if not isinstance(t, dict) else t.get('id')
+                    if tid:
+                        visible.append(tid)
+            energies = getattr(poke, 'energyCards', []) if not isinstance(poke, dict) else poke.get('energyCards', [])
+            for e in list(energies):
+                if e:
+                    eid = getattr(e, 'id', None) if not isinstance(e, dict) else e.get('id')
+                    if eid:
+                        visible.append(eid)
                 
     # Discard pile
-    for card in ps.discard:
+    discard = getattr(ps, "discard", []) if not isinstance(ps, dict) else ps.get("discard", [])
+    for card in list(discard):
         if card is not None:
-            visible.append(card.id)
+            cid = getattr(card, 'id', None) if not isinstance(card, dict) else card.get('id')
+            if cid:
+                revealed.append(cid)
             
     return visible
 
 
-def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel, search_count: int = None, temperature: float = 0.0, force_action: list[int] = None, opponent_name: str = "unknown", epoch: int = 1) -> tuple[list[int], LearnSample]:
-    """Perform MCTS exploration and select the best action list, returning it and a training sample."""
-    obs = to_observation_class(obs_dict)
-    your_index = obs.current.yourIndex
-    state = obs.current
-    active = state.players[1 - your_index].active
-    
-    # Dynamically sample opponent belief deck using Bayesian Information Set probabilities
-    opp_index = 1 - your_index
-    revealed_ids = get_opponent_revealed_card_ids(obs, opp_index)
-    matched_deck = sample_opponent_belief_deck(revealed_ids, OPPONENT_DECKS)
-    
-    # Use Counter for O(1) per-card removal instead of O(n) list.remove()
-    remaining_counter = Counter(matched_deck)
-    for cid in revealed_ids:
-        if remaining_counter.get(cid, 0) > 0:
-            remaining_counter[cid] -= 1
-    remaining_cards = []
-    for cid, cnt in remaining_counter.items():
-        remaining_cards.extend([cid] * cnt)
-    random.shuffle(remaining_cards)
-    
-    deck_count = state.players[opp_index].deckCount
-    prize_count = len(state.players[opp_index].prize)
-    hand_count = state.players[opp_index].handCount
-    
-    total_needed = deck_count + prize_count + hand_count
-    if len(remaining_cards) < total_needed:
-        # Fallback padding if deck mismatch occurs
-        remaining_cards.extend([3] * (total_needed - len(remaining_cards)))
-        
-    opp_deck_sampled = remaining_cards[:deck_count]
-    opp_prize_sampled = remaining_cards[deck_count:deck_count + prize_count]
-    opp_hand_sampled = remaining_cards[deck_count + prize_count:deck_count + prize_count + hand_count]
-    
-    # Sample own hidden zones correctly — Counter for O(1) per-card removal
-    own_counter = Counter(your_deck)
-    own_visible = get_own_visible_card_ids(obs, your_index)
-    for cid in own_visible:
-        if own_counter.get(cid, 0) > 0:
-            own_counter[cid] -= 1
-    own_remaining = []
-    for cid, cnt in own_counter.items():
-        own_remaining.extend([cid] * cnt)
-    random.shuffle(own_remaining)
-    
-    own_prize_count = len(state.players[your_index].prize)
-    own_deck_count = state.players[your_index].deckCount
-    
-    # Safe fallback if count mismatch
-    total_own_needed = own_prize_count + own_deck_count
-    if len(own_remaining) < total_own_needed:
-        own_remaining.extend([3] * (total_own_needed - len(own_remaining)))
-        
-    your_prize_sampled = own_remaining[:own_prize_count]
-    your_deck_sampled = own_remaining[own_prize_count:own_prize_count + own_deck_count]
-    
-    search_state = search_begin(
-        obs,
-        your_deck=your_deck_sampled,
-        your_prize=your_prize_sampled,
-        opponent_deck=opp_deck_sampled,
-        opponent_prize=opp_prize_sampled,
-        opponent_hand=opp_hand_sampled,
-        opponent_active=[1072] if len(active) > 0 and active[0] is None else []
-    )
-    
-    root, sample = create_node(None, search_state, your_index, your_deck, model, epoch=epoch)
-
-    # Add Dirichlet noise to root prior for exploration (AlphaZero-style)
-    # Without noise, MCTS always explores the same paths from the NN prior,
-    # causing mode collapse (the agent repeatedly selects "end turn").
-    if len(root.children) > 0:
-        dir_alpha = 0.3  # TCG has moderate action space
-        turn = state.turn if (state is not None) else 0
-        noise_frac = 0.25  # AlphaZero standard; 0.40 was over-randomising with only 50 sims
-        noise = [random.gammavariate(dir_alpha, 1.0) for _ in root.children]
-        noise_sum = sum(noise) + 1e-8
-        noise = [n / noise_sum for n in noise]
-        for i, child in enumerate(root.children):
-            child.prob = (1.0 - noise_frac) * child.prob + noise_frac * noise[i]
-
-    # Dynamic Simulation Count based on game urgency (Option 2: 350 MCTS Rollout Expansion)
-    # Opening (Turns 1-3): 120 sims (fast opening setup)
-    # Midgame (Turns 4-9): 200 sims (balanced board development)
-    # Critical Endgame / Clutch Turns (Turn 10+ or <=3 prizes remaining or Active HP < 100): 350 sims (Maximum 2x thinking depth)
-    if search_count is None or search_count >= 200:
-        turn = state.turn if (state is not None) else 1
-        my_prizes = len(state.players[your_index].prize) if (state and len(state.players) > your_index) else 6
-        opp_prizes = len(state.players[opp_index].prize) if (state and len(state.players) > opp_index) else 6
-        min_prizes = min(my_prizes, opp_prizes)
-        
-        my_active_pk = state.players[your_index].active[0] if (state and len(state.players[your_index].active) > 0 and state.players[your_index].active[0]) else None
-        active_hp = my_active_pk.hp if my_active_pk else 300
-        
-        is_clutch_turn = (min_prizes <= 3) or (active_hp < 100) or (turn >= 10)
-        
-        if is_clutch_turn:
-            dynamic_search_count = 350  # 350 MCTS rollouts for clutch game-deciding turns
-        elif turn <= 3:
-            dynamic_search_count = 120  # Fast setup
-        else:
-            dynamic_search_count = 200  # Balanced midgame
-    else:
-        dynamic_search_count = search_count
-
-    # Caps simulations in the Kaggle runtime environment if total time is constrained
-    IS_KAGGLE = os.path.exists('/kaggle_simulations/agent') or 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
-    if IS_KAGGLE and search_count is None:
-        dynamic_search_count = min(dynamic_search_count, 250)
-
-    # Search loop
-    for _ in range(dynamic_search_count):
-        current = root
-        while True:
-            value = -1e9
-            # PUCT: Q(s,a) + C_PUCT * P(s,a) * sqrt(N(parent)) / (1 + N(s,a))
-            # C_PUCT is a fixed constant per AlphaZero (not scaled by parent visits).
-            puct_scale = C_PUCT * math.sqrt(max(1, current.visit))
-            next_child = None
-            for child in current.children:
-                visit = 0
-                if child.node is None:
-                    v = current.total / max(1, current.visit)
-                else:
-                    v = child.node.total / max(1, child.node.visit)
-                    visit = child.node.visit
-                
-                if current.state.observation.current.yourIndex != your_index:
-                    v = -v
-                exp_bonus = 0.0
-                if child.select_option is not None and hasattr(current.state, "observation"):
-                    exp_bonus, _ = get_expert_bonus(current.state.observation, child.select_option, opponent_name=opponent_name)
-                v += puct_scale * child.prob / (1 + visit) + EXPERT_WEIGHT * exp_bonus
-                if value < v:
-                    value = v
-                    next_child = child
-            
-            if next_child.node is None:
-                search_state = search_step(current.state.searchId, next_child.select)
-                next_child.node, _ = create_node(current, search_state, your_index, your_deck, model, epoch=epoch)
-                next_child.node.backprop(next_child.node.value)
-                break
-            else:
-                current = next_child.node
-                if current.state.observation.current.result >= 0:
-                    current.backprop(current.value)
-                    break
-
-    # Select action according to temperature:
-    #   temperature=0.0 → argmax on visit counts (deterministic / evaluation mode)
-    #   temperature=1.0 → sample proportional to visit counts (AlphaZero training mode)
-    visited_children = [c for c in root.children if c.node is not None]
-    
-    if temperature > 0.0 and visited_children:
-        # AlphaZero-style: sample proportional to N(s,a)^(1/τ)
-        visits = [c.node.visit ** (1.0 / temperature) for c in visited_children]
-        total_v = sum(visits)
-        if total_v > 0:
-            weights = [v / total_v for v in visits]
-            max_child = random.choices(visited_children, weights=weights, k=1)[0]
-        else:
-            max_child = visited_children[0]
-    else:
-        # Argmax (evaluation / greedy mode)
-        max_child = None
-        max_visit = -1
-        for child in visited_children:
-            if child.node.visit > max_visit:
-                max_child = child
-                max_visit = child.node.visit
-
-    # Fallback: if no children were visited (e.g. search_count=0), pick highest-prior child
-    if max_child is None and root.children:
-        max_child = max(root.children, key=lambda c: c.prob)
-
-    # Handle terminal root state — sample is None when the game is already over at root
-    if sample is None:
-        search_end()
-        sel = max_child.select if max_child is not None else []
-        return (sel, LearnSample(0.0, [], SparseVector(), SparseVector()))
-
-    # Generate targets/labels for training
-    # Value target: root mean value
-    sample.value = root.total / root.visit
-
-    # Policy target: visit count distribution (AlphaZero-style)
-    # Visit counts are more robust than Q-value differences with limited simulations.
-    total_child_visits = sum(
-        child.node.visit for child in root.children if child.node is not None
-    )
+def mcts_agent(obs: dict,
+               your_deck: list[int],
+               client: GPUInferenceClient | None = None,
+               search_count: int = SEARCH_COUNT,
+               temperature: float = 1.0,
+               force_action: list[int] | None = None,
+               opponent_name: str = "",
+               epoch: int = 1
+) -> tuple[list[int], LearnSample | None]:
+    """
+    AlphaZero MCTS Agent Implementation
+    Executes MCTS tree search over search_count iterations, guided by Neural Network V(s) & P(s, a).
+    Returns: (selected_action_indices, training_sample)
+    """
     if force_action is not None:
-        found = False
-        for i in range(len(root.children)):
-            child = root.children[i]
-            if child.select == force_action:
-                sample.policy[i] = 1.0
-                found = True
-            else:
-                sample.policy[i] = 0.0
-        if not found and len(root.children) > 0:
-            sample.policy[0] = 1.0
-    elif total_child_visits > 0:
-        for i in range(len(root.children)):
-            child = root.children[i]
-            if child.node is not None:
-                sample.policy[i] = child.node.visit / total_child_visits
-            else:
-                sample.policy[i] = 0.0
-    else:
-        # Fallback: uniform if no visits
-        n = len(root.children)
-        for i in range(n):
-            sample.policy[i] = 1.0 / n
+        return force_action, None
 
-    search_end()
-    final_selected = force_action if force_action is not None else (max_child.select if max_child is not None else [])
-    return (final_selected, sample)
+    obs_dataclass = to_observation_class(obs)
+    obs_obj, state, result, your_idx = _extract_obs_info(obs_dataclass)
+    if result >= 0:
+        return [0], None
 
-
-def random_agent(obs_dict: dict) -> list[int]:
-    """Random baseline agent."""
-    obs = to_observation_class(obs_dict)
-    return random.sample(list(range(len(obs.select.option))), obs.select.maxCount)
-
-
-# Cached global model and deck to avoid repeated loading
-_model = None
-_deck = None
-
-
-def agent(obs_dict: dict) -> list[int]:
-    """Kaggle Competition Entry point function."""
-    global _model, _deck
-    
-    # Load deck list
-    if _deck is None:
-        if "__file__" in globals():
-            base_path = os.path.dirname(os.path.abspath(__file__))
-        else:
-            base_path = os.getcwd()
-        deck_path = os.path.join(base_path, "deck.csv")
+    select_obj = getattr(obs_dataclass, "select", None)
+    opts = getattr(select_obj, "option", []) if select_obj else []
+    if len(opts) == 0:
+        return [0], None
+    if len(opts) == 1:
         try:
-            with open(deck_path, "r") as f:
-                _deck = [int(line.strip()) for line in f if line.strip()]
+            sv_enc = get_encoder_input(obs_obj, your_deck)
+            sv_dec = get_decoder_input(obs_obj, [[0]])
+            single_sample = LearnSample(0.0, [1.0], sv_enc, sv_dec)
+            single_sample.pred_val = 0.0
+            return [0], single_sample
         except Exception:
-            # Fallback to exact Team Rocket 60-card decklist
-            _deck = [1, 1, 1, 1, 1, 1, 5, 5, 5, 5, 15, 15, 15, 15, 400, 400, 400, 401, 401, 401, 414, 414, 431, 431, 432, 434, 1094, 1094, 1097, 1097, 1116, 1121, 1121, 1121, 1121, 1129, 1134, 1134, 1134, 1134, 1152, 1159, 1175, 1216, 1216, 1216, 1216, 1217, 1217, 1218, 1218, 1218, 1219, 1220, 1220, 1220, 1227, 1227, 1257, 1257]
+            return [0], None
 
-    # Check if this is the initial deck-registration step (obs.select is None)
-    if obs_dict.get("select") is None:
-        return _deck
+    search_state = None
+    if getattr(obs_dataclass, "search_begin_input", None) is not None:
+        try:
+            opp_idx = 1 - your_idx
+            revealed_ids = get_opponent_revealed_card_ids(obs_dataclass, opp_idx)
+            matched_deck = sample_opponent_belief_deck(revealed_ids, OPPONENT_DECKS)
 
-    # Load model weights
-    if _model is None:
-        _model = MyModel(
-            MODEL_D_MODEL,
-            MODEL_NUM_HEADS,
-            MODEL_D_FEEDFORWARD,
-            MODEL_NUM_LAYERS_ENCODER,
-            MODEL_NUM_LAYERS_DECODER
-        )
-        if "__file__" in globals():
-            base_path = os.path.dirname(os.path.abspath(__file__))
-        else:
-            base_path = os.getcwd()
-        candidate_paths = [
-            os.path.join(base_path, "best_model.pth"),
-            os.path.join(base_path, "model.pth"),
-            os.path.join(os.getcwd(), "best_model.pth"),
-            os.path.join(os.getcwd(), "model.pth"),
-            "/kaggle_simulations/agent/best_model.pth",
-            "/kaggle_simulations/agent/model.pth"
-        ]
+            remaining_counter = Counter(matched_deck)
+            for cid in revealed_ids:
+                if remaining_counter.get(cid, 0) > 0:
+                    remaining_counter[cid] -= 1
+            remaining_cards = []
+            for cid, cnt in remaining_counter.items():
+                remaining_cards.extend([cid] * cnt)
+            random.shuffle(remaining_cards)
+
+            opp_player = state.players[opp_idx] if state and hasattr(state, "players") else None
+            deck_count = getattr(opp_player, "deckCount", 0) if opp_player else 0
+            prize_count = len(getattr(opp_player, "prize", [])) if opp_player else 0
+            hand_count = getattr(opp_player, "handCount", 0) if opp_player else 0
+
+            total_needed = deck_count + prize_count + hand_count
+            if len(remaining_cards) < total_needed:
+                remaining_cards.extend([3] * (total_needed - len(remaining_cards)))
+
+            opp_deck_sampled = remaining_cards[:deck_count]
+            opp_prize_sampled = remaining_cards[deck_count:deck_count + prize_count]
+            opp_hand_sampled = remaining_cards[deck_count + prize_count:deck_count + prize_count + hand_count]
+
+            own_counter = Counter(your_deck)
+            own_visible = get_own_visible_card_ids(obs_dataclass, your_idx)
+            for cid in own_visible:
+                if own_counter.get(cid, 0) > 0:
+                    own_counter[cid] -= 1
+            own_remaining = []
+            for cid, cnt in own_counter.items():
+                own_remaining.extend([cid] * cnt)
+            random.shuffle(own_remaining)
+
+            my_player = state.players[your_idx] if state and hasattr(state, "players") else None
+            own_prize_count = len(getattr(my_player, "prize", [])) if my_player else 0
+            own_deck_count = getattr(my_player, "deckCount", 0) if my_player else 0
+
+            total_own_needed = own_prize_count + own_deck_count
+            if len(own_remaining) < total_own_needed:
+                own_remaining.extend([3] * (total_own_needed - len(own_remaining)))
+
+            your_prize_sampled = own_remaining[:own_prize_count]
+            your_deck_sampled = own_remaining[own_prize_count:own_prize_count + own_deck_count]
+            active = getattr(opp_player, "active", []) if opp_player else []
+            opp_active_sampled = [1072] if len(active) > 0 and active[0] is None else []
+
+            search_state = search_begin(
+                obs_dataclass,
+                your_deck=your_deck_sampled,
+                your_prize=your_prize_sampled,
+                opponent_deck=opp_deck_sampled,
+                opponent_prize=opp_prize_sampled,
+                opponent_hand=opp_hand_sampled,
+                opponent_active=opp_active_sampled
+            )
+        except Exception:
+            search_state = obs_dataclass
+
+    if search_state is None:
+        search_state = obs_dataclass
+
+    root, sample = create_node(None, search_state, your_idx, your_deck, client, epoch=epoch)
+    if not root.children:
+        return [0], sample
+
+    # AlphaZero Root Dirichlet Noise for self-play exploration (temperature > 0.01)
+    if temperature > 0.01 and len(root.children) > 1:
+        epsilon = 0.25
+        alpha = 0.30
+        try:
+            dirichlet = torch.distributions.Dirichlet(torch.full((len(root.children),), alpha)).sample().tolist()
+            for idx, child in enumerate(root.children):
+                child.prob = (1.0 - epsilon) * child.prob + epsilon * dirichlet[idx]
+        except Exception:
+            pass
+
+
+    # Pure AlphaZero MCTS Search Loop
+    for _ in range(search_count):
+        curr = root
         
-        loaded = False
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        for model_path in candidate_paths:
-            if os.path.exists(model_path):
+        # 1. Selection Phase: Traverse tree using AlphaZero PUCT formula
+        while curr.children and curr.children[0].node is not None:
+            best_puct = -1e9
+            best_child = curr.children[0]
+            total_visits = sum(c.node.visit if c.node else 0 for c in curr.children) + 1
+            
+            for child in curr.children:
+                if child.node is None:
+                    continue
+                # AlphaZero PUCT Equation
+                q_val = child.node.total / max(1, child.node.visit)
+                u_val = C_PUCT * child.prob * (math.sqrt(total_visits) / (1 + child.node.visit))
+                puct = q_val + u_val
+                if puct > best_puct:
+                    best_puct = puct
+                    best_child = child
+            curr = best_child.node
+
+        # 2. Expansion & Evaluation Phase
+        if curr.children:
+            unvisited_children = [c for c in curr.children if c.node is None]
+            if unvisited_children:
+                target_child = unvisited_children[0]
+                next_state = curr.state
                 try:
-                    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
-                    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-                        _model.load_state_dict(checkpoint["state_dict"])
-                    else:
-                        _model.load_state_dict(checkpoint)
-                    print(f"Loaded RL model checkpoint from: {model_path}", file=sys.stderr)
-                    loaded = True
-                    break
-                except Exception as e:
-                    print(f"Failed to load checkpoint {model_path}: {e}", file=sys.stderr)
-        
-        if not loaded:
-            print("Warning: No checkpoint loaded! Operating on fresh RL model weights.", file=sys.stderr)
-        
-        _model = _model.to(device)
-        _model.eval()
+                    search_id = getattr(curr.state, "searchId", None)
+                    if search_id is not None:
+                        next_state = search_step(search_id, target_child.select)
+                except Exception:
+                    pass
 
-    # Determine adaptive search count budget based on current turn & remaining overage time
-    obs = to_observation_class(obs_dict)
-    turn = obs.current.turn if (obs.current is not None) else 0
-    remaining_time = float(obs_dict.get('remainingOverageTime', 600.0))
-    
-    # Check if active is walled (Mewtwo ex active against opponent Mimikyu)
-    active_is_walled = False
-    try:
-        your_index = obs.current.yourIndex
-        my_active = obs.current.players[your_index].active
-        opp_active = obs.current.players[1 - your_index].active
-        if my_active and opp_active:
-            if my_active[0].id == 431 and opp_active[0].id == 434:
-                active_is_walled = True
-    except Exception:
-        pass
+                next_node, _ = create_node(curr, next_state, your_idx, your_deck, client, epoch=epoch)
+                target_child.node = next_node
+                
+                # 3. Backpropagation Phase
+                next_node.backprop(next_node.value)
 
-    # Check if context is MAIN (critical turn-beginning choice)
-    is_main_context = False
-    try:
-        if obs.select is not None and obs.select.context == SelectContext.MAIN:
-            is_main_context = True
-    except Exception:
-        pass
+
+    # 4. Action Selection based on Visit Count Distribution N(s, a)^(1/tau)
+    visits = [c.node.visit if c.node else 0 for c in root.children]
+    sum_visits = sum(visits)
+
+    # Update training sample policy target to true MCTS visit count distribution pi_mcts(a) = N(a) / sum(N)
+    if sample is not None and sum_visits > 0:
+        sample.policy = [v / sum_visits for v in visits]
+
+    if sum_visits == 0:
+        return root.children[0].select, sample
+
+    if temperature <= 0.01:
+        # Deterministic max-visit action selection (Inference / Tournament Mode)
+        best_idx = visits.index(max(visits))
+        return root.children[best_idx].select, sample
+    else:
+        # Stochastic temperature-scaled action sampling (Exploration / Self-Play Mode)
+        scaled_visits = [v ** (1.0 / temperature) for v in visits]
+        total_sv = sum(scaled_visits)
+        if total_sv <= 0:
+            return root.children[0].select, sample
+        probs = [v / total_sv for v in scaled_visits]
+        selected_idx = random.choices(range(len(probs)), weights=probs, k=1)[0]
+        return root.children[selected_idx].select, sample
+
+
+
+my_deck_global = None
+
+def _load_my_deck():
+    global my_deck_global
+    if my_deck_global is None:
+        candidate_paths = [
+            "deck.csv",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "deck.csv"),
+            "/kaggle_simulations/agent/deck.csv",
+            "deck_mewtwo_battle_cage.csv"
+        ]
+        for path in candidate_paths:
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8-sig") as f:
+                        ids = [int(l.strip()) for l in f if l.strip()]
+                        if len(ids) == 60:
+                            my_deck_global = ids
+                            break
+                except Exception:
+                    pass
+        if my_deck_global is None:
+            my_deck_global = OPPONENT_DECKS.get("Rulebasedmodel_Mewtwo", [])
+    return my_deck_global
+
+
+model_global = None
+
+def agent(obs, configuration=None) -> list[int]:
+    """Kaggle Competition Agent Entry Point."""
+    global model_global
+
+    your_deck = _load_my_deck()
+
+    # Step 0: Initial deck registration step in Kaggle cabt
+    # When obs["select"] is None, Kaggle expects the 60 card IDs list
+    if isinstance(obs, dict):
+        if obs.get("select") is None:
+            return your_deck
+    else:
+        if getattr(obs, "select", None) is None:
+            return your_deck
+
+    if model_global is None:
+        try:
+            model_global = MyModel(
+                MODEL_D_MODEL,
+                MODEL_NUM_HEADS,
+                MODEL_D_FEEDFORWARD,
+                MODEL_NUM_LAYERS_ENCODER,
+                MODEL_NUM_LAYERS_DECODER
+            )
+            model_path = "best_model.pth"
+            if not os.path.exists(model_path):
+                model_path = "model.pth"
+            if os.path.exists(model_path):
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+                if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                    model_global.load_state_dict(checkpoint["state_dict"], strict=False)
+                else:
+                    model_global.load_state_dict(checkpoint, strict=False)
+                model_global.to(device)
+                model_global.eval()
+        except Exception:
+            model_global = None
+
+    remaining_time = 600.0
+    if isinstance(obs, dict):
+        remaining_time = float(obs.get('remainingOverageTime', 600.0))
+    elif hasattr(obs, 'remainingOverageTime'):
+        remaining_time = float(getattr(obs, 'remainingOverageTime', 600.0))
 
     IS_KAGGLE = os.path.exists('/kaggle_simulations/agent') or 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
     if remaining_time < 60.0:
-        # Emergency fast play mode to prevent TIMEOUT when remaining time is low (<60s)
         search_count = 5
     elif remaining_time < 150.0:
-        # Low time budget mode (<150s)
-        search_count = 8
+        search_count = 10
     elif remaining_time < 300.0:
-        # Moderate time budget mode (<300s)
-        if active_is_walled or is_main_context:
-            search_count = 20 if IS_KAGGLE else 50
-        else:
-            search_count = 10 if IS_KAGGLE else 25
-    elif IS_KAGGLE:
-        # Standard Kaggle budget with comfortable time remaining (>300s)
-        if active_is_walled or is_main_context:
-            search_count = 100  # Deep search for critical main context choices
-        elif turn <= 3:
-            search_count = 70
-        elif turn <= 8:
-            search_count = 50
-        else:
-            search_count = 40
+        search_count = 20 if IS_KAGGLE else 50
     else:
-        # Standard local/eval budget
-        if active_is_walled or is_main_context:
-            search_count = 180  # Boost budget to 150-200 for critical/walled decisions
-        elif turn <= 3:
-            search_count = 150
-        elif turn <= 8:
-            search_count = 100
-        else:
-            search_count = 50
+        search_count = 50 if IS_KAGGLE else 200
 
     try:
-        with torch.inference_mode():
-            action, _ = mcts_agent(obs_dict, _deck, _model, search_count=search_count)
-        return action if (action or not obs.select or not obs.select.option) else list(range(min(getattr(obs.select, "maxCount", 1), len(obs.select.option))))
-    except Exception as e:
-        print(f"MCTS Agent crashed: {e}. Falling back to default action.", file=sys.stderr)
-        obs = to_observation_class(obs_dict)
-        if obs.select and obs.select.option:
-            n_opts = len(obs.select.option)
-            k_opts = min(getattr(obs.select, "maxCount", 1), n_opts)
-            return list(range(k_opts))
-        return []
+        selected, _ = mcts_agent(obs, your_deck, client=model_global, search_count=search_count, temperature=0.0)
+        return selected
+    except Exception:
+        return [0]
+

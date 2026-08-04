@@ -122,11 +122,31 @@ def calculate_lillie_strategic_reward(pre: dict, post: dict, action_type: int, s
     # 2. ENERGY ATTACHMENT ACTIONS (action_type == 8)
     # -------------------------------------------------------------------------
     elif action_type == 8:
+        try:
+            from src.expert_system.energy_evaluator import compute_generic_energy_reward
+        except ImportError:
+            from expert_system.energy_evaluator import compute_generic_energy_reward
+
         attached_id = pre.get("attached_card_id", -1)
-        if attached_id == TELEPATHIC_ENERGY_ID:
-            r_strategic += 0.22  # Attachment + 2 Basic {P} benching
-        else:
-            r_strategic += 0.10
+        target_id   = pre.get("attached_target_id", -1)
+        target_energy = pre.get("target_energy", 0)
+        active_id   = pre.get("active_id", -1)
+        active_energy = pre.get("active_energy", 0)
+        bench_ids   = pre.get("bench_ids", [])
+        bench_energies = pre.get("bench_energies", [])
+        
+        energy_added = 2 if attached_id in (19, 15) else 1
+        r_strategic += compute_generic_energy_reward(
+            target_card_id=target_id,
+            energy_before=target_energy,
+            energy_after=target_energy + energy_added,
+            attached_card_id=attached_id,
+            is_active_target=(target_id == active_id),
+            bench_ids=bench_ids,
+            bench_energies_before=bench_energies,
+            active_id=active_id,
+            active_energy_before=active_energy
+        )
 
     # -------------------------------------------------------------------------
     # 3. EVOLUTION ACTIONS (action_type == 9)
@@ -168,6 +188,7 @@ def calculate_lillie_strategic_reward(pre: dict, post: dict, action_type: int, s
     if action_type in (7, 8, 9):
         r_strategic += 0.05
 
-    # Bounded in range [-0.25, +0.25]
-    r_strategic = max(-0.25, min(0.25, r_strategic))
+    # Smooth mathematical soft-scaling via tanh (strictly bounded in (-0.25, +0.25) without hard clipping)
+    import math
+    r_strategic = 0.25 * math.tanh(r_strategic / 0.25)
     return r_strategic

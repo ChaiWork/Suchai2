@@ -1,33 +1,37 @@
 """
-Team Rocket Mewtwo ex + Spidops Refactored Heuristic Expert Engine.
-Ground Truth: Matches 60-card CSV list (deck copy BARU CARD TAPI KECEWA.csv).
-Provides small strategic action prior guidance (range [-0.20, +0.20]) for MCTS exploration.
+Team Rocket Mewtwo ex Heuristic Expert Engine (v3 Refined).
+Ground Truth: Matches 60-card CSV list (deck lama.csv / deck_mewtwo.csv).
+Provides phase-aware strategic action prior guidance (range [-0.20, +0.20]) for MCTS exploration.
 """
-from cg.api import OptionType
 
-# Card ID Constants (From Deck CSV Ground Truth)
+from cg.api import OptionType
+try:
+    from src.expert_system.search_strategy import score_search_target
+except ImportError:
+    from expert_system.search_strategy import score_search_target
+
+# Card ID Constants (Ground Truth: deck lama.csv)
 BASIC_G_ENERGY_ID    = 1    # Basic {G} Energy
-BASIC_P_ENERGY_ID    = 5    # Basic {P} Energy
 TR_ENERGY_ID         = 15   # Team Rocket's Energy
 
 TAROUNTULA_ID        = 400  # Team Rocket's Tarountula
 SPIDOPS_ID           = 401  # Team Rocket's Spidops
 ARTICUNO_ID          = 414  # Team Rocket's Articuno
-MIMIKYU_ID           = 434  # Team Rocket's Mimikyu
 MEWTWO_EX_ID         = 431  # Team Rocket's Mewtwo ex
-SNEASEL_ID           = 464  # Team Rocket's Sneasel
-CLEFAIRY_EX_ID       = 272  # Lillie's Clefairy ex
+MIMIKYU_ID           = 434  # Team Rocket's Mimikyu
 
 POFFIN_ID            = 1086 # Buddy-Buddy Poffin
-SECRET_BOX_ID        = 1092 # Secret Box (ACE SPEC)
 BUG_CATCHING_SET_ID  = 1094 # Bug Catching Set
-ENERGY_SWITCH_ID     = 1116 # Energy Switch
+ENERGY_SWITCH_ID      = 1095 # Energy Switch
+SWITCH_ID            = 1097 # Switch
+EARTHEN_VESSEL_ID     = 1106 # Earthen Vessel
 ULTRA_BALL_ID        = 1121 # Ultra Ball
-SACRED_ASH_ID        = 1129 # Sacred Ash
 TRANSCEIVER_ID       = 1134 # Team Rocket's Transceiver
 POKE_PAD_ID          = 1152 # Poké Pad
-LUCKY_HELMET_ID      = 1156 # Lucky Helmet
+MAXIMUM_BELT_ID      = 1158 # Maximum Belt (ACE SPEC Tool)
+NIGHT_STRETCHER_ID   = 1159 # Night Stretcher
 BRAVE_BANGLE_ID      = 1175 # Brave Bangle
+PRISM_TOWER_ID        = 1180 # Prism Tower
 
 ARIANA_ID            = 1216 # Team Rocket's Ariana
 GIOVANNI_ID          = 1218 # Team Rocket's Giovanni
@@ -36,281 +40,520 @@ PROTON_ID            = 1220 # Team Rocket's Proton
 LILLIES_DETERM_ID    = 1227 # Lillie's Determination
 
 TR_FACTORY_ID        = 1257 # Team Rocket's Factory
+BATTLE_CAGE_ID       = 1264 # Battle Cage (Anti-Dragapult Bench Protection)
 
-TR_POKEMON_IDS = frozenset({400, 401, 414, 431, 434, 464})
-EX_POKEMON_IDS = frozenset({431, 272})
+# Card Category Sets
+TR_POKEMON_IDS         = frozenset({400, 401, 414, 431, 434})
+EX_POKEMON_IDS         = frozenset({431})
+SUPPORTER_IDS          = frozenset({1216, 1218, 1219, 1220, 1227})
+TACTICAL_SUPPORTER_IDS = frozenset({1219, 1220})
+SEARCH_ITEM_IDS        = frozenset({POFFIN_ID, BUG_CATCHING_SET_ID, ULTRA_BALL_ID, TRANSCEIVER_ID})
+MAIN_ATTACKER_IDS      = frozenset({MEWTWO_EX_ID, SPIDOPS_ID})
+SPIDOPS_LINE_IDS       = frozenset({SPIDOPS_ID, TAROUNTULA_ID})
+
+# Energy cost requirements per attacker
+ATTACK_ENERGY_COSTS = {
+    MEWTWO_EX_ID: 3,  # Mewtwo ex Psywave requires 3 energy total
+    SPIDOPS_ID: 2,     # Spidops Venomous Whip requires 2 energy total
+    ARTICUNO_ID: 2,
+    MIMIKYU_ID: 1,
+    TAROUNTULA_ID: 1,
+}
+
+
+# Heuristic Tuning Constants (Prior Bonuses in range [-0.20, +0.20])
+# Attack Bonuses & Penalties
+BONUS_MEWTWO_ATTACK                  = 0.20
+PENALTY_MEWTWO_POWER_SAVER_UNMET     = -0.20
+BONUS_SPIDOPS_ATTACK                 = 0.14
+BONUS_SPIDOPS_ATTACK_MEWTWO_PRIORITY = 0.12
+BONUS_ARTICUNO_ATTACK                = 0.12
+BONUS_GENERIC_ATTACK                 = 0.10
+BONUS_UNDERPOWERED_ATTACK            = 0.02
+
+# Supporter & Gust Bonuses
+BONUS_GIOVANNI_WIN_CLOSE_EX          = 0.20
+BONUS_GIOVANNI_WIN_CLOSE_OR_EX       = 0.16
+BONUS_GIOVANNI_EARLY_GUST            = 0.14
+BONUS_GIOVANNI_BENCH_GUST            = 0.12
+BONUS_ARIANA_LOW_HAND                = 0.16
+BONUS_LILLIE_LOW_HAND                = 0.16
+BONUS_TACTICAL_SUPPORTER             = 0.10
+
+# Search, Bench & Equipment Bonuses
+BONUS_REACH_FOUR_TR_POKEMON          = 0.16
+BONUS_TRANSCEIVER                    = 0.18
+BONUS_BUG_CATCHING                   = 0.16
+BONUS_EARLY_POFFIN                   = 0.22
+BONUS_LATE_POFFIN                    = 0.08
+
+BONUS_ULTRA_BALL                     = 0.14
+BONUS_MAXIMUM_BELT                   = 0.18
+BONUS_BRAVE_BANGLE_ACTIVE            = 0.16
+BONUS_BRAVE_BANGLE_BENCH             = 0.12
+BONUS_POKE_PAD                       = 0.14
+BONUS_POKE_PAD_CLOSE                 = 0.16
+BONUS_NIGHT_STRETCHER                = 0.12
+BONUS_NIGHT_STRETCHER_CLOSE          = 0.16
+BONUS_TR_FACTORY_EARLY               = 0.14
+BONUS_TR_FACTORY_LATE                = 0.10
+
+# Positioning & Energy Bonuses
+BONUS_SWITCH_HEAVY_ATTACKER          = 0.14
+PENALTY_SWITCH_MEWTWO_NO_ATTACK      = -0.18
+BONUS_SWITCH_OPTIMIZE_CLOSE          = 0.12
+BONUS_ENERGY_ACTIVE_MEWTWO           = 0.18
+BONUS_ENERGY_BENCH_MEWTWO            = 0.15
+BONUS_ENERGY_SPIDOPS                 = 0.14
+BONUS_EVOLVE_SPIDOPS                 = 0.16
+
+
+def _get_val(obj, key: str, default=None):
+    """Safely retrieves a value from either a dict (checking 'cardId' and 'id') or object attribute."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        val = obj.get(key)
+        if val is None and key == "cardId":
+            val = obj.get("id")
+        return val if val is not None else default
+        
+    val = getattr(obj, key, None)
+    if val is None and key == "cardId":
+        val = getattr(obj, "id", None)
+    return val if val is not None else default
+
+
+def _count_tr_pokemon(bench_ids: list[int], active_id: int) -> int:
+    """Counts total Team Rocket Pokémon currently in play (Active + Bench)."""
+    count = 0
+    for cid in [active_id] + list(bench_ids):
+        if cid in TR_POKEMON_IDS:
+            count += 1
+    return count
 
 
 def _extract_context(obs) -> dict:
     """
-    Extracts essential board context for Mewtwo deck heuristics.
+    Extracts structured, state-aware board context from observation object or dictionary.
+    Handles nested attribute-style and dict-style observation schemas safely.
     """
     ctx = {
+        "turn": 1,
         "my_prizes": 6,
         "opp_prizes": 6,
         "my_active_id": -1,
+        "my_active_energy": 0,
         "opp_active_id": -1,
+        "opp_active_energy": 0,
         "my_bench_ids": [],
         "opp_bench_ids": [],
-        "my_active_energy": 0,
-        "game_phase": "early",
-        "my_ps": None,
         "my_bench_count": 0,
-        "tr_in_play": 0,
-        "turn": 0,
+        "opp_bench_count": 0,
         "my_hand_len": 0,
         "my_hand_ids": [],
     }
-    try:
-        current = getattr(obs, "current", None)
-        if current is None and isinstance(obs, dict):
-            current = obs.get("current")
 
-        if current is not None:
-            yi = getattr(current, "yourIndex", 0) if not isinstance(current, dict) else current.get("yourIndex", 0)
-            players = getattr(current, "players", []) if not isinstance(current, dict) else current.get("players", [])
-            ctx["turn"] = getattr(current, "turn", 0) if not isinstance(current, dict) else current.get("turn", 0)
+    current = _get_val(obs, "current")
+    if current is None:
+        return ctx
 
-            if len(players) >= 2:
-                my_ps = players[yi]
-                opp_ps = players[1 - yi]
+    ctx["turn"] = _get_val(current, "turn", 1)
+    yi = _get_val(current, "yourIndex", 0)
+    players = _get_val(current, "players", [])
 
-                prizes_my = getattr(my_ps, "prize", []) if not isinstance(my_ps, dict) else my_ps.get("prize", [])
-                prizes_opp = getattr(opp_ps, "prize", []) if not isinstance(opp_ps, dict) else opp_ps.get("prize", [])
+    if len(players) >= 2:
+        my_ps = players[yi]
+        opp_ps = players[1 - yi]
+        ctx["my_ps"] = my_ps
 
-                ctx["my_prizes"] = len(prizes_my)
-                ctx["opp_prizes"] = len(prizes_opp)
-                ctx["my_ps"] = my_ps
+        prizes_my = _get_val(my_ps, "prize", [])
+        prizes_opp = _get_val(opp_ps, "prize", [])
+        ctx["my_prizes"] = len(prizes_my) if isinstance(prizes_my, (list, tuple, set)) else 6
+        ctx["opp_prizes"] = len(prizes_opp) if isinstance(prizes_opp, (list, tuple, set)) else 6
 
-                my_active_list = getattr(my_ps, "active", []) if not isinstance(my_ps, dict) else my_ps.get("active", [])
-                if my_active_list and my_active_list[0] is not None:
-                    a = my_active_list[0]
-                    if isinstance(a, dict):
-                        ctx["my_active_id"] = a.get("cardId", a.get("id", -1))
-                        ctx["my_active_energy"] = len(a.get("energyCards", []))
-                    else:
-                        ctx["my_active_id"] = getattr(a, "cardId", getattr(a, "id", -1))
-                        ctx["my_active_energy"] = len(getattr(a, "energyCards", []))
+        my_active_list = _get_val(my_ps, "active", [])
+        if my_active_list and len(my_active_list) > 0 and my_active_list[0] is not None:
+            active_card = my_active_list[0]
+            ctx["my_active_id"] = _get_val(active_card, "cardId", -1)
+            energies = _get_val(active_card, "energyCards", [])
+            ctx["my_active_energy"] = len(energies) if isinstance(energies, (list, tuple)) else 0
+            ctx["my_active_hp"] = _get_val(active_card, "hp", 280)
 
-                opp_active_list = getattr(opp_ps, "active", []) if not isinstance(opp_ps, dict) else opp_ps.get("active", [])
-                if opp_active_list and opp_active_list[0] is not None:
-                    a = opp_active_list[0]
-                    ctx["opp_active_id"] = a.get("cardId", a.get("id", -1)) if isinstance(a, dict) else getattr(a, "cardId", getattr(a, "id", -1))
+        opp_active_list = _get_val(opp_ps, "active", [])
+        if opp_active_list and len(opp_active_list) > 0 and opp_active_list[0] is not None:
+            active_card = opp_active_list[0]
+            ctx["opp_active_id"] = _get_val(active_card, "cardId", -1)
+            energies = _get_val(active_card, "energyCards", [])
+            ctx["opp_active_energy"] = len(energies) if isinstance(energies, (list, tuple)) else 0
 
-                opp_bench = getattr(opp_ps, "bench", []) if not isinstance(opp_ps, dict) else opp_ps.get("bench", [])
-                bench_ids = []
-                for p in opp_bench:
-                    if p is not None:
-                        bench_ids.append(p.get("cardId", p.get("id", -1)) if isinstance(p, dict) else getattr(p, "cardId", getattr(p, "id", -1)))
-                ctx["opp_bench_ids"] = bench_ids
+        my_bench = _get_val(my_ps, "bench", [])
+        if isinstance(my_bench, (list, tuple)):
+            ctx["my_bench_ids"] = [_get_val(b, "cardId", -1) for b in my_bench if b is not None]
+            ctx["my_bench_count"] = len(ctx["my_bench_ids"])
 
-                prizes = ctx["my_prizes"]
-                if prizes <= 2:
-                    ctx["game_phase"] = "late"
-                elif prizes <= 4:
-                    ctx["game_phase"] = "mid"
-                else:
-                    ctx["game_phase"] = "early"
+        opp_bench = _get_val(opp_ps, "bench", [])
+        if isinstance(opp_bench, (list, tuple)):
+            ctx["opp_bench_ids"] = [_get_val(b, "cardId", -1) for b in opp_bench if b is not None]
+            ctx["opp_bench_count"] = len(ctx["opp_bench_ids"])
 
-                my_bench = getattr(my_ps, "bench", []) if not isinstance(my_ps, dict) else my_ps.get("bench", [])
-                my_bench_ids = []
-                tr_count = 1 if ctx["my_active_id"] in TR_POKEMON_IDS else 0
-                for p in my_bench:
-                    if p is not None:
-                        pid = p.get("cardId", p.get("id", -1)) if isinstance(p, dict) else getattr(p, "cardId", getattr(p, "id", -1))
-                        my_bench_ids.append(pid)
-                        if pid in TR_POKEMON_IDS:
-                            tr_count += 1
-                ctx["my_bench_ids"] = my_bench_ids
-                ctx["my_bench_count"] = len(my_bench_ids)
-                ctx["tr_in_play"] = tr_count
-
-                my_hand = getattr(my_ps, "hand", []) if not isinstance(my_ps, dict) else my_ps.get("hand", [])
-                ctx["my_hand_len"] = len(my_hand)
-                hand_ids = []
-                for c in my_hand:
-                    if c is not None:
-                        hand_ids.append(c.get("cardId", c.get("id", -1)) if isinstance(c, dict) else getattr(c, "cardId", getattr(c, "id", -1)))
-                ctx["my_hand_ids"] = hand_ids
-    except Exception:
-        pass
+        my_hand = _get_val(my_ps, "hand", [])
+        if isinstance(my_hand, (list, tuple)):
+            ctx["my_hand_ids"] = [_get_val(h, "cardId", -1) for h in my_hand if h is not None]
+            ctx["my_hand_len"] = len(ctx["my_hand_ids"])
 
     return ctx
 
 
-def evaluate_mewtwo_expert_bonus(obs, option, opponent_name="unknown") -> tuple[float, str]:
+def _resolve_card_id_from_opt(obs: dict, opt, ctx: dict) -> int:
+    """Safely extracts target cardId from an option object across all play & search contexts."""
+    cid = _get_val(opt, "cardId", _get_val(opt, "id", -1))
+    if cid is not None and cid > 0:
+        return cid
+
+    area = _get_val(opt, "area")
+    idx = _get_val(opt, "index")
+    if area is None or idx is None or idx < 0:
+        return -1
+
+    my_ps = ctx.get("my_ps")
+    current = _get_val(obs, "current")
+    select_obj = _get_val(obs, "select")
+
+    if area == 1:  # DECK
+        deck_cards = _get_val(select_obj, "deck", [])
+        if deck_cards and 0 <= idx < len(deck_cards) and deck_cards[idx] is not None:
+            return _get_val(deck_cards[idx], "cardId", _get_val(deck_cards[idx], "id", -1))
+
+    elif area == 12:  # LOOKING
+        looking_cards = _get_val(current, "looking", [])
+        if looking_cards and 0 <= idx < len(looking_cards) and looking_cards[idx] is not None:
+            return _get_val(looking_cards[idx], "cardId", _get_val(looking_cards[idx], "id", -1))
+
+    elif area == 5 and my_ps:  # BENCH
+        bench_cards = _get_val(my_ps, "bench", [])
+        if bench_cards and 0 <= idx < len(bench_cards) and bench_cards[idx] is not None:
+            return _get_val(bench_cards[idx], "cardId", _get_val(bench_cards[idx], "id", -1))
+
+    elif area == 4 and my_ps:  # ACTIVE
+        active_cards = _get_val(my_ps, "active", [])
+        if active_cards and 0 <= idx < len(active_cards) and active_cards[idx] is not None:
+            return _get_val(active_cards[idx], "cardId", _get_val(active_cards[idx], "id", -1))
+
+    elif area == 2 and my_ps:  # HAND
+        hand_cards = _get_val(my_ps, "hand", [])
+        if hand_cards and 0 <= idx < len(hand_cards) and hand_cards[idx] is not None:
+            return _get_val(hand_cards[idx], "cardId", _get_val(hand_cards[idx], "id", -1))
+
+    return -1
+
+
+def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tuple[float, str]:
     """
-    Evaluates a strategic prior bonus in range [-0.20, +0.20] for Mewtwo deck.
-    Serves as a soft prior guide for MCTS without hardcoding actions.
+    Evaluates state-aware strategic prior bonus for MCTS exploration (bounded range [-0.20, +0.20]).
+    Returns: (prior_bonus: float, explanation: str)
     """
+    opt_type = _get_val(opt, "type")
+    card_id = _get_val(opt, "cardId")
+
+    if opt_type is None:
+        return 0.0, ""
+
     ctx = _extract_context(obs)
-    my_active_id = ctx["my_active_id"]
-    opp_bench_ids = ctx.get("opp_bench_ids", [])
-    my_bench_ids = ctx.get("my_bench_ids", [])
-    my_bench_count = ctx["my_bench_count"]
-    tr_in_play = ctx["tr_in_play"]
-    turn = ctx["turn"]
-    game_phase = ctx["game_phase"]
 
-    opt_type_raw = getattr(option, "type", getattr(option, "optionType", None))
-    if opt_type_raw is None and isinstance(option, dict):
-        opt_type_raw = option.get("type", option.get("optionType", -1))
-
-    opt_type_str = str(opt_type_raw).upper()
-    IS_PLAY   = (opt_type_raw in (7, getattr(OptionType, "PLAY", 7))) or ("PLAY" in opt_type_str)
-    IS_ATTACH = (opt_type_raw in (8, getattr(OptionType, "ATTACH", 8))) or ("ATTACH" in opt_type_str)
-    IS_EVOLVE = (opt_type_raw in (9, getattr(OptionType, "EVOLVE", 9))) or ("EVOLVE" in opt_type_str)
-    IS_RETREAT= (opt_type_raw in (12, getattr(OptionType, "RETREAT", 12))) or ("RETREAT" in opt_type_str)
-    IS_ATTACK = (opt_type_raw in (13, getattr(OptionType, "ATTACK", 13))) or ("ATTACK" in opt_type_str)
-
-    card_id = getattr(option, "cardId", -1) if not isinstance(option, dict) else option.get("cardId", -1)
-    if card_id is None or card_id in (-1, 0):
-        opt_index = getattr(option, "index", -1) if not isinstance(option, dict) else option.get("index", -1)
-        my_ps = ctx.get("my_ps")
-        if my_ps is not None and opt_index is not None and opt_index >= 0:
-            hand = getattr(my_ps, "hand", []) if not isinstance(my_ps, dict) else my_ps.get("hand", [])
-            if 0 <= opt_index < len(hand):
-                card = hand[opt_index]
-                if card is not None:
-                    card_id = card.get("cardId", card.get("id", -1)) if isinstance(card, dict) else getattr(card, "cardId", getattr(card, "id", -1))
-
-    bonus = 0.0
-    triggered = "None"
-
-    # -------------------------------------------------------------------------
-    # 1. PLAY ACTIONS (action_type == 7)
-    # -------------------------------------------------------------------------
-    if IS_PLAY:
-        # --- A. Basic Pokémon Benching & Opening Setup ---
-        if card_id in (TAROUNTULA_ID, ARTICUNO_ID, MIMIKYU_ID, SNEASEL_ID):
-            if my_bench_count < 4:
-                bonus += 0.15
-                triggered = f"Mewtwo_Bench_Basic_{card_id}"
-        elif card_id in EX_POKEMON_IDS:
-            if turn <= 3 and ctx["my_active_energy"] == 0:
-                bonus -= 0.15  # Avoid premature 2-prize ex exposure early
-                triggered = f"Mewtwo_Avoid_Premature_ex_Exposure_{card_id}"
-            elif my_bench_count < 4:
-                bonus += 0.10
-                triggered = f"Mewtwo_Bench_ex_{card_id}"
-
-        # --- B. Supporter & Tutor Play ---
-        elif card_id == TRANSCEIVER_ID:
-            bonus += 0.18  # Search TR Supporter (Ariana / Giovanni / Petrel)
-            triggered = "Mewtwo_Transceiver_Supporter_Tutor"
-
-        elif card_id == ARIANA_ID:
-            bonus += 0.16  # Team Rocket Pokémon search + draw
-            triggered = "Mewtwo_Ariana_Search_Draw"
-
-        elif card_id == GIOVANNI_ID and len(opp_bench_ids) > 0:
-            bonus += 0.18  # Gust benched target
-            triggered = "Mewtwo_Giovanni_Gust_Disruption"
-
-        elif card_id == LILLIES_DETERM_ID:
-            bonus += 0.15  # Hand refresh
-            triggered = "Mewtwo_Lillie_Hand_Refresh"
-
-        elif card_id == PROTON_ID:
-            bonus += 0.12  # Additional draw engine
-            triggered = "Mewtwo_Proton_Draw"
-
-        elif card_id == PETREL_ID:
-            bonus += 0.12  # Supporter recycling
-            triggered = "Mewtwo_Petrel_Supporter_Recovery"
-
-        # --- C. Search Items, Tools & Stadiums ---
-        elif card_id == BUG_CATCHING_SET_ID:
-            bonus += 0.15  # Search Grass Pokémon (Tarountula/Spidops) + Energy
-            triggered = "Mewtwo_Bug_Catching_Set_Search"
-
-        elif card_id == POFFIN_ID and my_bench_count < 4:
-            bonus += 0.18  # Search 2 Basics <= 70 HP (Tarountula, Mimikyu, Sneasel)
-            triggered = "Mewtwo_Poffin_Search_Basics"
-
-        elif card_id == ULTRA_BALL_ID:
-            bonus += 0.14  # Unrestricted Pokémon search
-            triggered = "Mewtwo_Ultra_Ball_Search"
-
-        elif card_id == SECRET_BOX_ID:
-            bonus += 0.16  # ACE SPEC multi-type search engine
-            triggered = "Mewtwo_Secret_Box_Search"
-
-        elif card_id == ENERGY_SWITCH_ID:
-            bonus += 0.15  # Energy acceleration transfer to active attacker
-            triggered = "Mewtwo_Energy_Switch_Transfer"
-
-        elif card_id == SACRED_ASH_ID:
-            bonus += 0.12  # Recycle 5 Pokémon back to deck
-            triggered = "Mewtwo_Sacred_Ash_Recovery"
-
-        elif card_id == POKE_PAD_ID:
-            bonus += 0.12  # Recycle Supporter to deck
-            triggered = "Mewtwo_PokePad_Recycle"
-
-        elif card_id == BRAVE_BANGLE_ID:
-            if my_active_id in (SPIDOPS_ID, MEWTWO_EX_ID):
-                bonus += 0.16  # +30 damage boost against ex targets
-                triggered = "Mewtwo_Brave_Bangle_Equip_Attacker"
-
-        elif card_id == LUCKY_HELMET_ID:
-            if my_active_id in (ARTICUNO_ID, MIMIKYU_ID):
-                bonus += 0.16  # Draw on damage equip on defensive wall
-                triggered = "Mewtwo_Lucky_Helmet_Defensive_Wall"
-
-        elif card_id == TR_FACTORY_ID:
-            bonus += 0.15  # Stadium draw engine for Team Rocket cards
-            triggered = "Mewtwo_TR_Factory_Stadium"
-
-    # -------------------------------------------------------------------------
-    # 2. ENERGY ATTACHMENT ACTIONS (action_type == 8)
-    # -------------------------------------------------------------------------
-    elif IS_ATTACH:
-        attached_id = getattr(option, "cardId", -1) if not isinstance(option, dict) else option.get("cardId", -1)
-        if attached_id == TR_ENERGY_ID:
-            if tr_in_play >= 2:
-                bonus += 0.20  # Counts as 2 Energy for TR Pokémon
-                triggered = "Mewtwo_TR_Energy_Accelerate"
-        elif attached_id == BASIC_G_ENERGY_ID:
-            if my_active_id in (TAROUNTULA_ID, SPIDOPS_ID, ARTICUNO_ID):
-                bonus += 0.15
-                triggered = "Mewtwo_Grass_Energy_Attach"
-        elif attached_id == BASIC_P_ENERGY_ID:
-            if my_active_id in (CLEFAIRY_EX_ID, MEWTWO_EX_ID, MIMIKYU_ID):
-                bonus += 0.15
-                triggered = "Mewtwo_Psychic_Energy_Attach"
-
-    # -------------------------------------------------------------------------
-    # 3. EVOLUTION ACTIONS (action_type == 9)
-    # -------------------------------------------------------------------------
-    elif IS_EVOLVE:
-        if card_id == SPIDOPS_ID:
-            bonus += 0.20  # Main Stage 1 attacker evolution
-            triggered = "Mewtwo_Evolve_Spidops"
-
-    # -------------------------------------------------------------------------
-    # 4. RETREAT ACTIONS (action_type == 12)
-    # -------------------------------------------------------------------------
-    elif IS_RETREAT:
-        if my_active_id in EX_POKEMON_IDS and turn <= 4:
-            bonus += 0.15  # Rescue early exposed 2-prize ex back to bench
-            triggered = "Mewtwo_Retreat_Rescue_Exposed_ex"
-
-    # -------------------------------------------------------------------------
-    # 5. ATTACK EXECUTION (action_type == 13)
-    # -------------------------------------------------------------------------
-    elif IS_ATTACK:
-        my_hand_ids = ctx.get("my_hand_ids", [])
-        has_unplayed_supporter = any(cid in (1216, 1218, 1227, 1219, 1220) for cid in my_hand_ids)
-        has_unplayed_search_item = any(cid in (1134, 1094, 1086, 1121, 1092) for cid in my_hand_ids)
-
-        if has_unplayed_supporter or has_unplayed_search_item:
-            bonus += 0.10  # Postpone attack slightly so MCTS searches Supporters/Items FIRST
-            triggered = "Mewtwo_Postpone_Attack_For_Setup"
+    # Dynamic card_id resolution from hand index if option provides hand index instead of direct cardId
+    if card_id is None or card_id < 0:
+        card_idx = _get_val(opt, "index")
+        if card_idx is not None and isinstance(card_idx, int) and 0 <= card_idx < len(ctx["my_hand_ids"]):
+            card_id = ctx["my_hand_ids"][card_idx]
         else:
-            bonus += 0.20
-            triggered = "Mewtwo_Attack_Execution"
+            target_id = _get_val(opt, "targetId")
+            if target_id is not None and target_id >= 0:
+                card_id = target_id
+            else:
+                card_id = -1
 
-    # Bound bonus range [-0.20, +0.20]
-    bonus = max(-0.20, min(0.20, bonus))
-    return bonus, triggered
+    turn = ctx["turn"]
+    hand_len = ctx["my_hand_len"]
+    active_id = ctx["my_active_id"]
+
+    tr_count = _count_tr_pokemon(ctx["my_bench_ids"], active_id)
+    early_game = turn <= 3 or ctx["my_prizes"] >= 5
+    close_game = ctx["my_prizes"] <= 2 or ctx["opp_prizes"] <= 2
+
+    # 1. PLAY CARD ACTIONS (OptionType.PLAY / 7)
+    if opt_type in (getattr(OptionType, "PLAY", 7), 7):
+        # A. Team Rocket Pokémon Play & 4-Pokémon Power Saver Unlock
+        if card_id in TR_POKEMON_IDS:
+            if tr_count == 3:
+                return 0.18, "Prior: Play 4th TR Pokemon Unlocking Mewtwo ex Power Saver Ability"
+            if ctx["my_bench_count"] <= 1:
+                return 0.16, "Prior: Play TR Pokemon Low Bench Recovery Guard"
+            # FIX 2 (expert): Early Mewtwo ex and Tarountula setup priority
+            if early_game:
+                if card_id == MEWTWO_EX_ID:
+                    return 0.20, "Prior: Early Mewtwo ex Main Attacker Deployment (Turn 1-3)"
+                elif card_id == TAROUNTULA_ID:
+                    return 0.16, "Prior: Early Tarountula Setup Deployment (Turn 1-3)"
+            if card_id == SPIDOPS_ID or card_id == TAROUNTULA_ID:
+                return 0.12, "Prior: Play Spidops Line Trap Territory Setup"
+            return 0.08, "Prior: Play Team Rocket Pokemon Setup"
+
+
+        # B. Search & Tutor Engines
+        if card_id == TRANSCEIVER_ID:
+            return BONUS_TRANSCEIVER, "Prior: TR Transceiver Supporter Tutor"
+
+        if card_id == BUG_CATCHING_SET_ID:
+            return BONUS_BUG_CATCHING, "Prior: Bug Catching Set Grass Search"
+
+        if card_id == POFFIN_ID:
+            if early_game or ctx["my_bench_count"] <= 1:
+                return BONUS_EARLY_POFFIN, "Prior: Early Poffin Bench Fill"
+            return BONUS_LATE_POFFIN, "Prior: Late Poffin Bench Fill"
+
+        if card_id == ULTRA_BALL_ID:
+            return BONUS_ULTRA_BALL, "Prior: Ultra Ball Key Search"
+
+        # C. Equipment & Recovery
+        if card_id == MAXIMUM_BELT_ID:
+            return BONUS_MAXIMUM_BELT, "Prior: Equip Maximum Belt ACE SPEC Snipe Tool"
+
+        if card_id == BRAVE_BANGLE_ID:
+            is_fast_aggro = any(k in opponent_name.lower() for k in ("starmie", "ogerpon", "garchomp", "dipplin"))
+            if is_fast_aggro:
+                return 0.20, "Prior: Equip Brave Bangle Counter Fast 2-Energy Aggro"
+            if active_id in MAIN_ATTACKER_IDS:
+                return BONUS_BRAVE_BANGLE_ACTIVE, "Prior: Equip Brave Bangle to Active Main Attacker"
+            if any(b in MAIN_ATTACKER_IDS for b in ctx["my_bench_ids"]):
+                return BONUS_BRAVE_BANGLE_BENCH, "Prior: Equip Brave Bangle to Bench Main Attacker"
+            return 0.06, "Prior: Equip Brave Bangle General"
+
+        if card_id == POKE_PAD_ID:
+            is_control = any(k in opponent_name.lower() for k in ("iono", "control", "snorlax"))
+            if is_control or hand_len <= 3 or close_game:
+                return 0.18, "Prior: Poké Pad Recycle Key Supporter vs Iono Control"
+            return 0.08, "Prior: Poké Pad Supporter Recycling"
+
+        if card_id == NIGHT_STRETCHER_ID:
+            if close_game:
+                return BONUS_NIGHT_STRETCHER_CLOSE, "Prior: Night Stretcher Key Recovery Close Game"
+            return BONUS_NIGHT_STRETCHER, "Prior: Night Stretcher Recovery"
+
+        if card_id == TR_FACTORY_ID:
+            is_control = any(k in opponent_name.lower() for k in ("iono", "control", "snorlax"))
+            if is_control or early_game:
+                return 0.20, "Prior: Play TR Factory Stadium Counter Iono Hand Disruption"
+            return 0.16, "Prior: Play TR Factory Stadium Draw Engine"
+
+        if card_id == PRISM_TOWER_ID:
+            return 0.16, "Prior: Play Prism Tower Recurring Discard & Draw"
+
+        if card_id == BATTLE_CAGE_ID:
+            bench_counter_keywords = ("dragapult", "froslass", "dusknoir", "dusclops", "munkidori")
+            is_bench_counter_meta = any(k in opponent_name.lower() for k in bench_counter_keywords) or opponent_name == "DRAGAPULT"
+            if is_bench_counter_meta:
+                return 0.22, "Prior: Play Battle Cage Counter Dragapult/Froslass Bench Snipe"
+            return 0.18, "Prior: Play Battle Cage Active/Bench Protection"
+
+        # D. Positioning & Tempo Items
+        if card_id == SWITCH_ID:
+            has_bench_attacker = any(b in MAIN_ATTACKER_IDS for b in ctx["my_bench_ids"])
+            active_is_main = active_id in MAIN_ATTACKER_IDS
+            active_e = ctx.get("my_active_energy", 0)
+            active_hp = ctx.get("my_active_hp", 280)
+
+            # Prevent pointless switching of healthy, fully-powered active Mewtwo ex
+            if active_id == MEWTWO_EX_ID and active_e >= 3 and active_hp >= 100 and tr_count >= 4:
+                return -0.35, "Prior Penalty: Do NOT switch out a healthy, fully-powered active Mewtwo ex"
+
+            # Penalize switching if neither active nor bench has energy
+            if active_e == 0 and not has_bench_attacker:
+                return -0.15, "Prior Penalty: Pointless Switch (Neither Active Nor Bench Has Energy)"
+            if not active_is_main and has_bench_attacker:
+                return BONUS_SWITCH_HEAVY_ATTACKER, "Prior: Switch Non-Attacker for Heavy Attacker"
+            if close_game and has_bench_attacker:
+                return BONUS_SWITCH_OPTIMIZE_CLOSE, "Prior: Switch to Optimize Damage Close Game"
+            if close_game:
+                return 0.10, "Prior: Switch Tempo Positioning Close Game"
+            return 0.05, "Prior: Switch Tempo Positioning"
+
+        # E. State-Aware Supporters
+        if card_id == GIOVANNI_ID:
+            if ctx["opp_bench_count"] > 0:
+                has_ex_target = any(b in EX_POKEMON_IDS for b in ctx["opp_bench_ids"])
+                if has_ex_target and close_game:
+                    return BONUS_GIOVANNI_WIN_CLOSE_EX, "Prior: Giovanni Gust Target EX Prize Win Swing"
+                elif has_ex_target or close_game:
+                    bonus = BONUS_GIOVANNI_WIN_CLOSE_OR_EX
+                    if early_game and not has_ex_target:
+                        bonus = BONUS_GIOVANNI_EARLY_GUST  # Slight early-game dampener
+                    return bonus, "Prior: Giovanni Gust Target EX or Win Close"
+                return BONUS_GIOVANNI_BENCH_GUST, "Prior: Giovanni Bench Gust"
+            return 0.02, "Prior: Giovanni Supporter Play"
+
+        if card_id == ARIANA_ID:
+            if hand_len <= 4:
+                return BONUS_ARIANA_LOW_HAND, "Prior: Ariana Draw Refresh Low Hand"
+            return 0.08, "Prior: Ariana Team Rocket Draw"
+
+        if card_id == LILLIES_DETERM_ID:
+            if hand_len <= 3:
+                return BONUS_LILLIE_LOW_HAND, "Prior: Lillie Determination Emergency Draw"
+            return 0.06, "Prior: Lillie Determination Draw"
+
+        if card_id in TACTICAL_SUPPORTER_IDS:
+            return BONUS_TACTICAL_SUPPORTER, "Prior: TR Tactical Supporter Play"
+
+    # 2. ENERGY ATTACHMENT ACTIONS (OptionType.ATTACH / 8)
+    elif opt_type in (getattr(OptionType, "ATTACH", 8), 8):
+        if card_id > 0:
+            in_area = getattr(opt, "inPlayArea", 4) if not isinstance(opt, dict) else opt.get("inPlayArea", 4)
+            in_idx  = getattr(opt, "inPlayIndex", 0) if not isinstance(opt, dict) else opt.get("inPlayIndex", 0)
+
+            target_poke = None
+            my_ps = ctx.get("my_ps")
+            if my_ps is not None:
+                active_list = _get_val(my_ps, "active", [])
+                bench_list  = _get_val(my_ps, "bench", [])
+                if in_area == 4 and active_list and active_list[0] is not None:
+                    target_poke = active_list[0]
+                elif in_area == 5 and bench_list and 0 <= in_idx < len(bench_list) and bench_list[in_idx] is not None:
+                    target_poke = bench_list[in_idx]
+
+            opt_target_energy = 0
+            if target_poke is not None:
+                energies = _get_val(target_poke, "energyCards", [])
+                opt_target_energy = len(energies) if isinstance(energies, (list, tuple)) else 0
+                opt_target = _get_val(target_poke, "cardId", _get_val(target_poke, "id", -1))
+            else:
+                opt_target = getattr(opt, "targetCardId", active_id) if not isinstance(opt, dict) else opt.get("targetCardId", active_id)
+                opt_target_energy = ctx.get("target_energy", 0)
+
+            # Extract board context for generic evaluator
+            my_bench_ids     = ctx.get("my_bench_ids", [])
+            my_prizes        = ctx.get("my_prizes", 6)
+            opp_prizes       = ctx.get("opp_prizes", 6)
+            my_bench_count   = ctx.get("my_bench_count", 0)
+            hand_ids         = ctx.get("my_hand_ids", [])
+            active_energy    = ctx.get("my_active_energy", 0)
+            active_hp        = ctx.get("my_active_hp", 100)
+
+            # Build bench energy list generically from my_ps
+            bench_energies = []
+            if my_ps is not None:
+                bench_list_raw = _get_val(my_ps, "bench", [])
+                for bp in bench_list_raw:
+                    if bp is not None:
+                        ben_en = _get_val(bp, "energyCards", [])
+                        bench_energies.append(len(ben_en) if isinstance(ben_en, (list, tuple)) else 0)
+
+            # --- Generic evaluation via energy_evaluator ---
+            try:
+                from src.expert_system.energy_evaluator import evaluate_energy_target
+            except ImportError:
+                from expert_system.energy_evaluator import evaluate_energy_target
+
+            score, reason = evaluate_energy_target(
+                target_card_id=opt_target,
+                target_current_energy=opt_target_energy,
+                energy_card_id=card_id,
+                hand_ids=hand_ids,
+                my_prizes=my_prizes,
+                opp_prizes=opp_prizes,
+                bench_ids=my_bench_ids,
+                bench_energies=bench_energies,
+                active_id=active_id,
+                active_energy=active_energy,
+                active_hp=active_hp,
+            )
+            return score, f"Prior: {reason}"
+
+
+
+    # 3. EVOLVE ACTIONS (OptionType.EVOLVE / 9)
+    elif opt_type in (getattr(OptionType, "EVOLVE", 9), 9):
+        if card_id == SPIDOPS_ID or card_id > 0:
+            if active_id == TAROUNTULA_ID or TAROUNTULA_ID in ctx["my_bench_ids"]:
+                return BONUS_EVOLVE_SPIDOPS, "Prior: Evolve Tarountula to Spidops"
+            return 0.10, "Prior: Evolve to Spidops"
+
+    # 4. RETREAT ACTIONS (OptionType.RETREAT / 12)
+    elif opt_type in (getattr(OptionType, "RETREAT", 12), 12):
+        active_hp = ctx.get("my_active_hp", 280)
+        active_energy = ctx.get("my_active_energy", 0)
+
+        if active_id == MEWTWO_EX_ID and active_energy >= 1 and active_hp >= 100:
+            return -0.50, "Prior Penalty: Do NOT retreat healthy active Mewtwo ex with energy!"
+        elif active_energy >= 1 and active_hp >= 80:
+            return -0.40, "Prior Penalty: Do NOT retreat healthy active with energy!"
+        elif active_hp <= 30:
+            return 0.15, "Prior: Tactical retreat of low-HP active"
+        return -0.20, "Prior Penalty: General wasteful retreat"
+
+    # 5. ATTACK ACTIONS (OptionType.ATTACK / 13)
+    elif opt_type in (getattr(OptionType, "ATTACK", 13), 13):
+        req_energy = ATTACK_ENERGY_COSTS.get(active_id, 2)
+        current_energy = ctx["my_active_energy"]
+
+        if active_id == MEWTWO_EX_ID:
+            if tr_count < 4:
+                return PENALTY_MEWTWO_POWER_SAVER_UNMET, "Prior Penalty: Mewtwo ex Power Saver Unmet (<4 TR Pokemon)"
+            if current_energy >= req_energy:
+                # FIX 1 (expert): Powered Mewtwo MUST attack — highest possible prior
+                opp_hp = ctx.get("opp_active_hp", 9999)
+                if opp_hp <= 160:
+                    return 0.20, "CRITICAL Prior: Mewtwo ex Fully Powered - Lethal Window - ATTACK NOW"
+                return 0.20, "Prior: Mewtwo ex Fully Powered - Attack Immediately"
+            return BONUS_UNDERPOWERED_ATTACK, "Prior: Underpowered Active Attack"
+
+        if current_energy >= req_energy:
+            if active_id == SPIDOPS_ID:
+                # Venomous Whip scales: 20 + 20 per bench Pokemon (full bench=5 → 120 dmg)
+                bench_size = ctx.get("my_bench_count", len(ctx["my_bench_ids"]))
+                spidops_damage = 20 + (20 * bench_size)
+                opp_hp = ctx.get("opp_active_hp", 9999)
+                if bench_size == 5:
+                    # Full bench — max damage 120, always attack!
+                    return 0.20, f"Prior: Spidops Full Bench Attack 120 Damage"
+                elif bench_size >= 3:
+                    # Good bench — decent damage 80-100
+                    if 0 < opp_hp <= spidops_damage:
+                        return 0.20, f"Prior: Spidops Lethal Window Bench{bench_size}"
+                    return 0.15, f"Prior: Spidops Good Bench Attack {spidops_damage} Damage"
+                elif bench_size <= 1:
+                    # Thin bench — low damage, prefer to fill bench first
+                    return -0.08, f"Prior Penalty: Spidops Thin Bench ({bench_size}) Only {spidops_damage} Damage"
+                mewtwo_bench_present = MEWTWO_EX_ID in ctx["my_bench_ids"]
+                if mewtwo_bench_present:
+                    return BONUS_SPIDOPS_ATTACK_MEWTWO_PRIORITY, "Prior: Spidops Attack (Mewtwo On Bench)"
+                return BONUS_SPIDOPS_ATTACK, "Prior: Affordable Spidops Attack"
+
+
+            if active_id == ARTICUNO_ID:
+                return BONUS_ARTICUNO_ATTACK, "Prior: Affordable Articuno Snipe Attack"
+            return BONUS_GENERIC_ATTACK, "Prior: Affordable Active Attack"
+        else:
+            return BONUS_UNDERPOWERED_ATTACK, "Prior: Underpowered Active Attack"
+
+    # 6. SEARCH CANDIDATE CARD SELECTION (OptionType.CARD / 3)
+    elif opt_type in (getattr(OptionType, "CARD", 3), 3):
+        target_card_id = _resolve_card_id_from_opt(obs, opt, ctx)
+        if target_card_id > 0:
+            try:
+                from src.expert_system.search_strategy import evaluate_search_target_prior, extract_search_context
+            except ImportError:
+                from expert_system.search_strategy import evaluate_search_target_prior, extract_search_context
+            
+            search_ctx = extract_search_context(obs)
+            prior_score, reason = evaluate_search_target_prior(target_card_id, search_ctx)
+            return prior_score, f"Search Candidate Prior: {reason}"
+        return 0.0, "Search Candidate: Unknown Card"
+
+    return 0.0, ""
+
+
+# Backward-compatible API binding
+get_expert_bonus = evaluate_mewtwo_expert_bonus
+
+

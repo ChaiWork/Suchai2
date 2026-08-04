@@ -6,6 +6,32 @@ from cg.api import CardType, OptionType, SelectContext
 USE_EXPERT_GUIDANCE = True
 EXPERT_WEIGHT = 0.10
 
+# Number of training epochs over which expert guidance fully decays to zero.
+# Phase 1:  epoch 1-5   → scale 1.00 (full curriculum guidance)
+# Phase 2:  epoch 6-10  → scale 0.70
+# Phase 3:  epoch 11-20 → scale ~0.40
+# Phase 4:  epoch 21-30 → scale ~0.15
+# Phase 5:  epoch 31+   → scale 0.00 (pure RL — NN decides everything)
+EXPERT_DECAY_EPOCHS = 40
+
+
+def expert_scale(epoch: int) -> float:
+    """
+    Returns a [1.0 → 0.0] multiplier that linearly decays the expert system
+    influence to zero over EXPERT_DECAY_EPOCHS epochs.
+
+    Used as a universal decay gate for:
+    - Expert logit biases in MCTS node priors (agent.py)
+    - Hard logit blocks (overcharge, type mismatch, turn-pass guard)
+    - Reward shaping constants in mewtwo_reward.py
+
+    At epoch >= EXPERT_DECAY_EPOCHS the expert system has zero authority;
+    the neural network is the sole decision-maker.
+    """
+    if not USE_EXPERT_GUIDANCE:
+        return 0.0
+    return max(0.0, 1.0 - (max(0, epoch - 1) / EXPERT_DECAY_EPOCHS))
+
 
 def extract_board_context(obs) -> dict:
     """
@@ -49,11 +75,13 @@ def extract_board_context(obs) -> dict:
                 if my_active_list and my_active_list[0] is not None:
                     a = my_active_list[0]
                     if isinstance(a, dict):
-                        ctx["my_active_id"] = a.get("cardId", a.get("id", -1))
+                        ctx["my_active_id"]     = a.get("cardId", a.get("id", -1))
                         ctx["my_active_energy"] = len(a.get("energyCards", []))
+                        ctx["my_active_hp"]     = a.get("hp", 100)
                     else:
-                        ctx["my_active_id"] = getattr(a, "cardId", getattr(a, "id", -1))
+                        ctx["my_active_id"]     = getattr(a, "cardId", getattr(a, "id", -1))
                         ctx["my_active_energy"] = len(getattr(a, "energyCards", []))
+                        ctx["my_active_hp"]     = getattr(a, "hp", 100)
 
                 opp_active_list = getattr(opp_ps, "active", []) if not isinstance(opp_ps, dict) else opp_ps.get("active", [])
                 if opp_active_list and opp_active_list[0] is not None:

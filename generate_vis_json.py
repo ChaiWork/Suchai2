@@ -23,7 +23,9 @@ def run_match_and_export(opponent_name="Rulebasedmodel_Dragapult", output_json="
     print(f"       RUNNING MATCH: MY AGENT vs {opponent_name}                 ")
     print("==================================================================")
     
-    my_deck = load_deck("deck.csv")
+    from src.training.evaluator import get_active_deck_csv_path
+    my_deck_path = get_active_deck_csv_path()
+    my_deck = load_deck(my_deck_path)
     opp_deck = load_deck(opponent_name)
     
     print("Initializing battle simulation...")
@@ -66,17 +68,16 @@ def run_match_and_export(opponent_name="Rulebasedmodel_Dragapult", output_json="
         try:
             obs_dict = battle_select(selected)
         except Exception:
-            opts = obs_dict.get("select", {}).get("option", [])
-            advanced = False
-            for opt_i in range(len(opts)):
+            from agent import random_agent
+            selected = random_agent(obs_dict)
+            try:
+                obs_dict = battle_select(selected)
+            except Exception:
                 try:
-                    obs_dict = battle_select([opt_i])
-                    advanced = True
-                    break
+                    obs_dict = battle_select([0])
                 except Exception:
-                    continue
-            if not advanced:
-                break
+                    break
+
                 
         step_count += 1
         if step_count % 30 == 0:
@@ -114,8 +115,10 @@ def run_batch_matches(opponent_name="Rulebasedmodel_Dragapult", num_matches=10, 
     losses = 0
     draws = 0
 
+    from src.training.evaluator import get_active_deck_csv_path
+    my_deck_path = get_active_deck_csv_path()
     for m_i in range(1, num_matches + 1):
-        my_deck = load_deck("deck.csv")
+        my_deck = load_deck(my_deck_path)
         opp_deck = load_deck(opponent_name)
 
         obs_dict, _ = battle_start(opp_deck, my_deck)
@@ -156,17 +159,16 @@ def run_batch_matches(opponent_name="Rulebasedmodel_Dragapult", num_matches=10, 
             try:
                 obs_dict = battle_select(selected)
             except Exception:
-                opts = obs_dict.get("select", {}).get("option", [])
-                advanced = False
-                for opt_i in range(len(opts)):
+                from agent import random_agent
+                selected = random_agent(obs_dict)
+                try:
+                    obs_dict = battle_select(selected)
+                except Exception:
                     try:
-                        obs_dict = battle_select([opt_i])
-                        advanced = True
-                        break
+                        obs_dict = battle_select([0])
                     except Exception:
-                        continue
-                if not advanced:
-                    break
+                        break
+
 
             step_count += 1
 
@@ -207,16 +209,81 @@ def run_batch_matches(opponent_name="Rulebasedmodel_Dragapult", num_matches=10, 
     print(f"Win Rate:           {wr:.1f}%")
     print(f"All Replays Folder: {os.path.abspath(out_dir)}")
     print("==================================================================")
+    return wins, losses, draws
+
+
+def run_all_rule_based_matches(num_matches=10, base_out_dir="all_replays"):
+    all_opponents = [
+        "Rulebasedmodel_Mewtwo_Easy",
+        "Rulebasedmodel_Mewtwo",
+        "Rulebasedmodel_Abomasnow",
+        "Rulebasedmodel_Crustle",
+        "Rulebasedmodel_Lopunny",
+        "Rulebasedmodel_Typhlosion",
+        "Rulebasedmodel_Marnie_Kangaskhan",
+        "Rulebasedmodel_Honchkrow",
+        "Rulebasedmodel_Alakazam",
+        "Rulebasedmodel_Archaludon",
+        "Rulebasedmodel_Dipplin",
+        "Rulebasedmodel_Dragapult",
+        "Rulebasedmodel_Grimmsnarl",
+        "Rulebasedmodel_Iono",
+        "Rulebasedmodel_Kangaskhan_Crustle",
+        "Rulebasedmodel_Lucario",
+        "Rulebasedmodel_Mewtwo_Wobbuffet",
+        "Rulebasedmodel_Starmie",
+        "Rulebasedmodel_Trevenant",
+        "Rulebasedmodel_TR_Mewtwo",
+        "Rulebasedmodel_Hydrapple_Ogerpon"
+    ]
+    summary_data = []
+    total_wins = 0
+    total_games = 0
+
+    print("==================================================================")
+    print(f"   STARTING BATCH EVALUATION: ALL {len(all_opponents)} RULE-BASED BOTS ({num_matches} MATCHES EACH)")
+    print("==================================================================")
+
+    for opp in all_opponents:
+        opp_dir = os.path.join(base_out_dir, opp)
+        print(f"\n>>> Running {num_matches} matches vs {opp}...")
+        w, l, d = run_batch_matches(opponent_name=opp, num_matches=num_matches, out_dir=opp_dir)
+        wr = (w / max(1, num_matches)) * 100.0
+        summary_data.append((opp, w, l, d, wr))
+        total_wins += w
+        total_games += num_matches
+
+    print("\n==================================================================")
+    print("            OVERALL RULE-BASED BOT EVALUATION REPORT              ")
+    print("==================================================================")
+    print(f"{'Opponent Name':<35} | {'W':<3} | {'L':<3} | {'D':<3} | {'Win Rate':<8}")
+    print("-" * 65)
+    for opp, w, l, d, wr in summary_data:
+        print(f"{opp:<35} | {w:<3} | {l:<3} | {d:<3} | {wr:5.1f}%")
+    print("-" * 65)
+    overall_wr = (total_wins / max(1, total_games)) * 100.0
+    print(f"{'OVERALL TOTAL':<35} | {total_wins:<3} | {total_games - total_wins:<3} | {0:<3} | {overall_wr:5.1f}%")
+    print("==================================================================")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run your AI Agent against a specified opponent and export replay JSON files.")
-    parser.add_argument("--opp", type=str, default="Rulebasedmodel_Dragapult", help="Opponent name (e.g. Rulebasedmodel_Dragapult, DRAGOPULT, Rulebasedmodel_Starmie)")
-    parser.add_argument("--num-matches", "-n", type=int, default=1, help="Number of matches to generate (e.g. 10)")
+    parser = argparse.ArgumentParser(description="Run your AI Agent against specified opponent(s) and export replay JSON files.")
+    parser.add_argument("--opp", type=str, default="Rulebasedmodel_Dragapult", help="Opponent name (e.g. Rulebasedmodel_Dragapult, ALL)")
+    parser.add_argument("--all", action="store_true", help="Run evaluation against ALL rule-based opponents (10 matches each)")
+    parser.add_argument("--active-deck", type=str, default=None, help="Active deck name (e.g. GRIMMSNARL, MEWTWO, LILLIE)")
+    parser.add_argument("--num-matches", "-n", type=int, default=1, help="Number of matches per opponent (e.g. 10)")
     parser.add_argument("--out-dir", type=str, default="replays", help="Output directory folder for batch replay JSON files")
     parser.add_argument("--out", type=str, default="vis.json", help="Output JSON file name for single match mode")
     args = parser.parse_args()
 
-    if args.num_matches > 1:
+    if args.active_deck:
+        from src.configs.active_deck import set_active_deck
+        set_active_deck(args.active_deck)
+
+    if args.all or args.opp.upper() == "ALL":
+        n_matches = args.num_matches if args.num_matches > 1 else 10
+        run_all_rule_based_matches(num_matches=n_matches, base_out_dir=args.out_dir)
+    elif args.num_matches > 1:
         run_batch_matches(opponent_name=args.opp, num_matches=args.num_matches, out_dir=args.out_dir)
     else:
         run_match_and_export(opponent_name=args.opp, output_json=args.out)

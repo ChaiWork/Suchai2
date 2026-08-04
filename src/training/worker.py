@@ -70,13 +70,18 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 except Exception as e:
                     opp_model = None
             
+            went_second = (random.random() < 0.5)
+            d0 = opponent_deck if went_second else sample_deck
+            d1 = sample_deck if went_second else opponent_deck
+            my_player_idx = 1 if went_second else 0
+
             try:
-                obs, start_data = battle_start(sample_deck, opponent_deck)
+                obs, start_data = battle_start(d0, d1)
                 if start_data.errorPlayer >= 0:
-                    result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {})))
+                    result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {}, [], went_second, my_player_idx)))
                     continue
             except Exception as e:
-                result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {})))
+                result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {}, [], went_second, my_player_idx)))
                 continue
 
             try:
@@ -100,7 +105,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         break
     
                     curr_player = obs["current"]["yourIndex"]
-                    curr_deck = sample_deck if curr_player == 0 else opponent_deck
+                    curr_deck = sample_deck if curr_player == my_player_idx else opponent_deck
                     
                     obs_class = to_observation_class(obs)
                     state_ps = obs_class.current.players[curr_player]
@@ -174,7 +179,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         "lockout_turns": episode_lockouts[curr_player]
                     }
     
-                    if curr_player == 0:
+                    if curr_player == my_player_idx:
                         turn = obs_class.current.turn if (obs_class.current is not None) else 1
                         warmup_threshold = max(0, 5 - (current_epoch // 5))
                         
@@ -199,17 +204,23 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             
                             if selected and len(selected) > 0:
                                 try:
-                                    chosen_opt = obs_class.select.option[selected[0]]
-                                    exp_bonus, exp_trigger = get_expert_bonus(obs_class, chosen_opt, opponent_name=opponent_name)
-                                    if exp_trigger and str(exp_trigger).lower() not in ("none", "disabled") and abs(exp_bonus) > 1e-6:
-                                        expert_log.append({
-                                            "trigger":     exp_trigger,
-                                            "action_type": getattr(chosen_opt, "type", getattr(chosen_opt, "optionType", -1)),
-                                            "bonus":       exp_bonus,
-                                            "turn":        obs_class.current.turn,
-                                            "my_prizes":   len(obs_class.current.players[curr_player].prize),
-                                            "opp_prizes":  len(obs_class.current.players[1 - curr_player].prize),
-                                        })
+                                    options = obs.get("select", {}).get("option", [])
+                                    if selected[0] < len(options):
+                                        chosen_opt = options[selected[0]]
+                                        exp_bonus, exp_trigger = get_expert_bonus(obs, chosen_opt, opponent_name=opponent_name, epoch=current_epoch)
+                                        if exp_trigger and str(exp_trigger).lower() not in ("none", "disabled") and abs(exp_bonus) > 1e-6:
+                                            curr_turn = obs.get("current", {}).get("turn", 1) if isinstance(obs.get("current"), dict) else 1
+                                            players_list = obs.get("current", {}).get("players", [{}, {}]) if isinstance(obs.get("current"), dict) else [{}, {}]
+                                            my_p = len(players_list[curr_player].get("prize", [])) if len(players_list) > curr_player else 6
+                                            opp_p = len(players_list[1 - curr_player].get("prize", [])) if len(players_list) > (1 - curr_player) else 6
+                                            expert_log.append({
+                                                "trigger":     exp_trigger,
+                                                "action_type": chosen_opt.get("type", -1) if isinstance(chosen_opt, dict) else getattr(chosen_opt, "type", -1),
+                                                "bonus":       exp_bonus,
+                                                "turn":        curr_turn,
+                                                "my_prizes":   my_p,
+                                                "opp_prizes":  opp_p,
+                                            })
                                 except Exception:
                                     pass
                             
@@ -217,6 +228,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             played_card_id = -1
                             attached_card_id = -1
                             attached_target_id = -1
+                            target_energy = 0
                             evolved_card_id = -1
                             attack_id = -1
                             if selected and len(selected) > 0:
@@ -241,9 +253,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                         if target_area == 4: # ACTIVE
                                             if len(state_ps.active) > 0 and state_ps.active[0] is not None:
                                                 attached_target_id = state_ps.active[0].id
+                                                target_energy = len(state_ps.active[0].energyCards) if hasattr(state_ps.active[0], "energyCards") else 0
                                         elif target_area == 5: # BENCH
                                             if 0 <= target_idx < len(state_ps.bench) and state_ps.bench[target_idx] is not None:
                                                 attached_target_id = state_ps.bench[target_idx].id
+                                                target_energy = len(state_ps.bench[target_idx].energyCards) if hasattr(state_ps.bench[target_idx], "energyCards") else 0
                                     elif opt_type_val == 9: # EVOLVE
                                         hand = state_ps.hand
                                         card_idx = opt.get("index", -1)
@@ -256,6 +270,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             pre_metrics["played_card_id"] = played_card_id
                             pre_metrics["attached_card_id"] = attached_card_id
                             pre_metrics["attached_target_id"] = attached_target_id
+                            pre_metrics["target_energy"] = target_energy
                             pre_metrics["evolved_card_id"] = evolved_card_id
                             pre_metrics["attack_id"] = attack_id
                             samples[0].append((sample, pre_metrics))
@@ -336,7 +351,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             pre_metrics["attached_target_id"] = attached_target_id
                             pre_metrics["evolved_card_id"] = evolved_card_id
                             pre_metrics["attack_id"] = attack_id
-                            samples[1].append((sample, pre_metrics))
+                            if sample is not None:
+                                samples[my_player_idx].append((sample, pre_metrics))
                         elif opp_model is not None:
                             selected, sample = mcts_agent(obs, curr_deck, opp_model, search_count=50)
                         else:
@@ -355,7 +371,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         obs = battle_select(selected)
                     except IndexError:
                         selected = random_agent(obs)
-                        obs = battle_select(selected)
+                        try:
+                            obs = battle_select(selected)
+                        except IndexError:
+                            obs = battle_select([0])
+
                     
                 battle_finish()
             except Exception as e:
@@ -488,11 +508,12 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             costs = [len(attack_table[aid].energies) for aid in getattr(target_card, "attacks", []) if aid in attack_table]
                             if costs:
                                 max_req_en = max(costs)
-                        target_curr_en = pre.get("active_energies", 0) if attached_target == pre.get("active_id") else 0
+                        target_curr_en = pre.get("target_energy", 0) if "target_energy" in pre else (pre.get("active_energies", 0) if attached_target == pre.get("active_id") else 0)
+                        # max_req_en is already computed generically from attack_table above
                         if target_curr_en >= max_req_en:
-                            r_en = -0.25
+                            r_en = -0.50  # Overcharge penalty
                         else:
-                            r_en = 0.05
+                            r_en = 0.05   # Useful energy attachment
                     r_no_en = -0.05 if (action_type != 8 and pre.get("has_energy_in_hand", False)) else 0.0
                         
                     r_strategic = calculate_strategic_reward(pre, post, action_type, step_idx, went_second, i, opponent_name)
@@ -536,17 +557,18 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
 
             entropy_accum = 0.0
             entropy_count = 0
-            for sample_obj, _ in samples[0]:
-                if sample_obj is not None and hasattr(sample_obj, 'policy') and len(sample_obj.policy) > 0:
-                    policy_probs = [max(1e-8, p) for p in sample_obj.policy if p > 0]
+            for sample_obj, _ in samples[my_player_idx]:
+                if sample_obj is not None and hasattr(sample_obj, 'policy') and len(sample_obj.policy) > 1:
+                    policy_probs = [max(1e-8, p) for p in sample_obj.policy]
                     p_sum = sum(policy_probs)
                     if p_sum > 0:
                         import math
-                        entropy = -sum((p/p_sum) * math.log(p/p_sum) for p in policy_probs)
+                        probs_norm = [p / p_sum for p in policy_probs]
+                        entropy = -sum(p * math.log(p) for p in probs_norm)
                         entropy_accum += entropy
                         entropy_count += 1
                         
-            result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, processed_samples, result, final_turn, rc_worker, entropy_accum, entropy_count, action_counts, played_cards, expert_log)))
+            result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, processed_samples, result, final_turn, rc_worker, entropy_accum, entropy_count, action_counts, played_cards, expert_log, went_second, my_player_idx)))
             
         elif cmd == "EVAL":
             sample_deck, opponent_deck, opponent_name = args
@@ -570,17 +592,14 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 curr_player = obs["current"]["yourIndex"]
                 
                 if curr_player == your_index:
-                    turn = obs["current"]["turn"] if obs.get("current") else 1
-                    if turn <= 1:
-                        eval_search_count = 35
-                    elif turn <= 3:
-                        eval_search_count = 20
-                    elif turn <= 8:
-                        eval_search_count = 15
-                    else:
-                        eval_search_count = 10
+                    eval_search_count = 30
+
+
+
+
                         
-                    selected, _ = mcts_agent(obs, sample_deck, client, search_count=eval_search_count)
+                    selected, _ = mcts_agent(obs, sample_deck, client, search_count=eval_search_count, temperature=0.0)
+
                 else:
                     if opponent_name.startswith("Rulebasedmodel"):
                         try:

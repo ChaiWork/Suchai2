@@ -85,6 +85,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for model training (default: 128)")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate (default: 5e-5)")
     parser.add_argument("--patience", type=int, default=10, help="Patience for early stopping based on evaluation win rate (default: 10)")
+    parser.add_argument("--buffer-size", type=int, default=50000, help="Capacity of the Prioritized Replay Buffer (default: 50000)")
     default_workers = min(8, max(1, mp.cpu_count() - 1)) if sys.platform == "win32" else max(1, mp.cpu_count() - 1)
     parser.add_argument("--num-workers", type=int, default=default_workers, help="Number of parallel worker processes")
     parser.add_argument("--disable-league", action="store_true", help="Disable league play and checkpoint saving in league directory")
@@ -204,10 +205,11 @@ def main():
     metrics_path = os.path.join(run_dir, "training_metrics.csv")
     with open(metrics_path, mode="w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "win_rate", "avg_loss", "value_loss", "policy_loss", "avg_reward",
+        writer.writerow(["epoch", "win_rate", "win_rate_first", "win_rate_second", "avg_loss", "value_loss", "policy_loss", "avg_reward",
                          "r_prize_taken", "r_prize_lost", "r_kos", "r_own_kos",
                          "r_energy", "r_bench", "r_deckout", "r_terminal", "r_stall", "r_no_energy", "r_strategic",
                          "avg_game_length", "policy_entropy"])
+
 
     deck_matchup_path = os.path.join(run_dir, "deck_matchup.csv")
     with open(deck_matchup_path, mode="w", newline="", encoding="utf-8-sig") as f:
@@ -243,18 +245,24 @@ def main():
     best_win_rate = -1.0
     patience_counter = 0
     
+    tier1_opponents = [
+        "Rulebasedmodel_Mewtwo_Easy", "Rulebasedmodel_Abomasnow", "Rulebasedmodel_Lopunny",
+        "Rulebasedmodel_Dipplin", "Rulebasedmodel_Crustle", "Rulebasedmodel_Honchkrow",
+        "Rulebasedmodel_Alakazam", "Rulebasedmodel_Lucario", "Rulebasedmodel_Mewtwo"
+    ]
     all_opponent_names = sorted([name for name in opponent_decks.keys() if name != "Current (Self)"])
     train_opponent_names = all_opponent_names
-    test_opponent_names = all_opponent_names
+    test_opponent_names = [opp for opp in tier1_opponents if opp in opponent_decks] or all_opponent_names
 
     print(f"Opponent Decks Configuration:")
     print(f"  -> Train Opponent Decks: {train_opponent_names}")
-    print(f"  -> Test Opponent Decks: {test_opponent_names}")
+    print(f"  -> Initial SPRT Test Opponent Decks (Tier 1 Curriculum): {test_opponent_names}")
+
 
     rolling_wins = {name: 0.0 for name in train_opponent_names}
     rolling_games = {name: 0.0 for name in train_opponent_names}
     
-    replay_buffer = PrioritizedReplayBuffer(capacity=50000)
+    replay_buffer = PrioritizedReplayBuffer(capacity=args.buffer_size)
     model_lock = threading.Lock()
 
     num_workers = args.num_workers
@@ -349,10 +357,16 @@ def main():
         win_rate = 0.0
         if args.eval_episodes > 0:
             active_elo = league_elos.get("active", 1500.0)
+            if counter > 15:
+                test_opponents_epoch = all_opponent_names
+            else:
+                test_opponents_epoch = [opp for opp in tier1_opponents if opp in opponent_decks] or all_opponent_names
+
             decision, win_rate, wins, losses, draws, deck_stats = run_sprt_evaluation(
-                command_queues, result_queue, num_workers, sample_deck, opponent_decks, test_opponent_names,
-                alpha=0.05, beta=0.1, p0=0.50, p1=0.58, max_eval_games=args.eval_episodes
+                command_queues, result_queue, num_workers, sample_deck, opponent_decks, test_opponents_epoch,
+                alpha=0.05, beta=0.1, p0=0.50, p1=0.54, max_eval_games=args.eval_episodes
             )
+
             
             for name, stats in deck_stats.items():
                 d_denom = stats[0] + stats[1]
@@ -448,7 +462,14 @@ def main():
 
             epoch_self_play_wins = 0.0
             epoch_self_play_games = 0.0
+            epoch_first_wins = 0.0
+            epoch_first_games = 0.0
+            epoch_second_wins = 0.0
+            epoch_second_games = 0.0
+            entropy_accum = 0.0
+            entropy_count = 0
             pbar = ProgressBar(args.self_play_episodes, "Training Data Collecting... ")
+
             pbar.update(0)
             
             while games_received < args.self_play_episodes:
@@ -458,6 +479,8 @@ def main():
                     action_counts = data[7] if len(data) > 7 else {}
                     played_cards  = data[8] if len(data) > 8 else {}
                     expert_log    = data[9] if len(data) > 9 else []
+                    went_second   = data[10] if len(data) > 10 else False
+                    my_player_idx = data[11] if len(data) > 11 else 0
                     
                     games_received += 1
                     
@@ -476,12 +499,13 @@ def main():
                         else:
                             league_failed += 1
                     
+                    result_label = "WIN" if result == my_player_idx else ("LOSS" if (result >= 0 and result != 2) else ("DRAW" if result == 2 else "ERROR"))
                     with open(self_play_games_path, mode="a", newline="", encoding="utf-8-sig") as f_sp:
                         sp_writer = csv.writer(f_sp)
                         sp_writer.writerow([
                             counter,
                             opp_name,
-                            result,
+                            result_label,
                             final_turn,
                             action_counts.get("attack", 0),
                             action_counts.get("play", 0),
@@ -510,14 +534,27 @@ def main():
                                 ])
 
                     if result >= 0:
-                        if result == 0:
+                        epoch_self_play_games += 1.0
+                        is_win = (result == my_player_idx)
+                        is_draw = (result == 2)
+                        if is_win:
                             epoch_self_play_wins += 1.0
-                            epoch_self_play_games += 1.0
-                        elif result == 1:
-                            epoch_self_play_games += 1.0
-                        elif result == 2:
+                        elif is_draw:
                             epoch_self_play_wins += 0.5
-                            epoch_self_play_games += 1.0
+
+                        if went_second:
+                            epoch_second_games += 1.0
+                            if is_win:
+                                epoch_second_wins += 1.0
+                            elif is_draw:
+                                epoch_second_wins += 0.5
+                        else:
+                            epoch_first_games += 1.0
+                            if is_win:
+                                epoch_first_wins += 1.0
+                            elif is_draw:
+                                epoch_first_wins += 0.5
+
 
                     if opp_name != "Current (Self)" and result >= 0:
                         if opp_name in rolling_games:
@@ -657,8 +694,15 @@ def main():
                         out_dec_fp32 = out_dec.float()
                         masked_logits = out_dec_fp32 + (1.0 - mask_tensor) * (-1e4)
                         log_probs = torch.nn.functional.log_softmax(masked_logits, dim=-1)
-                        loss_dec_ce = -(label_tensor_dec * log_probs * mask_tensor)
+
+                        # Label smoothing (epsilon = 0.05) over valid candidate actions to prevent logit explosion & vanishing gradients
+                        LABEL_SMOOTHING = 0.05
+                        n_valid_actions = mask_tensor.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                        smoothed_labels = (1.0 - LABEL_SMOOTHING) * label_tensor_dec + (LABEL_SMOOTHING / n_valid_actions) * mask_tensor
+
+                        loss_dec_ce = -(smoothed_labels * log_probs * mask_tensor)
                         loss_dec_ce = (loss_dec_ce.sum(dim=-1, keepdim=True) * is_weight_tensor).mean()
+
 
                         # Policy Entropy Regularization: H(pi) = -sum(p * log_p) to prevent policy collapse
                         probs = torch.exp(log_probs) * mask_tensor
@@ -696,10 +740,21 @@ def main():
                         torch.cuda.empty_cache()
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                        with model_lock:
+                            optimizer.zero_grad(set_to_none=True)
+                        for var_name in ['out_enc', 'out_dec', 'loss', 'loss_enc', 'loss_dec_ce', 'mask_tensor', 'label_tensor_enc', 'label_tensor_dec', 'is_weight_tensor']:
+                            if var_name in locals():
+                                try:
+                                    del locals()[var_name]
+                                except Exception:
+                                    pass
                         import gc
                         gc.collect()
                         if device.type == 'cuda':
-                            torch.cuda.empty_cache()
+                            try:
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
                         print(f"[WARNING] CUDA Out of Memory on training batch {i}. Cleared CUDA cache & continuing safely.")
                         continue
                     else:
@@ -759,10 +814,14 @@ def main():
         avg_gl = total_game_length / total_games if total_games > 0 else 0.0
         avg_entropy = entropy_accum / max(1, entropy_count)
         rc_div = max(1, rc_count)
+
+        win_rate  = (epoch_self_play_wins / max(1.0, epoch_self_play_games)) * 100.0 if epoch_self_play_games > 0 else 0.0
+        wr_first  = (epoch_first_wins / max(1.0, epoch_first_games)) * 100.0 if epoch_first_games > 0 else 0.0
+        wr_second = (epoch_second_wins / max(1.0, epoch_second_games)) * 100.0 if epoch_second_games > 0 else 0.0
         
         with open(metrics_path, mode="a", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            writer.writerow([counter, win_rate, avg_loss, avg_val_loss, avg_pol_loss, avg_reward,
+            writer.writerow([counter, win_rate, wr_first, wr_second, avg_loss, avg_val_loss, avg_pol_loss, avg_reward,
                              rc["prize_taken"] / rc_div, rc["prize_lost"] / rc_div,
                              rc["kos"] / rc_div, rc["own_kos"] / rc_div,
                              rc["energy"] / rc_div, rc["bench"] / rc_div,
@@ -798,8 +857,11 @@ def main():
             tb_writer.add_scalar("MCTS/Entropy", avg_entropy, counter)
             tb_writer.add_scalar("League/ActiveElo", active_elo, counter)
             tb_writer.add_scalar("Generalization/OOD_WinRate", win_rate, counter)
+            tb_writer.add_scalar("TurnOrder/WinRate_First", wr_first, counter)
+            tb_writer.add_scalar("TurnOrder/WinRate_Second", wr_second, counter)
 
-        print(f"Epoch Metrics Logged -> Win Rate: {win_rate:.1f}%, Loss: {avg_loss:.4f}, Reward: {avg_reward:.4f}, Active Elo: {active_elo:.1f}")
+        print(f"Epoch Metrics Logged -> Win Rate: {win_rate:.1f}% (First: {wr_first:.1f}%, Second: {wr_second:.1f}%), Loss: {avg_loss:.4f}, Reward: {avg_reward:.4f}, Active Elo: {active_elo:.1f}")
+
         print(f"Current Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
         
         card_stats_path = os.path.join(run_dir, "card_play_stats.csv")

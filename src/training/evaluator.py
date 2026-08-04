@@ -46,15 +46,24 @@ def rule_based_opponent_agent(opponent_name, obs):
         "DRAGOPULT": ["hard.dragapult_agent"]
     }
     
+_opponent_module_cache = {}
+
+
+def rule_based_opponent_agent(opponent_name, obs):
+    if opponent_name in _opponent_module_cache:
+        return _opponent_module_cache[opponent_name].agent(obs)
+
     modules = mapping.get(opponent_name, [opponent_name])
     for mod_path in modules:
         try:
             mod = importlib.import_module(f"Rulebasedmodel.{mod_path}")
+            _opponent_module_cache[opponent_name] = mod
             return mod.agent(obs)
         except Exception:
             pass
-            
+
     raise ValueError(f"Unknown rule-based opponent: {opponent_name}")
+
 
 
 def get_active_deck_csv_path() -> str:
@@ -73,7 +82,7 @@ def get_active_deck_csv_path() -> str:
             if os.path.exists(path):
                 return path
     else:  # MEWTWO
-        for path in ["deck copy BARU CARD TAPI KECEWA.csv", "deck_mewtwo.csv", "deck.csv"]:
+        for path in ["deck_mewtwo_battle_cage.csv", "deck lama.csv", "deck_mewtwo.csv", "deck.csv"]:
             if os.path.exists(path):
                 return path
     return "deck.csv"

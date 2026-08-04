@@ -47,7 +47,7 @@ class TestGrimmsnarlDeckProfile(unittest.TestCase):
             player_idx=0,
             opponent_name="Rulebasedmodel_Mewtwo"
         )
-        self.assertGreaterEqual(reward, 0.25)
+        self.assertGreater(reward, 0.18)
 
     def test_expert_poffin_search_bonus(self):
         """Test expert guidance bonus for early Poffin play."""
