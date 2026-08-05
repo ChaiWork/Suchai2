@@ -208,7 +208,11 @@ def main():
         writer.writerow(["epoch", "win_rate", "win_rate_first", "win_rate_second", "avg_loss", "value_loss", "policy_loss", "avg_reward",
                          "r_prize_taken", "r_prize_lost", "r_kos", "r_own_kos",
                          "r_energy", "r_bench", "r_deckout", "r_terminal", "r_stall", "r_no_energy", "r_strategic",
-                         "avg_game_length", "policy_entropy"])
+                         "r_knockout", "r_attack_ready", "r_backup_ready", "r_bench_setup", "r_evolution_progress", "r_stadium_value",
+                         "r_retreat_eff", "r_damage_eff", "r_lethal_detection", "r_supporter_eff", "r_supporter_opp_cost",
+                         "r_hand_congestion", "r_deck_preservation", "r_missed_attack", "r_donk_prevention", "r_action_conv",
+                         "r_search_quality", "r_search_tempo",
+                         "avg_game_length", "policy_entropy", "action_diversity", "explained_variance", "mean_return", "mean_advantage", "value_prediction_mean"])
 
 
     deck_matchup_path = os.path.join(run_dir, "deck_matchup.csv")
@@ -345,7 +349,13 @@ def main():
         epoch_card_plays = defaultdict(int)
         rc = {"prize_taken": 0.0, "prize_lost": 0.0, "kos": 0.0, "own_kos": 0.0,
               "energy": 0.0, "bench": 0.0, "deckout": 0.0, "terminal": 0.0, "stall": 0.0,
-              "no_energy": 0.0, "strategic": 0.0}
+              "no_energy": 0.0, "strategic": 0.0,
+              "r_knockout": 0.0, "r_attack_ready": 0.0, "r_backup_ready": 0.0, "r_bench_setup": 0.0,
+              "r_evolution_progress": 0.0, "r_stadium_value": 0.0, "r_retreat_eff": 0.0,
+              "r_damage_eff": 0.0, "r_lethal_detection": 0.0, "r_supporter_eff": 0.0,
+              "r_supporter_opp_cost": 0.0, "r_hand_congestion": 0.0, "r_deck_preservation": 0.0,
+              "r_missed_attack": 0.0, "r_donk_prevention": 0.0, "r_action_conv": 0.0,
+              "r_search_quality": 0.0, "r_search_tempo": 0.0}
         rc_count = 0
         total_game_length = 0
         total_games = 0
@@ -646,6 +656,12 @@ def main():
             epoch_losses = []
             epoch_val_losses = []
             epoch_pol_losses = []
+            epoch_entropies = []
+            epoch_diversities = []
+            epoch_exp_vars = []
+            epoch_returns = []
+            epoch_advantages = []
+            epoch_val_preds = []
             for i in range(batch_count):
                 try:
                     beta = min(1.0, 0.4 + 0.6 * (counter / args.epochs))
@@ -692,8 +708,8 @@ def main():
                         loss_enc = (loss_enc_elem * is_weight_tensor).mean()
 
                         out_dec_fp32 = out_dec.float()
-                        masked_logits = out_dec_fp32 + (1.0 - mask_tensor) * (-1e4)
-                        log_probs = torch.nn.functional.log_softmax(masked_logits, dim=-1)
+                        valid_logits = out_dec_fp32.masked_fill(mask_tensor == 0, -1e4)
+                        log_probs = torch.nn.functional.log_softmax(valid_logits, dim=-1)
 
                         # Label smoothing (epsilon = 0.05) over valid candidate actions to prevent logit explosion & vanishing gradients
                         LABEL_SMOOTHING = 0.05
@@ -703,13 +719,32 @@ def main():
                         loss_dec_ce = -(smoothed_labels * log_probs * mask_tensor)
                         loss_dec_ce = (loss_dec_ce.sum(dim=-1, keepdim=True) * is_weight_tensor).mean()
 
+                        # Categorical Distribution over valid logits for accurate valid-action entropy computation
+                        dist = torch.distributions.Categorical(logits=valid_logits)
+                        policy_entropy = dist.entropy().mean()
 
-                        # Policy Entropy Regularization: H(pi) = -sum(p * log_p) to prevent policy collapse
-                        probs = torch.exp(log_probs) * mask_tensor
-                        policy_entropy = -(probs * log_probs * mask_tensor).sum(dim=-1, keepdim=True).mean()
-                        ENTROPY_WEIGHT = 0.01
+                        # ENTROPY_WEIGHT Decay Schedule: Ep 0-20: 0.02, Ep 20-50: 0.01, Ep >50: 0.005
+                        if counter <= 20:
+                            ENTROPY_WEIGHT = 0.02
+                        elif counter <= 50:
+                            ENTROPY_WEIGHT = 0.01
+                        else:
+                            ENTROPY_WEIGHT = 0.005
 
                         loss = loss_enc + loss_dec_ce - ENTROPY_WEIGHT * policy_entropy
+
+                        # PPO Health & Diversity Metrics
+                        probs = torch.exp(log_probs) * mask_tensor
+                        diversity_elem = ((probs > 0.01).float().sum(dim=-1, keepdim=True) / n_valid_actions).mean()
+                        var_y = torch.var(label_tensor_enc)
+                        exp_var = 1.0 - (torch.var(label_tensor_enc - out_enc) / (var_y + 1e-8))
+
+                        epoch_entropies.append(policy_entropy.item())
+                        epoch_diversities.append(diversity_elem.item())
+                        epoch_exp_vars.append(exp_var.item())
+                        epoch_returns.append(label_tensor_enc.mean().item())
+                        epoch_advantages.append(is_weight_tensor.mean().item())
+                        epoch_val_preds.append(out_enc.mean().item())
 
                     if scaler is not None:
                         scaler.scale(loss).backward()
@@ -765,7 +800,10 @@ def main():
             avg_pol_loss = sum(epoch_pol_losses) / len(epoch_pol_losses) if epoch_pol_losses else 0.0
             print(f"Training Finish. Average Loss: {avg_loss:.4f} (Value Loss: {avg_val_loss:.4f}, Policy Loss: {avg_pol_loss:.4f})")
             if device.type == 'cuda':
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
         else:
             if args.self_play_episodes > 0:
                 print(f"Skipping training: collected buffer size ({len(replay_buffer)}) less than batch size ({args.batch_size}).")
@@ -812,7 +850,16 @@ def main():
         _league_cache.clear()
 
         avg_gl = total_game_length / total_games if total_games > 0 else 0.0
-        avg_entropy = entropy_accum / max(1, entropy_count)
+        avg_entropy = sum(epoch_entropies) / len(epoch_entropies) if epoch_entropies else (entropy_accum / max(1, entropy_count))
+        avg_diversity = sum(epoch_diversities) / len(epoch_diversities) if epoch_diversities else 0.0
+        avg_exp_var = sum(epoch_exp_vars) / len(epoch_exp_vars) if epoch_exp_vars else 0.0
+        avg_return = sum(epoch_returns) / len(epoch_returns) if epoch_returns else 0.0
+        avg_advantage = sum(epoch_advantages) / len(epoch_advantages) if epoch_advantages else 0.0
+        avg_val_pred = sum(epoch_val_preds) / len(epoch_val_preds) if epoch_val_preds else 0.0
+
+        if avg_entropy < 0.05:
+            print("\nWARNING: Policy entropy collapse detected")
+
         rc_div = max(1, rc_count)
 
         win_rate  = (epoch_self_play_wins / max(1.0, epoch_self_play_games)) * 100.0 if epoch_self_play_games > 0 else 0.0
@@ -822,12 +869,21 @@ def main():
         with open(metrics_path, mode="a", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow([counter, win_rate, wr_first, wr_second, avg_loss, avg_val_loss, avg_pol_loss, avg_reward,
-                             rc["prize_taken"] / rc_div, rc["prize_lost"] / rc_div,
-                             rc["kos"] / rc_div, rc["own_kos"] / rc_div,
-                             rc["energy"] / rc_div, rc["bench"] / rc_div,
-                             rc["deckout"] / rc_div, rc["terminal"] / rc_div,
-                             rc["stall"] / rc_div, rc["no_energy"] / rc_div, rc["strategic"] / rc_div, avg_gl,
-                             avg_entropy])
+                             rc.get("prize_taken", 0.0) / rc_div, rc.get("prize_lost", 0.0) / rc_div,
+                             rc.get("kos", 0.0) / rc_div, rc.get("own_kos", 0.0) / rc_div,
+                             rc.get("energy", 0.0) / rc_div, rc.get("bench", 0.0) / rc_div,
+                             rc.get("deckout", 0.0) / rc_div, rc.get("terminal", 0.0) / rc_div,
+                             rc.get("stall", 0.0) / rc_div, rc.get("no_energy", 0.0) / rc_div, rc.get("strategic", 0.0) / rc_div,
+                             rc.get("r_knockout", 0.0) / rc_div, rc.get("r_attack_ready", 0.0) / rc_div, rc.get("r_backup_ready", 0.0) / rc_div,
+                             rc.get("r_bench_setup", 0.0) / rc_div, rc.get("r_evolution_progress", 0.0) / rc_div,
+                             rc.get("r_stadium_value", 0.0) / rc_div, rc.get("r_retreat_eff", 0.0) / rc_div,
+                             rc.get("r_damage_eff", 0.0) / rc_div, rc.get("r_lethal_detection", 0.0) / rc_div,
+                             rc.get("r_supporter_eff", 0.0) / rc_div, rc.get("r_supporter_opp_cost", 0.0) / rc_div,
+                             rc.get("r_hand_congestion", 0.0) / rc_div, rc.get("r_deck_preservation", 0.0) / rc_div,
+                             rc.get("r_missed_attack", 0.0) / rc_div, rc.get("r_donk_prevention", 0.0) / rc_div,
+                             rc.get("r_action_conv", 0.0) / rc_div,
+                             rc.get("r_search_quality", 0.0) / rc_div, rc.get("r_search_tempo", 0.0) / rc_div,
+                             avg_gl, avg_entropy, avg_diversity, avg_exp_var, avg_return, avg_advantage, avg_val_pred])
         
         with open(deck_matchup_path, mode="a", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)

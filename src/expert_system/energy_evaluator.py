@@ -208,7 +208,7 @@ def compute_board_energy_value(
         w.get("powered", 0.25) * powered_count +
         w.get("bench_powered", 0.20) * bench_powered_count +
         w.get("efficiency", 0.15) * mean_efficiency -
-        w.get("wasted", 0.10) * wasted_energy
+        0.50 * wasted_energy
     )
 
     metrics = {
@@ -415,9 +415,11 @@ def evaluate_energy_target(
 ) -> Tuple[float, str]:
     """Backward compatible prior score wrapper for MCTS heuristic search."""
     bench_ids = bench_ids or []
-    bench_energies = bench_energies or []
-    is_act = (target_card_id == active_id)
     energy_added = 2 if energy_card_id in (15, 19) else 1
+
+    req_en = get_required_energy(target_card_id)
+    if target_current_energy >= req_en:
+        return -0.15, "Prior: Overcharge Energy Penalty (Target already powered)"
 
     bench_e_after = list(bench_energies)
     if not is_act:

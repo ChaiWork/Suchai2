@@ -271,10 +271,16 @@ if __name__ == "__main__":
     parser.add_argument("--opp", type=str, default="Rulebasedmodel_Dragapult", help="Opponent name (e.g. Rulebasedmodel_Dragapult, ALL)")
     parser.add_argument("--all", action="store_true", help="Run evaluation against ALL rule-based opponents (10 matches each)")
     parser.add_argument("--active-deck", type=str, default=None, help="Active deck name (e.g. GRIMMSNARL, MEWTWO, LILLIE)")
+    parser.add_argument("--model", type=str, default=None, help="Path to specific model checkpoint (e.g. best_model.pth, out/runs/run_10/model.pth)")
     parser.add_argument("--num-matches", "-n", type=int, default=1, help="Number of matches per opponent (e.g. 10)")
     parser.add_argument("--out-dir", type=str, default="replays", help="Output directory folder for batch replay JSON files")
     parser.add_argument("--out", type=str, default="vis.json", help="Output JSON file name for single match mode")
     args = parser.parse_args()
+
+    if args.model and os.path.exists(args.model):
+        import shutil
+        shutil.copy(args.model, "best_model.pth")
+        print(f"Loaded checkpoint '{args.model}' as 'best_model.pth'")
 
     if args.active_deck:
         from src.configs.active_deck import set_active_deck

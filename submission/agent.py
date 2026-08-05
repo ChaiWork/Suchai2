@@ -609,9 +609,24 @@ def agent(obs, configuration=None) -> list[int]:
         except Exception:
             model_global = None
 
-    your_deck = _load_my_deck()
+    remaining_time = 600.0
+    if isinstance(obs, dict):
+        remaining_time = float(obs.get('remainingOverageTime', 600.0))
+    elif hasattr(obs, 'remainingOverageTime'):
+        remaining_time = float(getattr(obs, 'remainingOverageTime', 600.0))
+
+    IS_KAGGLE = os.path.exists('/kaggle_simulations/agent') or 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
+    if remaining_time < 60.0:
+        search_count = 5
+    elif remaining_time < 150.0:
+        search_count = 10
+    elif remaining_time < 300.0:
+        search_count = 20 if IS_KAGGLE else 50
+    else:
+        search_count = 50 if IS_KAGGLE else 200
+
     try:
-        selected, _ = mcts_agent(obs, your_deck, client=model_global, search_count=200, temperature=0.0)
+        selected, _ = mcts_agent(obs, your_deck, client=model_global, search_count=search_count, temperature=0.0)
         return selected
     except Exception:
         return [0]

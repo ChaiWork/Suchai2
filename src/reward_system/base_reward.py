@@ -1,11 +1,9 @@
 """
-Generic Domain-Agnostic RL Reward Engine (Phase 4 Sparse Final Form).
-Calculates pure sparse outcome rewards: prize deltas, KO rewards, bench guards,
-deckout danger penalties, and terminal win/loss signals applicable to any deck archetype.
+Generic Domain-Agnostic RL Reward Engine (Granular Multi-Component Form).
+Calculates orthogonal, state-transition-driven rewards for every strategic concept:
+knockouts, board setup, damage efficiency, attack readiness, search quality, supporter timing, and rule guards.
+Matches worker.py dictionary keys perfectly.
 """
-from cg.api import CardType, OptionType
-
-
 try:
     from src.expert_system.base_expert import expert_scale
 except ImportError:
@@ -15,95 +13,152 @@ except ImportError:
         def expert_scale(epoch=1):
             return 1.0
 
+SUPPORTER_IDS = frozenset({1216, 1218, 1219, 1220, 1227})
+SEARCH_CARD_IDS = frozenset({1086, 1094, 1106, 1121, 1134, 1152})
 
-def calculate_base_strategic_reward(pre: dict, post: dict, action_type: int, step_idx: int, went_second: bool, player_idx: int, opponent_name: str) -> float:
+
+def calculate_base_strategic_reward_components(pre: dict, post: dict, action_type: int, step_idx: int, went_second: bool, player_idx: int, opponent_name: str) -> dict:
     """
-    Computes pure deck-agnostic r_strategic value for state transitions.
-    Intermediate shaping signals (prize delta, KO, board setup, card conversion,
-    supporter opportunity cost) decay smoothly over training epochs but retain a 
-    minimum baseline floor (alpha_min = 0.20) so intermediate feedback never drops to zero.
+    Computes pure deck-agnostic granular reward components for state transitions S -> S'.
+    Returns a dictionary mapping each strategic concept to its independent reward float.
+    Uses exact key names matching worker.py:
+      - active_hp / opp_active_hp
+      - active_energy
+      - hand_size / hand_ids
+      - deck_size / opp_deck_size
+      - bench_size / bench_ids
+      - action_type / played_card_id
     """
-    r_strategic = 0.0
+    components = {
+        "r_knockout": 0.0,
+        "r_attack_ready": 0.0,
+        "r_backup_ready": 0.0,
+        "r_bench_setup": 0.0,
+        "r_evolution_progress": 0.0,
+        "r_stadium_value": 0.0,
+        "r_retreat_eff": 0.0,
+        "r_damage_eff": 0.0,
+        "r_lethal_detection": 0.0,
+        "r_supporter_eff": 0.0,
+        "r_supporter_opp_cost": 0.0,
+        "r_hand_congestion": 0.0,
+        "r_deck_preservation": 0.0,
+        "r_missed_attack": 0.0,
+        "r_donk_prevention": 0.0,
+        "r_action_conv": 0.0,
+        "r_search_quality": 0.0,
+        "r_search_tempo": 0.0,
+    }
 
-    # 1. Prize Delta Reward: +(prizes_taken) - (prizes_lost)
-    prizes_taken = pre.get("my_prizes", 6) - post.get("my_prizes", 6)
-    prizes_lost  = pre.get("opp_prizes", 6) - post.get("opp_prizes", 6)
+    # 1. Knockout Execution & Damage Efficiency & Lethal Detection
+    pre_opp_pk = pre.get("opp_pokemon", 0)
+    post_opp_pk = post.get("opp_pokemon", 0)
+    if pre_opp_pk > post_opp_pk and post_opp_pk >= 0 and pre_opp_pk > 0:
+        components["r_knockout"] = (pre_opp_pk - post_opp_pk) * 0.15
 
-    if prizes_taken > 0:
-        r_strategic += prizes_taken * 0.25
-    if prizes_lost > 0:
-        r_strategic -= prizes_lost * 0.25
+    pre_opp_hp = pre.get("opp_active_hp", 0)
+    post_opp_hp = post.get("opp_active_hp", 0)
+    if pre_opp_hp > post_opp_hp and pre_opp_hp > 0:
+        opp_hp_loss = pre_opp_hp - post_opp_hp
+        components["r_damage_eff"] = min(0.10, (opp_hp_loss / 200.0) * 0.10)
+        if post_opp_hp <= 0:
+            components["r_lethal_detection"] = 0.12
 
-    # 2. KO Reward / Own KO Loss Penalty
-    opp_pk_lost = pre.get("opp_pokemon", 0) - post.get("opp_pokemon", 0)
-    my_pk_lost  = pre.get("my_pokemon", 0) - post.get("my_pokemon", 0)
+    # 2. Board Power & Attack Readiness
+    pre_act_en = pre.get("active_energy", 0)
+    post_act_en = post.get("active_energy", 0)
+    if post_act_en >= 2 and pre_act_en < 2:
+        components["r_attack_ready"] = 0.10
 
-    if opp_pk_lost > 0:
-        r_strategic += opp_pk_lost * 0.15
-    if my_pk_lost > 0:
-        r_strategic -= my_pk_lost * 0.15
+    pre_bench_size = pre.get("bench_size", 0)
+    post_bench_size = post.get("bench_size", 0)
+    pre_total_en = pre.get("energy", 0)
+    post_total_en = post.get("energy", 0)
+    bench_en = post_total_en - post_act_en
+    if post_bench_size > 0 and bench_en >= 2 and post_total_en > pre_total_en:
+        components["r_backup_ready"] = 0.08
 
-    # 3. Board Evolution & Setup Readiness Delta
-    # Rewards developing bench HP, useful attached energy (capped at attack requirement), and evolution stages
-    pre_en = pre.get("useful_energy", pre.get("total_energy", 0))
-    post_en = post.get("useful_energy", post.get("total_energy", 0))
-    pre_power = pre.get("my_hp", 0) + pre_en * 15 + pre.get("my_pokemon", 0) * 20
-    post_power = post.get("my_hp", 0) + post_en * 15 + post.get("my_pokemon", 0) * 20
-    power_delta = post_power - pre_power
-    if power_delta > 0:
-        r_strategic += min(0.20, power_delta / 250.0)
+    # 3. Early Bench Setup & Donk Guard
+    turn_curr = post.get("turn", 1)
+    if post_bench_size > pre_bench_size and turn_curr <= 3:
+        components["r_bench_setup"] = min(0.08, 0.04 * (post_bench_size - pre_bench_size))
 
-    # 4. Action Conversion & Hand Congestion Reward
-    cards_played = post.get("cards_played_this_turn", 0) - pre.get("cards_played_this_turn", 0)
-    if cards_played > 0 and action_type in (7, 8):  # PLAY or ATTACH
-        r_strategic += min(0.15, cards_played * 0.05)
+    if post_bench_size == 0 and turn_curr <= 2:
+        components["r_donk_prevention"] = -0.20
 
-    # Hand Congestion Penalty (drawn lots of cards but holding many unplayed)
-    hand_cnt_post = post.get("hand_count", 0)
-    if hand_cnt_post > 10 and action_type == 7:  # PLAY draw engine
-        r_strategic -= 0.05
+    # 4. Evolution Progress
+    if action_type == 9:  # EVOLVE
+        components["r_evolution_progress"] = 0.08
 
-    # 5. Supporter Opportunity Cost Penalty (ending turn with playable Supporter in hand uncast)
-    supporter_played = post.get("supporter_played", False)
-    has_supporter_in_hand = post.get("has_supporter_in_hand", False)
-    if action_type == 0 and (not supporter_played) and has_supporter_in_hand:  # Action 0 = END_TURN
-        r_strategic -= 0.15
+    # 5. Supporter Play & Opportunity Cost
+    played_card_id = pre.get("played_card_id", -1)
+    if action_type == 7 and played_card_id in SUPPORTER_IDS:
+        components["r_supporter_eff"] = 0.05
 
-    # 6. Prize Proximity / Damage Progress Reward
-    opp_hp_loss = pre.get("opp_hp", 0) - post.get("opp_hp", 0)
-    if opp_hp_loss > 0:
-        r_strategic += min(0.20, (opp_hp_loss / 200.0) * 0.15)
+    post_hand_ids = post.get("hand_ids", [])
+    has_supporter_in_hand = any(cid in SUPPORTER_IDS for cid in post_hand_ids)
+    if action_type in (0, 14) and (played_card_id not in SUPPORTER_IDS) and has_supporter_in_hand:  # END_TURN
+        components["r_supporter_opp_cost"] = -0.08
 
-    # 7. Bench Size Protection Guard across early turns (prevents Bench Wipe loss)
-    bench_size_curr = post.get("bench_size", 0)
-    turn_curr = post.get("turn", 0)
-    if bench_size_curr == 0 and turn_curr <= 5:
-        r_strategic -= 0.40
+    # 6. Search Quality & Tempo
+    if (action_type == 7 and played_card_id in SEARCH_CARD_IDS) or action_type == 3:
+        components["r_search_quality"] = 0.06
+        components["r_search_tempo"] = 0.05
 
-    # 8. Deck-Out Danger Warning Penalty (Escalating as deck count drops <= 5)
-    deck_cnt_post = post.get("deck_count", 60)
+    # 7. Action Conversion & Hand Congestion
+    if action_type in (7, 8):  # PLAY or ATTACH
+        components["r_action_conv"] = 0.04
+
+    post_hand_size = post.get("hand_size", 0)
+    if post_hand_size > 10 and action_type == 7:
+        components["r_hand_congestion"] = -0.05
+
+    # 8. Pure AlphaZero State-Transition Retreat Delta V(S -> S')
+    if action_type == 12:  # RETREAT
+        pre_act_en = pre.get("active_energy", 0)
+        pre_min_req = pre.get("active_min_req_energy", 1)
+        pre_readiness = min(1.0, pre_act_en / max(1, pre_min_req))
+        
+        post_act_en = post.get("active_energy", 0)
+        post_min_req = post.get("active_min_req_energy", 1)
+        post_readiness = min(1.0, post_act_en / max(1, post_min_req))
+        
+        pre_survival = pre.get("active_hp", 100) / max(1, pre.get("active_max_hp", 100))
+        post_survival = post.get("active_hp", 100) / max(1, post.get("active_max_hp", 100))
+        
+        readiness_delta = post_readiness - pre_readiness
+        survival_delta = post_survival - pre_survival
+        
+        board_delta = 0.60 * readiness_delta + 0.40 * survival_delta
+        components["r_retreat_eff"] = max(-0.10, min(0.10, board_delta))
+
+    # 9. Deck-Out Danger Warning
+    deck_cnt_post = post.get("deck_size", 60)
     if deck_cnt_post <= 5:
-        r_strategic -= 0.15 * ((6.0 - deck_cnt_post) / 5.0)
+        components["r_deck_preservation"] = -0.05 * ((6.0 - deck_cnt_post) / 5.0)
 
-    # 9. Generic Board Control Improvement Delta (works for ANY stadium or bench protection card)
-    board_ctrl_pre = pre.get("board_control", 0.0)
-    board_ctrl_post = post.get("board_control", 0.0)
-    if board_ctrl_post > board_ctrl_pre:
-        r_strategic += min(0.08, (board_ctrl_post - board_ctrl_pre) * 0.05)
-    elif action_type == 7 and post.get("stadium_played", False):
-        r_strategic += 0.05  # Generic stadium deployment bonus
+    # 10. Stadium Deployment
+    if action_type == 7 and played_card_id in (1180, 1257, 1264):  # Prism Tower, TR Factory, Battle Cage
+        components["r_stadium_value"] = 0.06
 
-    # 10. Conditional Pass Penalty (small -0.05 penalty if powered attack was available but passed)
-    act_ready = pre.get("active_attack_ready", False) or pre.get("my_active_energy", 0) >= 3
-    if action_type == 0 and act_ready and opp_hp_loss == 0:  # Action 0 = END_TURN
-        r_strategic -= 0.05
+    # 11. Missed Attack Penalty (powered attacker passed without attacking)
+    act_ready = (pre_act_en >= 2)
+    if action_type in (0, 14) and act_ready and (pre_opp_hp - post_opp_hp <= 0):  # END_TURN
+        components["r_missed_attack"] = -0.10
 
-    # Apply curriculum decay with a non-zero baseline floor (alpha_min = 0.20)
+    # Apply curriculum decay
     epoch_val = pre.get("epoch", 1)
     decay_factor = max(0.20, expert_scale(epoch_val))
-    r_strategic *= decay_factor
+    for k in components:
+        components[k] *= decay_factor
 
-    return max(-0.50, min(0.50, r_strategic))
+    return components
+
+
+def calculate_base_strategic_reward(pre: dict, post: dict, action_type: int, step_idx: int, went_second: bool, player_idx: int, opponent_name: str) -> float:
+    """Backward-compatible total scalar reward wrapper."""
+    comp = calculate_base_strategic_reward_components(pre, post, action_type, step_idx, went_second, player_idx, opponent_name)
+    return max(-0.50, min(0.50, sum(comp.values())))
 
 
 def calculate_base_energy_reward(
@@ -120,11 +175,7 @@ def calculate_base_energy_reward(
     my_prizes: int,
     opp_prizes: int,
 ) -> float:
-    """
-    Generic deck-agnostic energy attachment reward.
-    Called from any deck-specific reward module for action_type == 8.
-    Bounded to [-0.25, +0.25].
-    """
+    """Generic energy reward wrapper delegating to energy_evaluator."""
     if action_type != 8 or attached_card_id < 0 or target_card_id < 0:
         return 0.0
     try:
@@ -137,7 +188,6 @@ def calculate_base_energy_reward(
         energy_added = 2 if attached_card_id in (15, 19) else 1
         energy_after = target_current_energy + energy_added
 
-        # Reconstruct post bench energies for backup bonus calculation
         bench_energies_after = list(bench_energies)
         if not is_active:
             for i, b_id in enumerate(bench_ids):
@@ -159,4 +209,3 @@ def calculate_base_energy_reward(
         )
     except Exception:
         return 0.0
-
