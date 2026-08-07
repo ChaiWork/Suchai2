@@ -4,7 +4,7 @@ Base Expert System & Context Extractor for Pokémon TCG AI Agent.
 from cg.api import CardType, OptionType, SelectContext
 
 USE_EXPERT_GUIDANCE = True
-EXPERT_WEIGHT = 0.10
+EXPERT_WEIGHT = 0.25
 
 # Expert influence schedule — stepped plateaus rather than linear-to-zero decay.
 # AlphaZero principle: expert priors are never fully removed; the NN learns ON TOP of them.
@@ -38,13 +38,13 @@ def expert_scale(epoch: int) -> float:
     """
     if not USE_EXPERT_GUIDANCE:
         return 0.0
-    if epoch <= 20:
+    if epoch <= 30:
         return 1.00
-    if epoch <= 50:
-        return 0.50
+    if epoch <= 60:
+        return 0.80
     if epoch <= 100:
-        return 0.25
-    return 0.10  # Permanent floor — expert priors never fully removed
+        return 0.70
+    return 0.60  # Permanent strong floor — preserves expert priors during late fine-tuning (Epoch 30+)
 
 
 def extract_board_context(obs) -> dict:

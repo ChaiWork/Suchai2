@@ -77,21 +77,19 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
     except Exception:
         _attack_threshold = 2  # Safe fallback if cg.api cache unavailable
     if post_act_en >= _attack_threshold and pre_act_en < _attack_threshold:
-        components["r_attack_ready"] = 0.10
+        components["r_attack_ready"] = 0.15
     elif action_type == 8 and pre_act_en >= _attack_threshold and post_act_en > pre_act_en:
-        # Active is ALREADY powered — penalize over-attaching energy to active
-        components["r_attack_ready"] = -0.10
+        # Active is ALREADY powered — harshly penalize over-attaching energy to active (-0.25)
+        components["r_attack_ready"] = -0.25
 
     pre_bench_size = pre.get("bench_size", 0)
     post_bench_size = post.get("bench_size", 0)
-    pre_total_en = pre.get("energy", 0)
-    post_total_en = post.get("energy", 0)
-    pre_bench_en = pre_total_en - pre_act_en
-    post_bench_en = post_total_en - post_act_en
+    pre_bench_en = sum(pre.get("bench_energies", [])) if "bench_energies" in pre else max(0, pre.get("energy", 0) - pre_act_en)
+    post_bench_en = sum(post.get("bench_energies", [])) if "bench_energies" in post else max(0, post.get("energy", 0) - post_act_en)
 
-    # Symmetrical bench energy preparation reward: award +0.08 whenever energy is attached to bench
-    if action_type == 8 and post_bench_en > pre_bench_en:
-        components["r_backup_ready"] = 0.08
+    # Symmetrical bench energy preparation reward: award +0.15 whenever energy on bench increases
+    if post_bench_en > pre_bench_en:
+        components["r_backup_ready"] = 0.15
 
     # 3. Early Bench Setup & Donk Guard
     turn_curr = post.get("turn", 1)

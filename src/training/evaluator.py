@@ -67,25 +67,12 @@ def rule_based_opponent_agent(opponent_name, obs):
 
 
 def get_active_deck_csv_path() -> str:
-    try:
-        from src.configs.active_deck import get_active_deck_name
-        deck_name = get_active_deck_name()
-    except Exception:
-        deck_name = os.getenv("ACTIVE_DECK", "MEWTWO").upper()
-
-    if deck_name == "GRIMMSNARL":
-        for path in ["deckgrimnai.csv", "deck_grimmsnarl.csv", "deck.csv"]:
-            if os.path.exists(path):
-                return path
-    elif deck_name == "LILLIE":
-        for path in ["deck clefairy.csv", "deck_lillie.csv", "deck.csv"]:
-            if os.path.exists(path):
-                return path
-    else:  # MEWTWO
-        for path in ["deck_mewtwo_battle_cage.csv", "deck lama.csv", "deck_mewtwo.csv", "deck.csv"]:
-            if os.path.exists(path):
-                return path
+    """Returns the path to the Mewtwo Battle Cage deck CSV file."""
+    for path in ["deck_mewtwo_battle_cage.csv", "deck.csv"]:
+        if os.path.exists(path):
+            return path
     return "deck.csv"
+
 
 
 def load_all_decks():
@@ -255,3 +242,13 @@ def run_sprt_evaluation(command_queues, result_queue, num_workers, sample_deck, 
     print(f"  -> 95% Wilson Confidence Interval: [{low_ci:.1f}%, {high_ci:.1f}%]")
     
     return decision, win_rate, wins, losses, draws, deck_stats
+
+
+def update_elo(ra: float, rb: float, score: float, k: float = 32.0):
+    """Calculates standard Elo rating update after a match outcome."""
+    ea = 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
+    eb = 1.0 - ea
+    ra_new = ra + k * (score - ea)
+    rb_new = rb + k * ((1.0 - score) - eb)
+    return ra_new, rb_new
+

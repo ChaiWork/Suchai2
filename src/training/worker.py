@@ -175,6 +175,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         "turn": obs_class.current.turn,
                         "has_attack_option": has_attack_option,
                         "has_attach_option": has_attach_option,
+                        "has_energy_in_hand": any(cid in (1, 15, 2, 3, 4, 5) for cid in ([c.id for c in state_ps.hand if c is not None] if state_ps.hand else [])),
                         "context": obs_class.select.context if (obs_class.select is not None) else None,
                         "lockout_turns": episode_lockouts[curr_player]
                     }

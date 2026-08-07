@@ -1,60 +1,39 @@
 """
-Intelligent Search Strategy Engine (card_search_engine / search_strategy.py).
-Provides matchup-aware, phase-aware, and combo-aware target prioritization for 
-all search Supporters (TR Petrel, TR Proton) and search Items (Ultra Ball, Poffin, 
-Bug Catching Set, TR Transceiver, Night Stretcher, Battle Cage, Earthen Vessel, Energy Switch).
+State-Aware Strategic Search Target Evaluator (AlphaZero Paradigm).
+
+Extracts board state features and computes dynamic, state-dependent prior bonuses [-0.10, +0.20]
+for candidate search target cards (e.g. via Ultra Ball, Poffin, Transceiver, Bug Catching Set).
+
+Card values dynamically depend on the game state (active Pokemon, energy needs, bench space,
+evolution readiness, prize situation, and opponent threat level) instead of static rankings.
 """
 from __future__ import annotations
-from typing import List, Dict, Any, Tuple, Iterable
+from typing import List, Dict, Any, Tuple
 
-# Card ID Constants
+
+# Ground Truth Card IDs for Team Rocket Mewtwo ex Deck
 BASIC_G_ENERGY_ID    = 1    # Basic {G} Energy
 TR_ENERGY_ID         = 15   # Team Rocket's Energy
-
 TAROUNTULA_ID        = 400  # Team Rocket's Tarountula
 SPIDOPS_ID           = 401  # Team Rocket's Spidops
 ARTICUNO_ID          = 414  # Team Rocket's Articuno
 MEWTWO_EX_ID         = 431  # Team Rocket's Mewtwo ex
 MIMIKYU_ID           = 434  # Team Rocket's Mimikyu
-LILLIES_CLEFAIRY_EX_ID = 272 # Lillie's Clefairy ex (Cross-deck Dragon counter)
 
 POFFIN_ID            = 1086 # Buddy-Buddy Poffin
 BUG_CATCHING_SET_ID  = 1094 # Bug Catching Set
-ENERGY_SWITCH_ID      = 1095 # Energy Switch (re-attach energy)
-SWITCH_ID            = 1097 # Switch
-EARTHEN_VESSEL_ID     = 1106 # Earthen Vessel (search basics, discard hand)
 ULTRA_BALL_ID        = 1121 # Ultra Ball
 TRANSCEIVER_ID       = 1134 # Team Rocket's Transceiver
-POKE_PAD_ID          = 1152 # Poké Pad
-MAXIMUM_BELT_ID      = 1158 # Maximum Belt (ACE SPEC Tool)
-HERO_CAPE_ID         = 1159 # Hero's Cape (ACE SPEC Tool)
-NIGHT_STRETCHER_ID   = 1159 # Night Stretcher (Recovery Item)
-BRAVE_BANGLE_ID      = 1175 # Brave Bangle
-PRISM_TOWER_ID        = 1180 # Prism Tower (Discard 2 -> Draw 1 Stadium)
 
 ARIANA_ID            = 1216 # Team Rocket's Ariana
 GIOVANNI_ID          = 1218 # Team Rocket's Giovanni
 PETREL_ID            = 1219 # Team Rocket's Petrel
 PROTON_ID            = 1220 # Team Rocket's Proton
 LILLIES_DETERM_ID    = 1227 # Lillie's Determination
+BATTLE_CAGE_ID       = 1264 # Battle Cage (Anti-Dragapult Bench Protection)
 
-TR_FACTORY_ID        = 1257 # Team Rocket's Factory
-BATTLE_CAGE_ID       = 1264 # Battle Cage (Anti-Dragapult / Bench Protection)
-
-TR_POKEMON_SET = frozenset({TAROUNTULA_ID, SPIDOPS_ID, ARTICUNO_ID, MEWTWO_EX_ID, MIMIKYU_ID, LILLIES_CLEFAIRY_EX_ID})
-BENCH_COUNTER_ARCHETYPES = ("dragapult", "froslass", "dusknoir", "dusclops", "munkidori")
-EX_META_ARCHETYPES       = ("mewtwo", "grimmsnarl", "charizard", "archaludon", "gardevoir")
-
-DISCARD_ENGINE_CARDS = frozenset({
-    PRISM_TOWER_ID, NIGHT_STRETCHER_ID, ENERGY_SWITCH_ID,
-    ULTRA_BALL_ID, EARTHEN_VESSEL_ID, POKE_PAD_ID, POFFIN_ID
-})
-
-# Discard Engine Tuning Constants
-REWARD_DISCARD_ENGINE_EARLY          = 0.20
-REWARD_DISCARD_ENGINE_MID            = 0.12
-REWARD_RECOVERY_FROM_DISCARD         = 0.18
-REWARD_ENERGY_REDEPLOY_AFTER_DISCARD = 0.16
+TR_POKEMON_IDS       = frozenset({400, 401, 414, 431, 434})
+SUPPORTER_IDS        = frozenset({1216, 1218, 1219, 1220, 1227})
 
 
 def _get_val(obj, key: str, default=None):
@@ -71,35 +50,32 @@ def _get_val(obj, key: str, default=None):
     return val if val is not None else default
 
 
-
-def _count_tr_pokemon_in_play(ctx: dict) -> int:
-    """Counts Team Rocket Pokémon currently in play (Active + Bench)."""
-    active_id = ctx.get("my_active_id", -1)
-    bench_ids = ctx.get("my_bench_ids", [])
-    count = 0
-    for cid in [active_id] + list(bench_ids):
-        if cid in TR_POKEMON_SET:
-            count += 1
-    return count
-
-
-def _is_discard_engine_card(card_id: int) -> bool:
-    """Returns True if card_id is part of the brilliant discard / recovery engine."""
-    return card_id in DISCARD_ENGINE_CARDS
-
-
 def extract_search_context(obs: dict) -> dict:
-    """Extracts state board context for search target scoring."""
+    """Extracts complete state-aware board context features for search target valuation."""
     ctx = {
         "turn": 1,
         "my_prizes": 6,
         "opp_prizes": 6,
         "my_active_id": -1,
+        "my_active_hp": 100,
+        "my_active_energy": 0,
+        "opp_active_id": -1,
+        "opp_active_hp": 100,
+        "opp_active_energy": 0,
         "my_bench_ids": [],
+        "opp_bench_ids": [],
         "my_hand_ids": [],
         "my_hand_len": 0,
         "my_bench_count": 0,
+        "opp_bench_count": 0,
         "my_discard_ids": [],
+        "tr_count": 0,
+        "has_mewtwo_in_play": False,
+        "has_mewtwo_in_hand": False,
+        "has_spidops_in_play": False,
+        "has_tarountula_in_play": False,
+        "has_supporter_in_hand": False,
+        "active_attack_ready": False,
     }
 
     current = _get_val(obs, "current")
@@ -121,12 +97,29 @@ def extract_search_context(obs: dict) -> dict:
 
         my_active_list = _get_val(my_ps, "active", [])
         if my_active_list and len(my_active_list) > 0 and my_active_list[0] is not None:
-            ctx["my_active_id"] = _get_val(my_active_list[0], "cardId", -1)
+            act_card = my_active_list[0]
+            ctx["my_active_id"] = _get_val(act_card, "cardId", -1)
+            ctx["my_active_hp"] = _get_val(act_card, "hp", 100)
+            energies = _get_val(act_card, "energyCards", [])
+            ctx["my_active_energy"] = len(energies) if isinstance(energies, (list, tuple)) else 0
+
+        opp_active_list = _get_val(opp_ps, "active", [])
+        if opp_active_list and len(opp_active_list) > 0 and opp_active_list[0] is not None:
+            act_card = opp_active_list[0]
+            ctx["opp_active_id"] = _get_val(act_card, "cardId", -1)
+            ctx["opp_active_hp"] = _get_val(act_card, "hp", 100)
+            energies = _get_val(act_card, "energyCards", [])
+            ctx["opp_active_energy"] = len(energies) if isinstance(energies, (list, tuple)) else 0
 
         my_bench = _get_val(my_ps, "bench", [])
         if isinstance(my_bench, (list, tuple)):
             ctx["my_bench_ids"] = [_get_val(b, "cardId", -1) for b in my_bench if b is not None]
             ctx["my_bench_count"] = len(ctx["my_bench_ids"])
+
+        opp_bench = _get_val(opp_ps, "bench", [])
+        if isinstance(opp_bench, (list, tuple)):
+            ctx["opp_bench_ids"] = [_get_val(b, "cardId", -1) for b in opp_bench if b is not None]
+            ctx["opp_bench_count"] = len(ctx["opp_bench_ids"])
 
         my_hand = _get_val(my_ps, "hand", [])
         if isinstance(my_hand, (list, tuple)):
@@ -137,207 +130,169 @@ def extract_search_context(obs: dict) -> dict:
         if isinstance(my_discard, (list, tuple)):
             ctx["my_discard_ids"] = [_get_val(d, "cardId", -1) for d in my_discard if d is not None]
 
+    # Derived state indicators
+    in_play = [ctx["my_active_id"]] + ctx["my_bench_ids"]
+    ctx["tr_count"] = sum(1 for cid in in_play if cid in TR_POKEMON_IDS)
+    ctx["has_mewtwo_in_play"] = (MEWTWO_EX_ID in in_play)
+    ctx["has_mewtwo_in_hand"] = (MEWTWO_EX_ID in ctx["my_hand_ids"])
+    ctx["has_spidops_in_play"] = (SPIDOPS_ID in in_play)
+    ctx["has_tarountula_in_play"] = (TAROUNTULA_ID in in_play)
+    ctx["has_supporter_in_hand"] = any(cid in SUPPORTER_IDS for cid in ctx["my_hand_ids"])
+
+    try:
+        from src.expert_system.energy_evaluator import get_required_energy
+    except ImportError:
+        from expert_system.energy_evaluator import get_required_energy
+    # Use API-driven energy cost lookup instead of hardcoded per-card values
+    req_e = get_required_energy(ctx["my_active_id"])
+    ctx["active_attack_ready"] = (ctx["my_active_energy"] >= req_e)
+
     return ctx
 
 
-def score_search_target(card_id: int, ctx: dict, search_card_id: int = -1, opponent_name: str = "") -> float:
+def get_search_features(card_id: int, ctx: dict) -> Dict[str, float]:
+    """Extracts normalized vector features for a candidate search target card."""
+    return {
+        "is_basic": 1.0 if card_id in (400, 414, 431, 434) else 0.0,
+        "is_evolution": 1.0 if card_id in (401,) else 0.0,
+        "is_supporter": 1.0 if card_id in SUPPORTER_IDS else 0.0,
+        "is_item": 1.0 if card_id in (1086, 1094, 1095, 1097, 1106, 1121, 1134, 1152, 1158, 1159, 1175) else 0.0,
+        "is_stadium": 1.0 if card_id in (1180, 1257, 1264) else 0.0,
+        "is_energy": 1.0 if card_id in (BASIC_G_ENERGY_ID, TR_ENERGY_ID) else 0.0,
+        "already_in_hand_count": float(ctx["my_hand_ids"].count(card_id)),
+        "already_in_bench_count": float(ctx["my_bench_ids"].count(card_id)),
+    }
+
+
+def evaluate_search_target_prior(card_id: int, ctx: dict) -> Tuple[float, str]:
     """
-    Computes multi-factor priority score (0.0 to 1.0) based on:
-    Score = Base(0.50) + Combo + Counter + Immediate Attack + Draw + Discard Engine + Recovery + Gust - Duplicates
+    Evaluates state-dependent strategic prior bonus [-0.10, +0.20] for a candidate search target.
+    
+    Scenarios handled dynamically:
+      1. Early Game / Missing Main Win Condition (Mewtwo ex): +0.20 when absent.
+      2. Missing Evolution Line / Setup (Tarountula / Spidops): +0.16 to +0.18 when line incomplete.
+      3. Power Saver Ability (<4 TR Pokemon in play): +0.16 for any TR Pokemon.
+      4. Active Energy Needs: +0.15 for Energy when active Mewtwo ex is building.
+      5. Lethal Window / Prize Swing: +0.20 for Giovanni gust when opponent active HP <= 160.
+      6. Low Hand Emergency: +0.18 for Ariana / Lillie when hand_len <= 3.
     """
-    base_score = 0.50
-    turn = ctx["turn"]
-    hand_ids = ctx["my_hand_ids"]
-    hand_len = ctx["my_hand_len"]
-    bench_ids = ctx["my_bench_ids"]
-    active_id = ctx["my_active_id"]
-    opp_lower = opponent_name.lower()
+    if card_id <= 0:
+        return 0.0, "Invalid card"
 
-    is_bench_counter_matchup = any(k in opp_lower for k in BENCH_COUNTER_ARCHETYPES)
-    is_ex_matchup = any(k in opp_lower for k in EX_META_ARCHETYPES)
-    early_game = turn <= 2 or ctx["my_prizes"] >= 5
-    close_game = ctx["my_prizes"] <= 2 or ctx["opp_prizes"] <= 2
-    tr_count = _count_tr_pokemon_in_play(ctx)
+    turn = ctx.get("turn", 1)
+    my_prizes = ctx.get("my_prizes", 6)
+    opp_prizes = ctx.get("opp_prizes", 6)
+    hand_len = ctx.get("my_hand_len", 0)
+    tr_count = ctx.get("tr_count", 0)
+    active_id = ctx.get("my_active_id", -1)
+    active_e = ctx.get("my_active_energy", 0)
+    opp_hp = ctx.get("opp_active_hp", 9999)
+    close_game = (my_prizes <= 2 or opp_prizes <= 2)
 
-    score_components = 0.0
+    # -------------------------------------------------------------------------
+    # A. MEWTWO EX (Main Win Condition)
+    # -------------------------------------------------------------------------
+    if card_id == MEWTWO_EX_ID:
+        if not ctx.get("has_mewtwo_in_play", False) and not ctx.get("has_mewtwo_in_hand", False):
+            return 0.20, "Search Priority: Deploy Main Attacker Mewtwo ex"
+        elif ctx.get("has_mewtwo_in_play", False) and not ctx.get("has_mewtwo_in_hand", False) and (turn <= 3 or my_prizes >= 5):
+            return 0.12, "Search Priority: Second Mewtwo ex Backup Attacker Setup"
+        return 0.05, "Search: Additional Mewtwo ex"
 
-    # 1a. PRISM TOWER (Recurring discard & draw engine)
-    if card_id == PRISM_TOWER_ID:
-        if early_game or hand_len <= 3:
-            score_components += 0.28
-        else:
-            score_components += 0.14
-        if TR_FACTORY_ID in hand_ids or TR_FACTORY_ID in bench_ids:
-            score_components += 0.06  # Prism Tower + Factory thinning loop
-
-    # 1b. STADIUM SEQUENCE (TR Factory first for early draw engine & deck thinning)
-    elif card_id == TR_FACTORY_ID:
-        if early_game or hand_len <= 3:
-            score_components += 0.30
-        else:
-            score_components += 0.12
-        if PRISM_TOWER_ID in hand_ids:
-            score_components += 0.06  # Factory + Prism Tower loop
-
-    # 1c. COUNTER COMPONENT (Battle Cage vs Bench-Sniper)
-    elif card_id == BATTLE_CAGE_ID:
-        if is_bench_counter_matchup:
-            has_factory_in_hand = TR_FACTORY_ID in hand_ids
-            has_cage_in_hand = BATTLE_CAGE_ID in hand_ids
-            if not has_factory_in_hand and not has_cage_in_hand:
-                score_components += 0.45
-            else:
-                score_components += 0.25
-        else:
-            score_components += 0.05
-            if BATTLE_CAGE_ID in hand_ids:
-                score_components -= 0.10  # Duplicate penalty for 2nd Cage if not heavy spread matchup
-
-    # 2. COMBO EVOLUTION + POWER SAVER (Spidops / Tarountula)
+    # -------------------------------------------------------------------------
+    # B. SPIDOPS LINE (Evolution & Territory Control)
+    # -------------------------------------------------------------------------
     elif card_id == SPIDOPS_ID:
-        has_tarountula = (active_id == TAROUNTULA_ID or TAROUNTULA_ID in bench_ids)
-        has_spidops_in_hand = SPIDOPS_ID in hand_ids
-        if has_tarountula and not has_spidops_in_hand:
-            bonus = 0.42
-            if tr_count <= 3:
-                bonus += 0.08  # Push toward 4 TR Pokémon
-            score_components += bonus
-        else:
-            score_components += 0.20
+        if ctx.get("has_tarountula_in_play", False) and not ctx.get("has_spidops_in_play", False):
+            return 0.18, "Search Priority: Spidops Evolution Ready Target"
+        elif not ctx.get("has_spidops_in_play", False):
+            return 0.12, "Search Priority: Spidops Line Setup Target"
+        return 0.06, "Search: Secondary Spidops"
 
-    # 3. MAIN HEAVY ATTACKER TUTOR (Mewtwo ex)
-    elif card_id == MEWTWO_EX_ID:
-        has_mewtwo_in_play = (active_id == MEWTWO_EX_ID or MEWTWO_EX_ID in bench_ids)
-        if not has_mewtwo_in_play:
-            base_bonus = 0.40
-            if tr_count == 3:
-                base_bonus += 0.10  # Extra bonus if grabbing Mewtwo ex completes 4-TR requirement
-            score_components += base_bonus
-        else:
-            score_components += 0.15
+    elif card_id == TAROUNTULA_ID:
+        if not ctx.get("has_tarountula_in_play", False) and not ctx.get("has_spidops_in_play", False):
+            return 0.16, "Search Priority: Deploy Tarountula Base Line"
+        elif ctx.get("my_bench_count", 0) <= 1:
+            return 0.14, "Search Priority: Bench Fill Tarountula Guard"
+        return 0.06, "Search: Additional Tarountula"
 
-    # 4. GUST / WIN CLOSE SUPPORTER (TR Giovanni)
+    # -------------------------------------------------------------------------
+    # C. SUPPORTERS (Giovanni, Ariana, Lillie)
+    # -------------------------------------------------------------------------
     elif card_id == GIOVANNI_ID:
-        if close_game or is_ex_matchup:
-            score_components += 0.38
-            if close_game:
-                score_components += 0.15  # Extra game-ending KO gust priority
-        else:
-            score_components += 0.22
+        if opp_hp <= 160 or close_game:
+            return 0.20, "Search Priority: Giovanni Gust Lethal Window / Prize Swing"
+        elif ctx.get("opp_bench_count", 0) > 0:
+            return 0.12, "Search: Giovanni Bench Gust Target"
+        return 0.05, "Search: Giovanni Supporter"
 
-    # 5. DRAW ENGINE SUPPORTERS (Ariana / Lillie's Determination)
-    elif card_id in (ARIANA_ID, LILLIES_DETERM_ID):
+    elif card_id == ARIANA_ID:
         if hand_len <= 3:
-            score_components += 0.36
-        else:
-            score_components += 0.18
+            return 0.18, "Search Priority: Ariana Draw Refresh (Low Hand)"
+        return 0.08, "Search: Ariana Supporter"
 
-    # 6. BASIC BENCH SETUP (Tarountula / Mimikyu)
-    elif card_id in (TAROUNTULA_ID, MIMIKYU_ID):
-        if early_game or ctx["my_bench_count"] <= 1 or tr_count < 4:
-            score_components += 0.34
-        else:
-            score_components += 0.05
+    elif card_id == LILLIES_DETERM_ID:
+        if hand_len <= 3:
+            return 0.18, "Search Priority: Lillie Emergency Draw (Low Hand)"
+        return 0.06, "Search: Lillie Supporter"
 
-    # 7. EQUIPMENT / TOOLS (Brave Bangle / Maximum Belt / Hero's Cape)
-    elif card_id in (BRAVE_BANGLE_ID, MAXIMUM_BELT_ID, HERO_CAPE_ID):
-        has_main_attacker = (active_id in (MEWTWO_EX_ID, SPIDOPS_ID) or any(b in (MEWTWO_EX_ID, SPIDOPS_ID) for b in bench_ids))
-        if card_id == MAXIMUM_BELT_ID:
-            score_components += 0.35  # High priority ACE SPEC snipe tool
-        elif has_main_attacker and is_ex_matchup:
-            score_components += 0.32
-        else:
-            score_components += 0.10
+    elif card_id in (PETREL_ID, PROTON_ID):
+        return 0.12, "Search: Tactical TR Supporter"
 
-    # 8. ENERGY ATTACHMENT / ACCELERATION
-    elif card_id in (TR_ENERGY_ID, BASIC_G_ENERGY_ID):
-        if early_game or active_id in (MEWTWO_EX_ID, SPIDOPS_ID):
-            score_components += 0.28
-        else:
-            score_components += 0.00
+    # -------------------------------------------------------------------------
+    # D. ENERGY (Basic {G} or TR Energy)
+    # -------------------------------------------------------------------------
+    elif card_id in (BASIC_G_ENERGY_ID, TR_ENERGY_ID):
+        my_hand_ids = ctx.get("my_hand_ids", [])
+        if active_id == MEWTWO_EX_ID and active_e < 3:
+            return 0.15, "Search Priority: Energy for Active Mewtwo ex (Psywave Build)"
+        elif active_id == SPIDOPS_ID and active_e < 2:
+            return 0.12, "Search Priority: Energy for Active Spidops"
+        elif not ctx.get("active_attack_ready", False) and my_hand_ids.count(card_id) == 0:
+            return 0.10, "Search: Energy for Attack Readiness"
+        return 0.02, "Search: Energy Candidate"
 
-    # 9. RECOVERY & RECYCLING (Night Stretcher / Poké Pad)
-    elif card_id == NIGHT_STRETCHER_ID:
-        discard_ids = ctx.get("my_discard_ids", [])
-        tr_in_discard = sum(1 for cid in discard_ids if cid in TR_POKEMON_SET)
-        if tr_in_discard >= 2:
-            score_components += 0.26
-        elif tr_in_discard == 1:
-            score_components += 0.14
-        else:
-            score_components += 0.06
+    # -------------------------------------------------------------------------
+    # E. UTILITY POKEMON (Articuno, Mimikyu)
+    # -------------------------------------------------------------------------
+    elif card_id == ARTICUNO_ID:
+        if turn <= 3 or ctx.get("my_bench_count", 0) <= 1:
+            return 0.12, "Search: Articuno Pivot Utility"
+        return 0.06, "Search: Articuno Utility"
 
-    elif card_id == POKE_PAD_ID:
-        if close_game or hand_len <= 3:
-            score_components += 0.30
-        else:
-            score_components += 0.10
+    elif card_id == MIMIKYU_ID:
+        if ctx.get("my_active_hp", 100) <= 40:
+            return 0.14, "Search: Mimikyu Stall Pivot Guard"
+        return 0.06, "Search: Mimikyu Stall Candidate"
 
-    # 10. BRILLIANT DISCARD ENGINE COMPONENT
-    if _is_discard_engine_card(card_id):
-        if early_game:
-            score_components += REWARD_DISCARD_ENGINE_EARLY
-        elif close_game:
-            score_components += REWARD_RECOVERY_FROM_DISCARD
-        else:
-            score_components += REWARD_DISCARD_ENGINE_MID
+    elif card_id == BATTLE_CAGE_ID:
+        # Generic state-transition threat evaluation: prevent expected bench damage/snipe
+        opp_name = ctx.get("opponent_name", "")
+        opp_act_id = ctx.get("opp_active_id", -1)
+        my_bench_cnt = ctx.get("my_bench_count", 0)
+        # Check if opponent has bench-damaging capability (e.g. Dragapult ID 121, Alakazam ID 150) or bench is populated
+        _BENCH_SNIPER_IDS = frozenset({121, 150, 414})
+        has_bench_threat = (opp_act_id in _BENCH_SNIPER_IDS) or ("Dragapult" in opp_name or "Alakazam" in opp_name) or (my_bench_cnt >= 2)
+        if has_bench_threat:
+            return 0.20, "Search Priority: Battle Cage Expected Bench Damage Protection"
+        return 0.08, "Search: Stadium Battle Cage"
 
-        if card_id == ENERGY_SWITCH_ID:
-            has_mewtwo = (active_id == MEWTWO_EX_ID or MEWTWO_EX_ID in bench_ids)
-            if has_mewtwo:
-                score_components += REWARD_ENERGY_REDEPLOY_AFTER_DISCARD
+    # -------------------------------------------------------------------------
+    # F. POWER SAVER TR POKEMON UNLOCK GUARD (<4 TR Pokemon in play)
+    # -------------------------------------------------------------------------
+    elif card_id in TR_POKEMON_IDS and tr_count < 4:
+        return 0.16, "Search Priority: TR Pokemon to Unlock Power Saver (<4 in play)"
 
-    # =========================================================================
-    # SEARCH-CARD SPECIFIC TARGET BIASES
-    # =========================================================================
-    is_petrel = (search_card_id == PETREL_ID)
-    is_proton = (search_card_id == PROTON_ID)
-    is_ultra_ball = (search_card_id == ULTRA_BALL_ID)
-    is_transceiver = (search_card_id == TRANSCEIVER_ID)
-    is_earthen_vessel = (search_card_id == EARTHEN_VESSEL_ID)
+    return 0.0, "Search: Generic Candidate"
 
-    # Petrel (Supporter search) biases toward Supporters & Stadiums
-    if is_petrel:
-        if card_id in (ARIANA_ID, LILLIES_DETERM_ID, GIOVANNI_ID, PROTON_ID, PETREL_ID):
-            score_components += 0.08
-        if card_id in (TR_FACTORY_ID, PRISM_TOWER_ID):
-            score_components += 0.06
 
-    # Proton (TR Pokémon search) biases toward TR Pokémon completing Power Saver
-    if is_proton:
-        if card_id in (TAROUNTULA_ID, SPIDOPS_ID, MEWTWO_EX_ID):
-            if tr_count < 4:
-                score_components += 0.10
-        if card_id == LILLIES_CLEFAIRY_EX_ID and any(k in opp_lower for k in ("dragon", "regidrago", "giratina", "roaring")):
-            score_components += 0.12
-
-    # Ultra Ball / Earthen Vessel / Transceiver biases
-    if is_ultra_ball or is_transceiver or is_earthen_vessel:
-        if card_id in (TAROUNTULA_ID, SPIDOPS_ID, MEWTWO_EX_ID):
-            if tr_count < 4:
-                score_components += 0.10
-        if card_id in (BASIC_G_ENERGY_ID, TR_ENERGY_ID):
-            has_spidops_or_mewtwo = (
-                active_id in (SPIDOPS_ID, MEWTWO_EX_ID) or
-                any(b in (SPIDOPS_ID, MEWTWO_EX_ID) for b in bench_ids)
-            )
-            if has_spidops_or_mewtwo:
-                score_components += 0.08
-        if card_id in (ARIANA_ID, LILLIES_DETERM_ID, GIOVANNI_ID, TR_FACTORY_ID, PRISM_TOWER_ID, BATTLE_CAGE_ID, BRAVE_BANGLE_ID, MAXIMUM_BELT_ID):
-            score_components += 0.06
-
-    # SUPPORTER DEDUPLICATION PENALTY (-0.12 if 2+ Supporters already in hand)
-    if card_id in (ARIANA_ID, LILLIES_DETERM_ID, GIOVANNI_ID, PROTON_ID, PETREL_ID):
-        supporter_count_in_hand = sum(1 for cid in hand_ids if cid in (ARIANA_ID, LILLIES_DETERM_ID, GIOVANNI_ID, PROTON_ID, PETREL_ID))
-        if supporter_count_in_hand >= 2:
-            score_components -= 0.12
-
-    # GENERAL DEDUPLICATION PENALTY (-0.15 if 2+ copies already in hand)
-    if hand_ids.count(card_id) >= 2:
-        score_components -= 0.15
-
-    final_score = base_score + score_components
-    return max(0.10, min(0.99, final_score))
+def score_search_target(card_id: int, ctx: dict, search_card_id: int = -1, opponent_name: str = "") -> float:
+    """Computes state-aware strategic prior score for candidate target card_id."""
+    if opponent_name and "opponent_name" not in ctx:
+        ctx["opponent_name"] = opponent_name
+    prior_bonus, _ = evaluate_search_target_prior(card_id, ctx)
+    # Map prior bonus [-0.10, +0.20] to logit score space
+    return prior_bonus
 
 
 def choose_best_search_target(
@@ -347,19 +302,49 @@ def choose_best_search_target(
     opponent_name: str = ""
 ) -> Tuple[int, float]:
     """
-    Evaluates candidate card IDs and returns the single highest scoring target.
-    Returns: (best_card_id: int, top_score: float)
+    Evaluates all candidate search target card IDs against current state context
+    and returns the best candidate ID and its strategic prior score.
     """
     if not candidate_card_ids:
         return -1, 0.0
 
     ctx = extract_search_context(obs)
-    scored_candidates = []
+    if opponent_name:
+        ctx["opponent_name"] = opponent_name
+        
+    best_cid = candidate_card_ids[0]
+    best_score = -1.0
+    best_reason = "Default"
 
     for cid in candidate_card_ids:
-        sc = score_search_target(cid, ctx, search_card_id, opponent_name)
-        scored_candidates.append((sc, cid))
+        score, reason = evaluate_search_target_prior(cid, ctx)
+        if score > best_score:
+            best_score = score
+            best_cid = cid
+            best_reason = reason
 
-    scored_candidates.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_cid = scored_candidates[0]
     return best_cid, best_score
+
+
+def format_search_decision_log(obs: dict, candidate_card_ids: List[int]) -> str:
+    """Formats human-readable diagnostic log for a search decision."""
+    ctx = extract_search_context(obs)
+    lines = [
+        "Search Decision:",
+        f"  Turn: {ctx.get('turn', 1)}",
+        f"  Current board: Active={ctx.get('my_active_id')} (HP {ctx.get('my_active_hp')}, Energy {ctx.get('my_active_energy')}), Bench={ctx.get('my_bench_ids')}",
+        "  Candidate cards:"
+    ]
+    best_cid = candidate_card_ids[0] if candidate_card_ids else -1
+    best_score = -1.0
+    for cid in candidate_card_ids:
+        score, reason = evaluate_search_target_prior(cid, ctx)
+        lines.append(f"    Card ID {cid:4d} | Prior: {score:+.2f} | Reason: \"{reason}\"")
+        if score > best_score:
+            best_score = score
+            best_cid = cid
+
+    lines.append(f"  Selected: Card ID {best_cid}")
+    return "\n".join(lines)
+
+

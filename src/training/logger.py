@@ -1,38 +1,217 @@
+"""
+Research-Grade Training Metrics Logger for Pokémon TCG RL Agent.
+Provides atomic, real-time CSV flushing and OS disk synchronization (os.fsync)
+so metrics can be viewed live in external tools without buffering delays.
+"""
+
+import os
+import csv
 import sys
-import time
+from typing import Dict, Any, List, Optional
 
 
 class ProgressBar:
-    """Helper class to display training/evaluation progress in terminal with time estimation."""
-    def __init__(self, count: int, text: str):
-        self.count = count
-        self.text = text.ljust(30)
-        self.start_time = time.time()
+    """Terminal progress bar utility."""
+
+    def __init__(self, total: int, prefix: str = "", length: int = 30):
+        self.total = max(1, total)
+        self.prefix = prefix
+        self.length = length
 
     def update(self, current: int, suffix: str = ""):
-        percent = min(100, 100 * current // self.count) if self.count > 0 else 100
-        elapsed = time.time() - self.start_time
-        
-        # Estimate remaining time
-        if current > 0:
-            avg_time_per_item = elapsed / current
-            est_total_time = avg_time_per_item * self.count
-            est_remaining = est_total_time - elapsed
-            
-            elapsed_min, elapsed_sec = divmod(int(elapsed), 60)
-            rem_min, rem_sec = divmod(int(max(0, est_remaining)), 60)
-            time_str = f"[{elapsed_min:02d}:{elapsed_sec:02d}<{rem_min:02d}:{rem_sec:02d}, {avg_time_per_item:.1f}s/game]"
-        else:
-            time_str = f"[00:00<--:--, --s/game]"
-            
-        # 15-char width progress bar
-        bar_width = 15
-        filled_width = int(bar_width * current // self.count) if self.count > 0 else bar_width
-        bar = "█" * filled_width + "░" * (bar_width - filled_width)
-        
-        suffix_str = f" | {suffix}" if suffix else ""
-        sys.stderr.write(f"\r{self.text} {bar} {current}/{self.count} ({percent}%) {time_str}{suffix_str}   ")
-        sys.stderr.flush()
-        if current >= self.count:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
+        percent = min(100.0, max(0.0, 100.0 * (current / float(self.total))))
+        filled_length = int(self.length * current // self.total)
+        bar = "=" * filled_length + "-" * (self.length - filled_length)
+        sys.stdout.write(f"\r{self.prefix} [{bar}] {percent:5.1f}% {suffix}")
+        sys.stdout.flush()
+        if current >= self.total:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+
+class MetricsLogger:
+
+    """
+    Manages CSV log files for reinforcement learning training:
+    - training_metrics.csv
+    - action_distribution.csv
+    - deck_matchup.csv
+    - self_play_games.csv
+    - expert_guidance.csv
+    """
+
+    METRICS_HEADER = [
+        "epoch", "win_rate", "win_rate_first", "win_rate_second", "avg_loss", "value_loss", "policy_loss", "avg_reward",
+        "r_prize_taken", "r_prize_lost", "r_kos", "r_own_kos",
+        "r_energy", "r_bench", "r_deckout", "r_terminal", "r_stall", "r_no_energy", "r_strategic",
+        "r_knockout", "r_attack_ready", "r_backup_ready", "r_bench_setup", "r_evolution_progress", "r_stadium_value",
+        "r_retreat_eff", "r_damage_eff", "r_lethal_detection", "r_supporter_eff", "r_supporter_opp_cost",
+        "r_hand_congestion", "r_deck_preservation", "r_missed_attack", "r_donk_prevention", "r_action_conv",
+        "r_search_quality", "r_search_tempo",
+        "avg_game_length", "policy_entropy", "action_diversity", "explained_variance", "mean_return", "mean_advantage", "value_prediction_mean"
+    ]
+
+    ACTION_DIST_HEADER = [
+        "epoch", "attack", "play", "attach", "evolve", "ability", "retreat", "end", "other"
+    ]
+
+    DECK_MATCHUP_HEADER = [
+        "epoch", "opponent_name", "wins", "losses", "draws", "win_rate"
+    ]
+
+    SELF_PLAY_HEADER = [
+        "epoch", "opponent_name", "result", "turns", "attack", "play", "attach", "evolve", "ability", "retreat", "end", "other"
+    ]
+
+    EXPERT_LOG_HEADER = [
+        "epoch", "opponent_name", "trigger", "action_type", "bonus", "result", "turn", "my_prizes", "opp_prizes"
+    ]
+
+    def __init__(self, run_dir: str):
+        self.run_dir = run_dir
+        os.makedirs(self.run_dir, exist_ok=True)
+
+        self.metrics_path = os.path.join(self.run_dir, "training_metrics.csv")
+        self.action_dist_path = os.path.join(self.run_dir, "action_distribution.csv")
+        self.deck_matchup_path = os.path.join(self.run_dir, "deck_matchup.csv")
+        self.self_play_path = os.path.join(self.run_dir, "self_play_games.csv")
+        self.expert_log_path = os.path.join(self.run_dir, "expert_guidance.csv")
+
+        self._init_file(self.metrics_path, self.METRICS_HEADER)
+        self._init_file(self.action_dist_path, self.ACTION_DIST_HEADER)
+        self._init_file(self.deck_matchup_path, self.DECK_MATCHUP_HEADER)
+        self._init_file(self.self_play_path, self.SELF_PLAY_HEADER)
+        self._init_file(self.expert_log_path, self.EXPERT_LOG_HEADER)
+
+    def _init_file(self, filepath: str, header: List[str]) -> None:
+        """Creates CSV file with header if it does not already exist."""
+        if not os.path.exists(filepath):
+            with open(filepath, mode="w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+
+    def _write_and_flush(self, filepath: str, row: List[Any]) -> None:
+        """Appends a single row to CSV file and immediately flushes and syncs to disk."""
+        with open(filepath, mode="a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+
+    def log_epoch_metrics(
+        self,
+        epoch: int,
+        win_rate: float,
+        wr_first: float,
+        wr_second: float,
+        avg_loss: float,
+        val_loss: float,
+        pol_loss: float,
+        avg_reward: float,
+        rc: Dict[str, float],
+        rc_div: float,
+        avg_gl: float,
+        avg_entropy: float,
+        avg_diversity: float,
+        avg_exp_var: float,
+        avg_return: float,
+        avg_advantage: float,
+        avg_val_pred: float,
+    ) -> None:
+        """Logs comprehensive epoch statistics with immediate disk synchronization."""
+        row = [
+            epoch, win_rate, wr_first, wr_second, avg_loss, val_loss, pol_loss, avg_reward,
+            rc.get("prize_taken", 0.0) / rc_div, rc.get("prize_lost", 0.0) / rc_div,
+            rc.get("kos", 0.0) / rc_div, rc.get("own_kos", 0.0) / rc_div,
+            rc.get("energy", 0.0) / rc_div, rc.get("bench", 0.0) / rc_div,
+            rc.get("deckout", 0.0) / rc_div, rc.get("terminal", 0.0) / rc_div,
+            rc.get("stall", 0.0) / rc_div, rc.get("no_energy", 0.0) / rc_div, rc.get("strategic", 0.0) / rc_div,
+            rc.get("r_knockout", 0.0) / rc_div, rc.get("r_attack_ready", 0.0) / rc_div, rc.get("r_backup_ready", 0.0) / rc_div,
+            rc.get("r_bench_setup", 0.0) / rc_div, rc.get("r_evolution_progress", 0.0) / rc_div,
+            rc.get("r_stadium_value", 0.0) / rc_div, rc.get("r_retreat_eff", 0.0) / rc_div,
+            rc.get("r_damage_eff", 0.0) / rc_div, rc.get("r_lethal_detection", 0.0) / rc_div,
+            rc.get("r_supporter_eff", 0.0) / rc_div, rc.get("r_supporter_opp_cost", 0.0) / rc_div,
+            rc.get("r_hand_congestion", 0.0) / rc_div, rc.get("r_deck_preservation", 0.0) / rc_div,
+            rc.get("r_missed_attack", 0.0) / rc_div, rc.get("r_donk_prevention", 0.0) / rc_div,
+            rc.get("r_action_conv", 0.0) / rc_div,
+            rc.get("r_search_quality", 0.0) / rc_div, rc.get("r_search_tempo", 0.0) / rc_div,
+            avg_gl, avg_entropy, avg_diversity, avg_exp_var, avg_return, avg_advantage, avg_val_pred
+        ]
+        self._write_and_flush(self.metrics_path, row)
+
+    def log_action_distribution(self, epoch: int, action_counts: Dict[str, int]) -> None:
+        """Logs action type breakdown for the epoch."""
+        row = [
+            epoch,
+            action_counts.get("attack", 0),
+            action_counts.get("play", 0),
+            action_counts.get("attach", 0),
+            action_counts.get("evolve", 0),
+            action_counts.get("ability", 0),
+            action_counts.get("retreat", 0),
+            action_counts.get("end", 0),
+            action_counts.get("other", 0),
+        ]
+        self._write_and_flush(self.action_dist_path, row)
+
+    def log_deck_matchup(self, epoch: int, deck_stats: Dict[str, Dict[str, Any]]) -> None:
+        """Logs opponent win rate matchup statistics."""
+        with open(self.deck_matchup_path, mode="a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            for name, stats in deck_stats.items():
+                writer.writerow([epoch, name, stats["wins"], stats["losses"], stats["draws"], f"{stats['win_rate']:.1f}"])
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+
+    def log_self_play_game(self, epoch: int, opp_name: str, result_label: str, turns: int, action_counts: Dict[str, int]) -> None:
+        """Logs a single completed self-play game trajectory immediately."""
+        row = [
+            epoch,
+            opp_name,
+            result_label,
+            turns,
+            action_counts.get("attack", 0),
+            action_counts.get("play", 0),
+            action_counts.get("attach", 0),
+            action_counts.get("evolve", 0),
+            action_counts.get("ability", 0),
+            action_counts.get("retreat", 0),
+            action_counts.get("end", 0),
+            action_counts.get("other", 0),
+        ]
+        self._write_and_flush(self.self_play_path, row)
+
+    def log_expert_guidance(self, epoch: int, opp_name: str, expert_log: List[Dict[str, Any]]) -> None:
+        """Logs expert guidance triggers immediately."""
+        if not expert_log:
+            return
+        with open(self.expert_log_path, mode="a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            for entry in expert_log:
+                writer.writerow([
+                    epoch,
+                    opp_name,
+                    entry.get("trigger", "NONE"),
+                    entry.get("action_type", -1),
+                    entry.get("bonus", 0.0),
+                    entry.get("result", -1),
+                    entry.get("turn", -1),
+                    entry.get("my_prizes", -1),
+                    entry.get("opp_prizes", -1),
+                ])
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass

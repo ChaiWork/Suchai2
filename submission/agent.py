@@ -49,9 +49,9 @@ except ImportError:
     )
 
 try:
-    from expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE
+    from expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE, expert_scale
 except ImportError:
-    from src.expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE
+    from src.expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE, expert_scale
 
 # Resolve cg-lib path dynamically for Kaggle vs Local environments
 try:
@@ -74,6 +74,11 @@ from cg.api import (
 )
 
 card_table = {c.cardId: c for c in all_card_data()}
+evolves_from_map: dict[str, list] = {}
+for _c in card_table.values():
+    _ef = getattr(_c, "evolvesFrom", None)
+    if _ef:
+        evolves_from_map.setdefault(_ef, []).append(_c)
 
 SEARCH_COUNT = 200  # MCTS Search count — ≥200 needed for meaningful visit differentiation
 C_PUCT = 1.25       # AlphaZero PUCT exploration constant (fixed, per DeepMind AlphaZero)
@@ -300,62 +305,73 @@ def create_node(parent: Node | None,
             v = -v
         node.value = v
 
-        # Layer 2: Soft Prior Integration (Neural Logits + Decay-scaled Expert Prior)
-        policy_biased = list(policy[:len(actions)])
-        prior_scale = max(0.05, 1.0 / math.sqrt(max(1, epoch))) if USE_EXPERT_GUIDANCE else 0.0
+        # Layer 2: Soft Prior Integration (Probability-Space Blending: NN Logits + Soft Expert Curriculum Prior)
+        n_actions = len(actions)
+        nn_logits = list(policy[:n_actions]) if n_actions > 0 else []
 
-        has_constructive = False
-        for opt in options:
-            opt_type = getattr(opt, "type", -1) if not isinstance(opt, dict) else opt.get("type", -1)
-            if opt_type in (OptionType.ATTACK, OptionType.ATTACH, OptionType.EVOLVE, OptionType.PLAY, OptionType.ABILITY):
-                has_constructive = True
-                break
+        # 1. Compute raw NN prior probabilities via Softmax over neural logits
+        if nn_logits:
+            max_nn_logit = max(nn_logits)
+            exp_nn = [math.exp(l - max_nn_logit) for l in nn_logits]
+            sum_exp_nn = sum(exp_nn)
+            nn_probs = [e / sum_exp_nn for e in exp_nn] if sum_exp_nn > 0 else [1.0 / n_actions] * n_actions
+        else:
+            nn_probs = []
 
-        for i in range(len(actions)):
-            bias = 0.0
-            has_end = False
+        curriculum_scale = expert_scale(epoch) if USE_EXPERT_GUIDANCE else 0.0
 
-            for opt_idx in actions[i]:
-                if opt_idx < len(options):
-                    opt = options[opt_idx]
-                    opt_type = getattr(opt, "type", -1) if not isinstance(opt, dict) else opt.get("type", -1)
-                    if opt_type == OptionType.END:
-                        has_end = True
+        if curriculum_scale > 0.0 and nn_probs:
+            has_constructive = False
+            for opt in options:
+                opt_type = getattr(opt, "type", -1) if not isinstance(opt, dict) else opt.get("type", -1)
+                if opt_type in (OptionType.ATTACK, OptionType.ATTACH, OptionType.EVOLVE, OptionType.PLAY, OptionType.ABILITY):
+                    has_constructive = True
+                    break
 
-                    # Soft Expert System Prior Evaluation (if guidance enabled)
-                    if USE_EXPERT_GUIDANCE and prior_scale > 0.05:
+            expert_scores = [0.0] * n_actions
+            for i in range(n_actions):
+                bias = 0.0
+                has_end = False
+
+                for opt_idx in actions[i]:
+                    if opt_idx < len(options):
+                        opt = options[opt_idx]
+                        opt_type = getattr(opt, "type", -1) if not isinstance(opt, dict) else opt.get("type", -1)
+                        if opt_type == OptionType.END:
+                            has_end = True
+
                         try:
                             exp_bonus, _ = get_expert_bonus(obs_obj, opt, opponent_name=archetype, epoch=epoch)
-                            bias += exp_bonus * 3.0  # Scaled smoothly to Neural Logit range
+                            if exp_bonus <= -0.20:
+                                bias -= 1.0  # Soft prior guidance (non-prohibitive, preserves AlphaZero exploration)
+                            else:
+                                bias += exp_bonus * 1.0
                         except Exception:
                             pass
 
-            # Structural Turn-Pass Guard (Penalize passing turn if constructive actions exist)
-            if has_end and has_constructive:
-                bias -= 3.0
+                if has_end and has_constructive:
+                    bias -= 1.0
 
-            policy_biased[i] += bias * prior_scale
+                expert_scores[i] = bias
 
-        # Numerically Stable Softmax over Policy Logits -> Child Prior Probabilities P(s, a)
-        n_actions = len(actions)
-        max_logit = max(policy_biased) if policy_biased else 0.0
-        prob_sum = 0.0
+            max_exp_score = max(expert_scores) if expert_scores else 0.0
+            exp_e = [math.exp(s - max_exp_score) for s in expert_scores]
+            sum_exp_e = sum(exp_e)
+            expert_probs = [e / sum_exp_e for e in exp_e] if sum_exp_e > 0 else [1.0 / n_actions] * n_actions
+
+            # Soft Probability Blend (Max 15% expert prior weight, 85% neural network)
+            alpha_blend = 0.15 * curriculum_scale
+            final_priors = [(1.0 - alpha_blend) * p_nn + alpha_blend * p_exp for p_nn, p_exp in zip(nn_probs, expert_probs)]
+        else:
+            final_priors = nn_probs
 
         for i in range(n_actions):
-            p = math.exp(policy_biased[i] - max_logit)
             first_opt = options[actions[i][0]] if (options and actions[i] and actions[i][0] < len(options)) else None
-            node.children.append(Child(actions[i], p, select_option=first_opt))
-            prob_sum += p
+            node.children.append(Child(actions[i], final_priors[i] if i < len(final_priors) else 1.0 / n_actions, select_option=first_opt))
 
-        target_policy_probs = []
-        if prob_sum > 0.0:
-            for c in node.children:
-                c.prob /= prob_sum
-                target_policy_probs.append(c.prob)
-        else:
-            target_policy_probs = [1.0 / n_actions] * n_actions if n_actions > 0 else [1.0]
-
+        target_policy_probs = [c.prob for c in node.children]
         sample = LearnSample(value, target_policy_probs, sv_enc, sv_dec)
+
 
 
     return (node, sample)
@@ -447,6 +463,236 @@ def random_agent(obs: dict) -> list[int]:
 
 
 
+def get_opponent_revealed_card_ids(obs, opponent_index: int) -> list[int]:
+    """Scans visible zones (active, bench, discard) to find cards played by the opponent."""
+    revealed = []
+    obs_obj, state, _, _ = _extract_obs_info(obs)
+    if state is None or not hasattr(state, "players"):
+        return revealed
+    ps = state.players[opponent_index]
+    
+    # Active Pokémon + attached cards
+    active = getattr(ps, "active", []) if not isinstance(ps, dict) else ps.get("active", [])
+    for poke in list(active):
+        if poke is not None:
+            pid = getattr(poke, 'id', None) if not isinstance(poke, dict) else poke.get('id')
+            if pid:
+                revealed.append(pid)
+            tools = getattr(poke, 'tools', []) if not isinstance(poke, dict) else poke.get('tools', [])
+            for t in list(tools):
+                if t:
+                    tid = getattr(t, 'id', None) if not isinstance(t, dict) else t.get('id')
+                    if tid:
+                        revealed.append(tid)
+            energies = getattr(poke, 'energyCards', []) if not isinstance(poke, dict) else poke.get('energyCards', [])
+            for e in list(energies):
+                if e:
+                    eid = getattr(e, 'id', None) if not isinstance(e, dict) else e.get('id')
+                    if eid:
+                        revealed.append(eid)
+                
+    # Bench Pokémon + attached cards
+    bench = getattr(ps, "bench", []) if not isinstance(ps, dict) else ps.get("bench", [])
+    for poke in list(bench):
+        if poke is not None:
+            pid = getattr(poke, 'id', None) if not isinstance(poke, dict) else poke.get('id')
+            if pid:
+                revealed.append(pid)
+            tools = getattr(poke, 'tools', []) if not isinstance(poke, dict) else poke.get('tools', [])
+            for t in list(tools):
+                if t:
+                    tid = getattr(t, 'id', None) if not isinstance(t, dict) else t.get('id')
+                    if tid:
+                        revealed.append(tid)
+            energies = getattr(poke, 'energyCards', []) if not isinstance(poke, dict) else poke.get('energyCards', [])
+            for e in list(energies):
+                if e:
+                    eid = getattr(e, 'id', None) if not isinstance(e, dict) else e.get('id')
+                    if eid:
+                        revealed.append(eid)
+                
+    # Discard pile
+    discard = getattr(ps, "discard", []) if not isinstance(ps, dict) else ps.get("discard", [])
+    for card in list(discard):
+        if card is not None:
+            cid = getattr(card, 'id', None) if not isinstance(card, dict) else card.get('id')
+            if cid:
+                revealed.append(cid)
+            
+    return revealed
+
+
+def create_dynamic_opponent_deck(revealed_ids: list[int]) -> list[int]:
+    """Generates a realistic 60-card deck template using revealed cards & energy/evolution line inference."""
+    deck = []
+    seen_counts = Counter(revealed_ids)
+    for cid, count in seen_counts.items():
+        deck.extend([cid] * min(4, max(count, 3)))
+        
+    revealed_mons = [card_table[cid] for cid in revealed_ids if cid in card_table and card_table[cid].cardType == CardType.POKEMON]
+    for m in revealed_mons:
+        evos = evolves_from_map.get(m.name, [])
+        for c in evos:
+            if c.cardId not in deck:
+                deck.extend([c.cardId] * 2)
+
+    trainers = [1121, 1121, 1121, 1121, 1123, 1123, 1227, 1227, 1227, 1227, 1097, 1097, 1086, 1086, 1152, 1152, 1129, 1159]
+    for t_id in trainers:
+        if len(deck) >= 48:
+            break
+        deck.append(t_id)
+
+    energy_pool = [2, 5, 1, 3]
+    idx = 0
+    while len(deck) < 60:
+        deck.append(energy_pool[idx % len(energy_pool)])
+        idx += 1
+
+    return deck[:60]
+
+
+SIGNATURE_FINGERPRINTS = {
+    379: "Rulebasedmodel_Garchomp_ex",
+    380: "Rulebasedmodel_Garchomp_ex",
+    381: "Rulebasedmodel_Garchomp_ex",
+    341: "Rulebasedmodel_Garchomp_ex",
+    1173: "Rulebasedmodel_Garchomp_ex",
+    357: "Rulebasedmodel_HoOh_HeartGold",
+    46:  "Rulebasedmodel_HoOh_HeartGold",
+    1215: "Rulebasedmodel_HoOh_HeartGold",
+    1031: "Rulebasedmodel_Starmie_ex_2",
+    721: "Rulebasedmodel_Starmie_ex_2",
+    1145: "Rulebasedmodel_Starmie_ex_2",
+    641: "Rulebasedmodel_Metagross_Grass",
+    639: "Rulebasedmodel_Metagross_Grass",
+    640: "Rulebasedmodel_Metagross_Grass",
+    119: "Rulebasedmodel_Dragapult",
+    120: "Rulebasedmodel_Dragapult",
+    121: "Rulebasedmodel_Dragapult ex",
+    96:  "Rulebasedmodel_Hydrapple_Ogerpon",
+    150: "Rulebasedmodel_Hydrapple_Ogerpon",
+    117: "Rulebasedmodel_Garchomp_ex_2",
+    891: "Rulebasedmodel_Honchkrow",
+    463: "Rulebasedmodel_Honchkrow",
+    473: "Rulebasedmodel_Honchkrow",
+    352: "Rulebasedmodel_Typhlosion",
+    354: "Rulebasedmodel_Typhlosion",
+    65:  "Rulebasedmodel_Lopunny",
+    66:  "Rulebasedmodel_Lopunny",
+    646: "Rulebasedmodel_Grimmsnarl_ex",
+    648: "Rulebasedmodel_Grimmsnarl_ex",
+    265: "Rulebasedmodel_Iono",
+    271: "Rulebasedmodel_Iono",
+}
+
+
+def sample_opponent_belief_deck(revealed_ids: list[int], opponent_decks: dict) -> list[int]:
+    """Computes Bayesian belief probabilities over known archetypes + dynamic template, sampling a belief deck for MCTS."""
+    if not revealed_ids:
+        sample_key = random.choice(list(opponent_decks.keys()))
+        return opponent_decks[sample_key]
+
+    for cid in revealed_ids:
+        if cid in SIGNATURE_FINGERPRINTS:
+            matched_archetype = SIGNATURE_FINGERPRINTS[cid]
+            if matched_archetype in opponent_decks:
+                return opponent_decks[matched_archetype]
+
+    scores = {}
+    r_counts = Counter(revealed_ids)
+    r_len = max(1, len(revealed_ids))
+
+    for name, deck in opponent_decks.items():
+        d_counts = Counter(deck)
+        matches = sum(min(cnt, d_counts.get(cid, 0)) for cid, cnt in r_counts.items())
+        scores[name] = matches / r_len
+
+    max_score = max(scores.values()) if scores else 0.0
+    dynamic_score = max(0.0, 1.0 - max_score * 1.5)
+    
+    temp = 4.0
+    exp_scores = {k: math.exp(v * temp) for k, v in scores.items()}
+    exp_scores["__DYNAMIC__"] = math.exp(dynamic_score * temp)
+    
+    total_prob = sum(exp_scores.values())
+    keys = list(exp_scores.keys())
+    weights = [exp_scores[k] / total_prob for k in keys]
+    
+    chosen_key = random.choices(keys, weights=weights, k=1)[0]
+    
+    if chosen_key == "__DYNAMIC__":
+        return create_dynamic_opponent_deck(revealed_ids)
+    else:
+        return opponent_decks[chosen_key]
+
+
+def get_own_visible_card_ids(obs, your_index: int) -> list[int]:
+    """Scans all visible own zones (active, bench, discard, hand) to find card IDs."""
+    visible = []
+    obs_obj, state, _, _ = _extract_obs_info(obs)
+    if state is None or not hasattr(state, "players"):
+        return visible
+    ps = state.players[your_index]
+    
+    # Hand
+    hand = getattr(ps, "hand", []) if not isinstance(ps, dict) else ps.get("hand", [])
+    for card in list(hand):
+        if card is not None:
+            cid = getattr(card, 'id', None) if not isinstance(card, dict) else card.get('id')
+            if cid:
+                visible.append(cid)
+            
+    # Active Pokémon + attached cards
+    active = getattr(ps, "active", []) if not isinstance(ps, dict) else ps.get("active", [])
+    for poke in list(active):
+        if poke is not None:
+            pid = getattr(poke, 'id', None) if not isinstance(poke, dict) else poke.get('id')
+            if pid:
+                visible.append(pid)
+            tools = getattr(poke, 'tools', []) if not isinstance(poke, dict) else poke.get('tools', [])
+            for t in list(tools):
+                if t:
+                    tid = getattr(t, 'id', None) if not isinstance(t, dict) else t.get('id')
+                    if tid:
+                        visible.append(tid)
+            energies = getattr(poke, 'energyCards', []) if not isinstance(poke, dict) else poke.get('energyCards', [])
+            for e in list(energies):
+                if e:
+                    eid = getattr(e, 'id', None) if not isinstance(e, dict) else e.get('id')
+                    if eid:
+                        visible.append(eid)
+                
+    # Bench Pokémon + attached cards
+    bench = getattr(ps, "bench", []) if not isinstance(ps, dict) else ps.get("bench", [])
+    for poke in list(bench):
+        if poke is not None:
+            pid = getattr(poke, 'id', None) if not isinstance(poke, dict) else poke.get('id')
+            if pid:
+                visible.append(pid)
+            tools = getattr(poke, 'tools', []) if not isinstance(poke, dict) else poke.get('tools', [])
+            for t in list(tools):
+                if t:
+                    tid = getattr(t, 'id', None) if not isinstance(t, dict) else t.get('id')
+                    if tid:
+                        visible.append(tid)
+            energies = getattr(poke, 'energyCards', []) if not isinstance(poke, dict) else poke.get('energyCards', [])
+            for e in list(energies):
+                if e:
+                    eid = getattr(e, 'id', None) if not isinstance(e, dict) else e.get('id')
+                    if eid:
+                        visible.append(eid)
+                
+    # Discard pile
+    discard = getattr(ps, "discard", []) if not isinstance(ps, dict) else ps.get("discard", [])
+    for card in list(discard):
+        if card is not None:
+            cid = getattr(card, 'id', None) if not isinstance(card, dict) else card.get('id')
+            if cid:
+                revealed.append(cid)
+            
+    return visible
+
+
 def mcts_agent(obs: dict,
                your_deck: list[int],
                client: GPUInferenceClient | None = None,
@@ -464,10 +710,91 @@ def mcts_agent(obs: dict,
     if force_action is not None:
         return force_action, None
 
-    search_state = to_observation_class(obs)
-    obs_obj, state, result, your_idx = _extract_obs_info(search_state)
+    obs_dataclass = to_observation_class(obs)
+    obs_obj, state, result, your_idx = _extract_obs_info(obs_dataclass)
     if result >= 0:
         return [0], None
+
+    select_obj = getattr(obs_dataclass, "select", None)
+    opts = getattr(select_obj, "option", []) if select_obj else []
+    if len(opts) == 0:
+        return [0], None
+    if len(opts) == 1:
+        try:
+            sv_enc = get_encoder_input(obs_obj, your_deck)
+            sv_dec = get_decoder_input(obs_obj, [[0]])
+            single_sample = LearnSample(0.0, [1.0], sv_enc, sv_dec)
+            single_sample.pred_val = 0.0
+            return [0], single_sample
+        except Exception:
+            return [0], None
+
+    search_state = None
+    if getattr(obs_dataclass, "search_begin_input", None) is not None:
+        try:
+            opp_idx = 1 - your_idx
+            revealed_ids = get_opponent_revealed_card_ids(obs_dataclass, opp_idx)
+            matched_deck = sample_opponent_belief_deck(revealed_ids, OPPONENT_DECKS)
+
+            remaining_counter = Counter(matched_deck)
+            for cid in revealed_ids:
+                if remaining_counter.get(cid, 0) > 0:
+                    remaining_counter[cid] -= 1
+            remaining_cards = []
+            for cid, cnt in remaining_counter.items():
+                remaining_cards.extend([cid] * cnt)
+            random.shuffle(remaining_cards)
+
+            opp_player = state.players[opp_idx] if state and hasattr(state, "players") else None
+            deck_count = getattr(opp_player, "deckCount", 0) if opp_player else 0
+            prize_count = len(getattr(opp_player, "prize", [])) if opp_player else 0
+            hand_count = getattr(opp_player, "handCount", 0) if opp_player else 0
+
+            total_needed = deck_count + prize_count + hand_count
+            if len(remaining_cards) < total_needed:
+                remaining_cards.extend([3] * (total_needed - len(remaining_cards)))
+
+            opp_deck_sampled = remaining_cards[:deck_count]
+            opp_prize_sampled = remaining_cards[deck_count:deck_count + prize_count]
+            opp_hand_sampled = remaining_cards[deck_count + prize_count:deck_count + prize_count + hand_count]
+
+            own_counter = Counter(your_deck)
+            own_visible = get_own_visible_card_ids(obs_dataclass, your_idx)
+            for cid in own_visible:
+                if own_counter.get(cid, 0) > 0:
+                    own_counter[cid] -= 1
+            own_remaining = []
+            for cid, cnt in own_counter.items():
+                own_remaining.extend([cid] * cnt)
+            random.shuffle(own_remaining)
+
+            my_player = state.players[your_idx] if state and hasattr(state, "players") else None
+            own_prize_count = len(getattr(my_player, "prize", [])) if my_player else 0
+            own_deck_count = getattr(my_player, "deckCount", 0) if my_player else 0
+
+            total_own_needed = own_prize_count + own_deck_count
+            if len(own_remaining) < total_own_needed:
+                own_remaining.extend([3] * (total_own_needed - len(own_remaining)))
+
+            your_prize_sampled = own_remaining[:own_prize_count]
+            your_deck_sampled = own_remaining[own_prize_count:own_prize_count + own_deck_count]
+            active = getattr(opp_player, "active", []) if opp_player else []
+            opp_active_sampled = [1072] if len(active) > 0 and active[0] is None else []
+
+            search_state = search_begin(
+                obs_dataclass,
+                your_deck=your_deck_sampled,
+                your_prize=your_prize_sampled,
+                opponent_deck=opp_deck_sampled,
+                opponent_prize=opp_prize_sampled,
+                opponent_hand=opp_hand_sampled,
+                opponent_active=opp_active_sampled
+            )
+        except Exception:
+            search_state = obs_dataclass
+
+    if search_state is None:
+        search_state = obs_dataclass
 
     root, sample = create_node(None, search_state, your_idx, your_deck, client, epoch=epoch)
     if not root.children:
@@ -585,6 +912,18 @@ model_global = None
 def agent(obs, configuration=None) -> list[int]:
     """Kaggle Competition Agent Entry Point."""
     global model_global
+
+    your_deck = _load_my_deck()
+
+    # Step 0: Initial deck registration step in Kaggle cabt
+    # When obs["select"] is None, Kaggle expects the 60 card IDs list
+    if isinstance(obs, dict):
+        if obs.get("select") is None:
+            return your_deck
+    else:
+        if getattr(obs, "select", None) is None:
+            return your_deck
+
     if model_global is None:
         try:
             model_global = MyModel(
@@ -630,3 +969,4 @@ def agent(obs, configuration=None) -> list[int]:
         return selected
     except Exception:
         return [0]
+

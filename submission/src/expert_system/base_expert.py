@@ -6,6 +6,46 @@ from cg.api import CardType, OptionType, SelectContext
 USE_EXPERT_GUIDANCE = True
 EXPERT_WEIGHT = 0.10
 
+# Expert influence schedule — stepped plateaus rather than linear-to-zero decay.
+# AlphaZero principle: expert priors are never fully removed; the NN learns ON TOP of them.
+# A permanent 10% floor means late-training priors still guide MCTS away from rule violations.
+#
+# Epoch   1-20  → 1.00  (full curriculum: expert leads, NN follows)
+# Epoch  21-50  → 0.50  (mid training:  expert and NN contribute equally)
+# Epoch  51-100 → 0.25  (late training: NN dominates, expert guards boundaries)
+# Epoch  100+   → 0.10  (floor:         permanent strategic prior, no complete removal)
+# Legacy compatibility constant
+EXPERT_DECAY_EPOCHS = 100
+
+def expert_scale(epoch: int) -> float:
+    """
+    Returns a stepped-plateau multiplier controlling expert system influence.
+
+    Design: AlphaZero systems retain expert priors permanently — the NN learns
+    better strategies on top of the prior, not instead of it. A hard floor of 0.10
+    ensures rule-safety guards (Turn 1 supporter block, Power Saver gate) remain
+    active even at epoch 500+.
+
+    Used as a universal gate for:
+    - Expert logit biases in MCTS node priors (agent.py)
+    - Reward shaping constants in mewtwo_reward.py
+
+    Schedule:
+      Epoch   1-20  → 1.00
+      Epoch  21-50  → 0.50
+      Epoch  51-100 → 0.25
+      Epoch  100+   → 0.10 (permanent floor)
+    """
+    if not USE_EXPERT_GUIDANCE:
+        return 0.0
+    if epoch <= 20:
+        return 1.00
+    if epoch <= 50:
+        return 0.50
+    if epoch <= 100:
+        return 0.25
+    return 0.10  # Permanent floor — expert priors never fully removed
+
 
 def extract_board_context(obs) -> dict:
     """
@@ -49,11 +89,13 @@ def extract_board_context(obs) -> dict:
                 if my_active_list and my_active_list[0] is not None:
                     a = my_active_list[0]
                     if isinstance(a, dict):
-                        ctx["my_active_id"] = a.get("cardId", a.get("id", -1))
+                        ctx["my_active_id"]     = a.get("cardId", a.get("id", -1))
                         ctx["my_active_energy"] = len(a.get("energyCards", []))
+                        ctx["my_active_hp"]     = a.get("hp", 100)
                     else:
-                        ctx["my_active_id"] = getattr(a, "cardId", getattr(a, "id", -1))
+                        ctx["my_active_id"]     = getattr(a, "cardId", getattr(a, "id", -1))
                         ctx["my_active_energy"] = len(getattr(a, "energyCards", []))
+                        ctx["my_active_hp"]     = getattr(a, "hp", 100)
 
                 opp_active_list = getattr(opp_ps, "active", []) if not isinstance(opp_ps, dict) else opp_ps.get("active", [])
                 if opp_active_list and opp_active_list[0] is not None:

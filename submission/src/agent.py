@@ -49,9 +49,9 @@ except ImportError:
     )
 
 try:
-    from expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE
+    from expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE, expert_scale
 except ImportError:
-    from src.expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE
+    from src.expert_knowledge import get_expert_bonus, EXPERT_WEIGHT, USE_EXPERT_GUIDANCE, expert_scale
 
 # Resolve cg-lib path dynamically for Kaggle vs Local environments
 try:
@@ -74,6 +74,11 @@ from cg.api import (
 )
 
 card_table = {c.cardId: c for c in all_card_data()}
+evolves_from_map: dict[str, list] = {}
+for _c in card_table.values():
+    _ef = getattr(_c, "evolvesFrom", None)
+    if _ef:
+        evolves_from_map.setdefault(_ef, []).append(_c)
 
 SEARCH_COUNT = 200  # MCTS Search count — ≥200 needed for meaningful visit differentiation
 C_PUCT = 1.25       # AlphaZero PUCT exploration constant (fixed, per DeepMind AlphaZero)
@@ -300,62 +305,73 @@ def create_node(parent: Node | None,
             v = -v
         node.value = v
 
-        # Layer 2: Soft Prior Integration (Neural Logits + Decay-scaled Expert Prior)
-        policy_biased = list(policy[:len(actions)])
-        prior_scale = max(0.05, 1.0 / math.sqrt(max(1, epoch))) if USE_EXPERT_GUIDANCE else 0.0
+        # Layer 2: Soft Prior Integration (Probability-Space Blending: NN Logits + Soft Expert Curriculum Prior)
+        n_actions = len(actions)
+        nn_logits = list(policy[:n_actions]) if n_actions > 0 else []
 
-        has_constructive = False
-        for opt in options:
-            opt_type = getattr(opt, "type", -1) if not isinstance(opt, dict) else opt.get("type", -1)
-            if opt_type in (OptionType.ATTACK, OptionType.ATTACH, OptionType.EVOLVE, OptionType.PLAY, OptionType.ABILITY):
-                has_constructive = True
-                break
+        # 1. Compute raw NN prior probabilities via Softmax over neural logits
+        if nn_logits:
+            max_nn_logit = max(nn_logits)
+            exp_nn = [math.exp(l - max_nn_logit) for l in nn_logits]
+            sum_exp_nn = sum(exp_nn)
+            nn_probs = [e / sum_exp_nn for e in exp_nn] if sum_exp_nn > 0 else [1.0 / n_actions] * n_actions
+        else:
+            nn_probs = []
 
-        for i in range(len(actions)):
-            bias = 0.0
-            has_end = False
+        curriculum_scale = expert_scale(epoch) if USE_EXPERT_GUIDANCE else 0.0
 
-            for opt_idx in actions[i]:
-                if opt_idx < len(options):
-                    opt = options[opt_idx]
-                    opt_type = getattr(opt, "type", -1) if not isinstance(opt, dict) else opt.get("type", -1)
-                    if opt_type == OptionType.END:
-                        has_end = True
+        if curriculum_scale > 0.0 and nn_probs:
+            has_constructive = False
+            for opt in options:
+                opt_type = getattr(opt, "type", -1) if not isinstance(opt, dict) else opt.get("type", -1)
+                if opt_type in (OptionType.ATTACK, OptionType.ATTACH, OptionType.EVOLVE, OptionType.PLAY, OptionType.ABILITY):
+                    has_constructive = True
+                    break
 
-                    # Soft Expert System Prior Evaluation (if guidance enabled)
-                    if USE_EXPERT_GUIDANCE and prior_scale > 0.05:
+            expert_scores = [0.0] * n_actions
+            for i in range(n_actions):
+                bias = 0.0
+                has_end = False
+
+                for opt_idx in actions[i]:
+                    if opt_idx < len(options):
+                        opt = options[opt_idx]
+                        opt_type = getattr(opt, "type", -1) if not isinstance(opt, dict) else opt.get("type", -1)
+                        if opt_type == OptionType.END:
+                            has_end = True
+
                         try:
                             exp_bonus, _ = get_expert_bonus(obs_obj, opt, opponent_name=archetype, epoch=epoch)
-                            bias += exp_bonus * 3.0  # Scaled smoothly to Neural Logit range
+                            if exp_bonus <= -0.20:
+                                bias -= 1.0  # Soft prior guidance (non-prohibitive, preserves AlphaZero exploration)
+                            else:
+                                bias += exp_bonus * 1.0
                         except Exception:
                             pass
 
-            # Structural Turn-Pass Guard (Penalize passing turn if constructive actions exist)
-            if has_end and has_constructive:
-                bias -= 3.0
+                if has_end and has_constructive:
+                    bias -= 1.0
 
-            policy_biased[i] += bias * prior_scale
+                expert_scores[i] = bias
 
-        # Numerically Stable Softmax over Policy Logits -> Child Prior Probabilities P(s, a)
-        n_actions = len(actions)
-        max_logit = max(policy_biased) if policy_biased else 0.0
-        prob_sum = 0.0
+            max_exp_score = max(expert_scores) if expert_scores else 0.0
+            exp_e = [math.exp(s - max_exp_score) for s in expert_scores]
+            sum_exp_e = sum(exp_e)
+            expert_probs = [e / sum_exp_e for e in exp_e] if sum_exp_e > 0 else [1.0 / n_actions] * n_actions
+
+            # Soft Probability Blend (Max 15% expert prior weight, 85% neural network)
+            alpha_blend = 0.15 * curriculum_scale
+            final_priors = [(1.0 - alpha_blend) * p_nn + alpha_blend * p_exp for p_nn, p_exp in zip(nn_probs, expert_probs)]
+        else:
+            final_priors = nn_probs
 
         for i in range(n_actions):
-            p = math.exp(policy_biased[i] - max_logit)
             first_opt = options[actions[i][0]] if (options and actions[i] and actions[i][0] < len(options)) else None
-            node.children.append(Child(actions[i], p, select_option=first_opt))
-            prob_sum += p
+            node.children.append(Child(actions[i], final_priors[i] if i < len(final_priors) else 1.0 / n_actions, select_option=first_opt))
 
-        target_policy_probs = []
-        if prob_sum > 0.0:
-            for c in node.children:
-                c.prob /= prob_sum
-                target_policy_probs.append(c.prob)
-        else:
-            target_policy_probs = [1.0 / n_actions] * n_actions if n_actions > 0 else [1.0]
-
+        target_policy_probs = [c.prob for c in node.children]
         sample = LearnSample(value, target_policy_probs, sv_enc, sv_dec)
+
 
 
     return (node, sample)
@@ -509,16 +525,15 @@ def get_opponent_revealed_card_ids(obs, opponent_index: int) -> list[int]:
 def create_dynamic_opponent_deck(revealed_ids: list[int]) -> list[int]:
     """Generates a realistic 60-card deck template using revealed cards & energy/evolution line inference."""
     deck = []
-    card_db = {c.cardId: c for c in all_card_data()}
-    
     seen_counts = Counter(revealed_ids)
     for cid, count in seen_counts.items():
         deck.extend([cid] * min(4, max(count, 3)))
         
-    revealed_mons = [card_db[cid] for cid in revealed_ids if cid in card_db and card_db[cid].cardType == CardType.POKEMON]
+    revealed_mons = [card_table[cid] for cid in revealed_ids if cid in card_table and card_table[cid].cardType == CardType.POKEMON]
     for m in revealed_mons:
-        for c in card_db.values():
-            if getattr(c, "evolvesFrom", None) == m.name and c.cardId not in deck:
+        evos = evolves_from_map.get(m.name, [])
+        for c in evos:
+            if c.cardId not in deck:
                 deck.extend([c.cardId] * 2)
 
     trainers = [1121, 1121, 1121, 1121, 1123, 1123, 1227, 1227, 1227, 1227, 1097, 1097, 1086, 1086, 1152, 1152, 1129, 1159]
@@ -673,7 +688,7 @@ def get_own_visible_card_ids(obs, your_index: int) -> list[int]:
         if card is not None:
             cid = getattr(card, 'id', None) if not isinstance(card, dict) else card.get('id')
             if cid:
-                visible.append(cid)
+                revealed.append(cid)
             
     return visible
 
@@ -699,6 +714,20 @@ def mcts_agent(obs: dict,
     obs_obj, state, result, your_idx = _extract_obs_info(obs_dataclass)
     if result >= 0:
         return [0], None
+
+    select_obj = getattr(obs_dataclass, "select", None)
+    opts = getattr(select_obj, "option", []) if select_obj else []
+    if len(opts) == 0:
+        return [0], None
+    if len(opts) == 1:
+        try:
+            sv_enc = get_encoder_input(obs_obj, your_deck)
+            sv_dec = get_decoder_input(obs_obj, [[0]])
+            single_sample = LearnSample(0.0, [1.0], sv_enc, sv_dec)
+            single_sample.pred_val = 0.0
+            return [0], single_sample
+        except Exception:
+            return [0], None
 
     search_state = None
     if getattr(obs_dataclass, "search_begin_input", None) is not None:
@@ -933,7 +962,7 @@ def agent(obs, configuration=None) -> list[int]:
     elif remaining_time < 300.0:
         search_count = 20 if IS_KAGGLE else 50
     else:
-        search_count = 35 if IS_KAGGLE else 150
+        search_count = 50 if IS_KAGGLE else 200
 
     try:
         selected, _ = mcts_agent(obs, your_deck, client=model_global, search_count=search_count, temperature=0.0)

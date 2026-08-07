@@ -25,7 +25,7 @@ from training.card_database import (
 )
 from training.evaluator import rule_based_opponent_agent
 from training.gae import compute_gae_advantages
-from training.rewards import calculate_strategic_reward
+from training.rewards import calculate_strategic_reward, calculate_strategic_reward_components
 
 
 def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_str):
@@ -70,13 +70,18 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 except Exception as e:
                     opp_model = None
             
+            went_second = (random.random() < 0.5)
+            d0 = opponent_deck if went_second else sample_deck
+            d1 = sample_deck if went_second else opponent_deck
+            my_player_idx = 1 if went_second else 0
+
             try:
-                obs, start_data = battle_start(sample_deck, opponent_deck)
+                obs, start_data = battle_start(d0, d1)
                 if start_data.errorPlayer >= 0:
-                    result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {})))
+                    result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {}, [], went_second, my_player_idx)))
                     continue
             except Exception as e:
-                result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {})))
+                result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {}, [], went_second, my_player_idx)))
                 continue
 
             try:
@@ -100,7 +105,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         break
     
                     curr_player = obs["current"]["yourIndex"]
-                    curr_deck = sample_deck if curr_player == 0 else opponent_deck
+                    curr_deck = sample_deck if curr_player == my_player_idx else opponent_deck
                     
                     obs_class = to_observation_class(obs)
                     state_ps = obs_class.current.players[curr_player]
@@ -174,7 +179,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         "lockout_turns": episode_lockouts[curr_player]
                     }
     
-                    if curr_player == 0:
+                    if curr_player == my_player_idx:
                         turn = obs_class.current.turn if (obs_class.current is not None) else 1
                         warmup_threshold = max(0, 5 - (current_epoch // 5))
                         
@@ -223,6 +228,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             played_card_id = -1
                             attached_card_id = -1
                             attached_target_id = -1
+                            target_energy = 0
                             evolved_card_id = -1
                             attack_id = -1
                             if selected and len(selected) > 0:
@@ -242,14 +248,16 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                         card_idx = opt.get("index", -1)
                                         if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
                                             attached_card_id = hand[card_idx].id
-                                        target_area = opt.get("inPlayArea", -1)
-                                        target_idx = opt.get("inPlayIndex", -1)
-                                        if target_area == 4: # ACTIVE
+                                        target_area = opt.get("inPlayArea", opt.get("area", opt.get("targetArea", -1)))
+                                        target_idx = opt.get("inPlayIndex", opt.get("index", opt.get("targetIndex", -1)))
+                                        if target_area == 4 or target_area == "active": # ACTIVE
                                             if len(state_ps.active) > 0 and state_ps.active[0] is not None:
                                                 attached_target_id = state_ps.active[0].id
-                                        elif target_area == 5: # BENCH
+                                                target_energy = len(state_ps.active[0].energyCards) if hasattr(state_ps.active[0], "energyCards") else 0
+                                        elif target_area == 5 or target_area == "bench": # BENCH
                                             if 0 <= target_idx < len(state_ps.bench) and state_ps.bench[target_idx] is not None:
                                                 attached_target_id = state_ps.bench[target_idx].id
+                                                target_energy = len(state_ps.bench[target_idx].energyCards) if hasattr(state_ps.bench[target_idx], "energyCards") else 0
                                     elif opt_type_val == 9: # EVOLVE
                                         hand = state_ps.hand
                                         card_idx = opt.get("index", -1)
@@ -262,6 +270,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             pre_metrics["played_card_id"] = played_card_id
                             pre_metrics["attached_card_id"] = attached_card_id
                             pre_metrics["attached_target_id"] = attached_target_id
+                            pre_metrics["target_energy"] = target_energy
                             pre_metrics["evolved_card_id"] = evolved_card_id
                             pre_metrics["attack_id"] = attack_id
                             samples[0].append((sample, pre_metrics))
@@ -320,12 +329,12 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                         card_idx = opt.get("index", -1)
                                         if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
                                             attached_card_id = hand[card_idx].id
-                                        target_area = opt.get("inPlayArea", -1)
-                                        target_idx = opt.get("inPlayIndex", -1)
-                                        if target_area == 4: # ACTIVE
+                                        target_area = opt.get("inPlayArea", opt.get("area", opt.get("targetArea", -1)))
+                                        target_idx = opt.get("inPlayIndex", opt.get("index", opt.get("targetIndex", -1)))
+                                        if target_area == 4 or target_area == "active": # ACTIVE
                                             if len(state_ps.active) > 0 and state_ps.active[0] is not None:
                                                 attached_target_id = state_ps.active[0].id
-                                        elif target_area == 5: # BENCH
+                                        elif target_area == 5 or target_area == "bench": # BENCH
                                             if 0 <= target_idx < len(state_ps.bench) and state_ps.bench[target_idx] is not None:
                                                 attached_target_id = state_ps.bench[target_idx].id
                                     elif opt_type_val == 9: # EVOLVE
@@ -342,7 +351,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             pre_metrics["attached_target_id"] = attached_target_id
                             pre_metrics["evolved_card_id"] = evolved_card_id
                             pre_metrics["attack_id"] = attack_id
-                            samples[1].append((sample, pre_metrics))
+                            if sample is not None:
+                                samples[my_player_idx].append((sample, pre_metrics))
                         elif opp_model is not None:
                             selected, sample = mcts_agent(obs, curr_deck, opp_model, search_count=50)
                         else:
@@ -381,9 +391,17 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
             final_turn = obs_class.current.turn if (obs_class is not None and obs_class.current is not None) else 0
             
             processed_samples = []
-            rc_worker = {"prize_taken": 0.0, "prize_lost": 0.0, "kos": 0.0, "own_kos": 0.0,
-                         "energy": 0.0, "bench": 0.0, "deckout": 0.0, "terminal": 0.0, "stall": 0.0,
-                         "no_energy": 0.0, "strategic": 0.0}
+            rc_worker = {
+                "prize_taken": 0.0, "prize_lost": 0.0, "kos": 0.0, "own_kos": 0.0,
+                "energy": 0.0, "bench": 0.0, "deckout": 0.0, "terminal": 0.0, "stall": 0.0,
+                "no_energy": 0.0, "strategic": 0.0,
+                "r_knockout": 0.0, "r_attack_ready": 0.0, "r_backup_ready": 0.0, "r_bench_setup": 0.0,
+                "r_evolution_progress": 0.0, "r_stadium_value": 0.0, "r_retreat_eff": 0.0,
+                "r_damage_eff": 0.0, "r_lethal_detection": 0.0, "r_supporter_eff": 0.0,
+                "r_supporter_opp_cost": 0.0, "r_hand_congestion": 0.0, "r_deck_preservation": 0.0,
+                "r_missed_attack": 0.0, "r_donk_prevention": 0.0, "r_action_conv": 0.0,
+                "r_search_quality": 0.0, "r_search_tempo": 0.0,
+            }
             
             for i in range(2):
                 player_samples = samples[i]
@@ -473,9 +491,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     if opp_deck_size <= 5:
                         r_stall = 0.0
                     else:
-                        r_stall = -0.02
+                        r_stall = -0.002
                         if lockout_turns > 3:
-                            r_stall -= min(0.20, 0.02 * (lockout_turns - 3))
+                            r_stall -= min(0.05, 0.005 * (lockout_turns - 3))
                         
                     r_prize_t = prizes_taken * 0.5 if prizes_taken > 0 else 0.0
                     if prizes_taken > 0 and not has_taken_prize_flag:
@@ -485,27 +503,17 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     if prizes_lost > 0 and not has_lost_prize_flag:
                         r_prize_l -= 0.35
                         has_lost_prize_flag = True
-                    r_ko = 0.0
+                    r_ko = prizes_taken * 0.30 if prizes_taken > 0 else 0.0
                     r_own_ko = - (own_kos * 0.15) if own_kos > 0 else 0.0
                     
                     action_type = pre.get("action_type", -1)
+                    # NOTE: Inline r_en was removed to eliminate duplicate reward calculation with energy_evaluator.py.
+                    # All energy attachment rewards and overcharge penalties are handled by r_strategic -> energy_evaluator pipeline.
                     r_en = 0.0
-                    if energy_attached > 0:
-                        attached_target = pre.get("attached_target_id", -1)
-                        target_card = get_card_data(attached_target) if attached_target > 0 else None
-                        max_req_en = 2
-                        if target_card and hasattr(target_card, "attacks"):
-                            costs = [len(attack_table[aid].energies) for aid in getattr(target_card, "attacks", []) if aid in attack_table]
-                            if costs:
-                                max_req_en = max(costs)
-                        target_curr_en = pre.get("active_energies", 0) if attached_target == pre.get("active_id") else 0
-                        if target_curr_en >= max_req_en:
-                            r_en = -0.25
-                        else:
-                            r_en = 0.05
                     r_no_en = -0.05 if (action_type != 8 and pre.get("has_energy_in_hand", False)) else 0.0
                         
-                    r_strategic = calculate_strategic_reward(pre, post, action_type, step_idx, went_second, i, opponent_name)
+                    comp_dict = calculate_strategic_reward_components(pre, post, action_type, step_idx, went_second, i, opponent_name)
+                    r_strategic = sum(comp_dict.values())
 
                     r_bench = 0.0
                     if post["bench_size"] == 0:
@@ -521,42 +529,46 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     if post["deck_size"] == 0:
                         r_deck -= 0.50
                         
-                    STRATEGIC_SCALE = 0.05
-                    step_reward = r_stall + r_prize_t + r_prize_l + r_ko + r_own_ko + r_en + r_no_en + r_bench + r_deck + (r_strategic * STRATEGIC_SCALE)
-                    step_reward = max(-0.15, min(0.15, step_reward))
+                    STRATEGIC_SCALE = 0.50
+                    step_reward = r_stall + r_prize_t + r_prize_l + r_ko + r_own_ko + r_no_en + r_bench + r_deck + (r_strategic * STRATEGIC_SCALE)
+                    step_reward = max(-0.25, min(0.25, step_reward))
 
-                    if i == 0:
+                    if i == my_player_idx:
                         rc_worker["prize_taken"] += r_prize_t
                         rc_worker["prize_lost"] += r_prize_l
-                        rc_worker["kos"] += prizes_taken
+                        rc_worker["kos"] += r_ko
                         rc_worker["own_kos"] += r_own_ko
-                        rc_worker["energy"] += r_en
+                        rc_worker["energy"] += comp_dict.get("r_attack_ready", 0.0)
                         rc_worker["no_energy"] += r_no_en
                         rc_worker["bench"] += r_bench
                         rc_worker["deckout"] += r_deck
                         rc_worker["stall"] += r_stall
                         rc_worker["strategic"] += r_strategic
+                        for ck, cv in comp_dict.items():
+                            if ck in rc_worker:
+                                rc_worker[ck] += cv
                         
                     rewards.append(step_reward)
                     
-                if i == 0:
+                if i == my_player_idx:
                     rc_worker["terminal"] += terminal_reward
                     
                 processed_samples.extend(compute_gae_advantages(player_samples, rewards, terminal_reward))
 
             entropy_accum = 0.0
             entropy_count = 0
-            for sample_obj, _ in samples[0]:
-                if sample_obj is not None and hasattr(sample_obj, 'policy') and len(sample_obj.policy) > 0:
-                    policy_probs = [max(1e-8, p) for p in sample_obj.policy if p > 0]
+            for sample_obj, _ in samples[my_player_idx]:
+                if sample_obj is not None and hasattr(sample_obj, 'policy') and len(sample_obj.policy) > 1:
+                    policy_probs = [max(1e-8, p) for p in sample_obj.policy]
                     p_sum = sum(policy_probs)
                     if p_sum > 0:
                         import math
-                        entropy = -sum((p/p_sum) * math.log(p/p_sum) for p in policy_probs)
+                        probs_norm = [p / p_sum for p in policy_probs]
+                        entropy = -sum(p * math.log(p) for p in probs_norm)
                         entropy_accum += entropy
                         entropy_count += 1
                         
-            result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, processed_samples, result, final_turn, rc_worker, entropy_accum, entropy_count, action_counts, played_cards, expert_log)))
+            result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, processed_samples, result, final_turn, rc_worker, entropy_accum, entropy_count, action_counts, played_cards, expert_log, went_second, my_player_idx)))
             
         elif cmd == "EVAL":
             sample_deck, opponent_deck, opponent_name = args
@@ -580,15 +592,11 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 curr_player = obs["current"]["yourIndex"]
                 
                 if curr_player == your_index:
-                    turn = obs["current"]["turn"] if obs.get("current") else 1
-                    if turn <= 1:
-                        eval_search_count = 80
-                    elif turn <= 3:
-                        eval_search_count = 60
-                    elif turn <= 8:
-                        eval_search_count = 50
-                    else:
-                        eval_search_count = 40
+                    eval_search_count = 50
+
+
+
+
                         
                     selected, _ = mcts_agent(obs, sample_deck, client, search_count=eval_search_count, temperature=0.0)
 

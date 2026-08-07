@@ -344,26 +344,26 @@ def evaluate_state_energy_transition(
     new_attacker_bonus = 0.05 if powered_delta > 0 else 0.0
 
     # 3. Backup Attacker & Bench Preparation Bonus
-    backup_bonus = 0.03 if backup_delta > 0 else 0.0
+    backup_bonus = 0.15 if backup_delta > 0 else 0.0
 
     # Bench preparation bonus: when active is already fully powered,
-    # attaching energy to an unpowered benched attacker receives a +0.03 prep bonus.
+    # attaching energy to an unpowered benched attacker receives a +0.15 prep bonus.
     active_req = get_required_energy(active_id_before) if active_id_before > 0 else 2
     is_bench_target = (target_card_id > 0 and target_card_id != active_id_before)
     if active_energy_before >= active_req and is_bench_target:
-        bench_prep_bonus = 0.03
+        bench_prep_bonus = 0.15
     else:
         bench_prep_bonus = 0.0
 
-    # 4. Energy Efficiency / Overcharge Penalty (flat schedule rescaled to fit [-0.10, +0.10] clip ceiling)
+    # 4. Energy Efficiency / Overcharge Penalty (harsh penalty schedule)
     if wasted_delta == 0:
         efficiency_penalty = 0.0
     elif wasted_delta == 1:
-        efficiency_penalty = 0.04
+        efficiency_penalty = 0.20
     elif wasted_delta == 2:
-        efficiency_penalty = 0.07
+        efficiency_penalty = 0.30
     else:
-        efficiency_penalty = 0.10
+        efficiency_penalty = 0.40
 
     # 5. Opportunity Cost Calculation (Compare chosen target S' against best legal target S'*)
     legal_targets = [active_id_before] + [bid for bid in bench_ids_before if bid > 0]
@@ -498,22 +498,51 @@ def evaluate_energy_target(
     if _violates_type_restriction(target_card_id, energy_card_id):
         return -0.25, "Prior: Energy Type Restriction Violation (e.g. Basic G on Mimikyu)"
 
-    req_en = get_required_energy(target_card_id)
-    if target_current_energy >= req_en:
-        # Check if another Pokemon on active/bench actually needs energy
+    # Rule 0: Crustle EX Immunity Matchup Rule
+    # Crustle (344, 345, 407, 408) has an ability rendering it IMMUNE to attacks from EX Pokémon (Mewtwo ex).
+    # Prioritize attaching energy to Spidops ex (401), Tarountula (400), or Mimikyu (434).
+    if active_id in (344, 345, 407, 408):
+        if target_card_id == 431:
+            return -0.25, "Prior Guidance: Mewtwo ex Cannot Damage Crustle (EX Immunity)"
+        elif target_card_id in (401, 400, 434):
+            return 0.25, "Prior Guidance: PRIORITIZE Spidops/Mimikyu Energy vs Crustle (EX Immunity Counter)"
+
+    # Rule 1: Team Rocket's Energy (ID 15, +2 energy) Strict Focus & Preservation for Mewtwo ex (431)
+    # Mewtwo ex needs 1 TR Energy + 1 Grass Energy (3 energy total) for Psystrike.
+    # Preserve TR Energy for Mewtwo ex unless Mewtwo ex is fully powered (>=3) or not on board.
+    if energy_card_id in (15, 19):  # TR Energy
+        mewtwo_in_play = (active_id == 431) or (431 in bench_ids)
+        mewtwo_needs_energy = False
+        if active_id == 431 and active_energy < 3:
+            mewtwo_needs_energy = True
+        elif 431 in bench_ids:
+            mewtwo_idx = bench_ids.index(431)
+            if bench_energies and mewtwo_idx < len(bench_energies) and bench_energies[mewtwo_idx] < 3:
+                mewtwo_needs_energy = True
+
+        if target_card_id != 431 and mewtwo_in_play and mewtwo_needs_energy:
+            return -0.25, "Prior Guidance: Team Rocket Energy STRICTLY Reserved for Mewtwo ex"
+
+    # Rule 2: Active Pokémon Max Energy Check & Mandatory Bench Redirection
+    # Effective max operational energy cap: Mewtwo ex = 3, Spidops ex = 2, Mimikyu/Tarountula = 1, Articuno = 1
+    max_useful_energy = 3 if target_card_id == 431 else (2 if target_card_id == 401 else 1)
+    if target_current_energy >= max_useful_energy:
+        # Check if any benched Pokemon needs energy
         bench_has_hungry = False
         if bench_ids and bench_energies:
             for bid, ben in zip(bench_ids, bench_energies):
-                if bid > 0 and ben < get_required_energy(bid):
+                req_b = 3 if bid == 431 else (2 if bid == 401 else 1)
+                if bid > 0 and ben < req_b:
                     bench_has_hungry = True
                     break
         if not bench_has_hungry and active_id > 0 and active_id != target_card_id:
-            if active_energy < get_required_energy(active_id):
+            req_a = 3 if active_id == 431 else (2 if active_id == 401 else 1)
+            if active_energy < req_a:
                 bench_has_hungry = True
 
         if bench_has_hungry:
-            return -0.20, "Prior Guidance: Target Already Powered (Prefer Hungry Pokemon)"
-        return -0.15, "Prior Guidance: Energy Overcharge (Target already powered)"
+            return -1.50, "Prior Guidance: Active Already at Max Energy (HARD BLOCK - Mandatory Bench Energy Setup)"
+        return -0.40, "Prior Guidance: Energy Overcharge (Target already powered)"
 
     bench_e_after = list(bench_energies)
     is_act = (target_card_id == active_id)  # Fix: define is_act before use (was NameError)

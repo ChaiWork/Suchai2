@@ -72,16 +72,16 @@ BONUS_GENERIC_ATTACK                 = 0.10
 BONUS_UNDERPOWERED_ATTACK            = 0.02
 
 # Supporter & Gust Bonuses
-BONUS_GIOVANNI_WIN_CLOSE_EX          = 0.20
-BONUS_GIOVANNI_WIN_CLOSE_OR_EX       = 0.16
-BONUS_GIOVANNI_EARLY_GUST            = 0.14
-BONUS_GIOVANNI_BENCH_GUST            = 0.12
-BONUS_ARIANA_LOW_HAND                = 0.16
-BONUS_LILLIE_LOW_HAND                = 0.16
-BONUS_TACTICAL_SUPPORTER             = 0.10
+BONUS_GIOVANNI_WIN_CLOSE_EX          = 0.24
+BONUS_GIOVANNI_WIN_CLOSE_OR_EX       = 0.20
+BONUS_GIOVANNI_EARLY_GUST            = 0.18
+BONUS_GIOVANNI_BENCH_GUST            = 0.16
+BONUS_ARIANA_LOW_HAND                = 0.28
+BONUS_LILLIE_LOW_HAND                = 0.28
+BONUS_TACTICAL_SUPPORTER             = 0.22
 
 # Search, Bench & Equipment Bonuses
-BONUS_REACH_FOUR_TR_POKEMON          = 0.16
+BONUS_REACH_FOUR_TR_POKEMON          = 0.22
 BONUS_TRANSCEIVER                    = 0.18
 BONUS_BUG_CATCHING                   = 0.16
 BONUS_EARLY_POFFIN                   = 0.18  # was 0.22 — capped at expert prior ceiling
@@ -291,17 +291,25 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
         # A. Team Rocket Pokémon Play & 4-Pokémon Power Saver Unlock
         if card_id in TR_POKEMON_IDS:
             if tr_count == 3:
-                return 0.18, "Prior: Play 4th TR Pokemon Unlocking Mewtwo ex Power Saver Ability"
-            if ctx["my_bench_count"] <= 1:
-                return 0.16, "Prior: Play TR Pokemon Low Bench Recovery Guard"
+                return 0.28, "CRITICAL Prior: Play 4th TR Pokemon Unlocking Mewtwo ex Power Saver Ability"
+            if ctx["my_bench_count"] == 0:
+                return 0.28, "CRITICAL Prior: Donk Prevention - Play Basic Pokemon to Empty Bench Immediately"
+            elif ctx["my_bench_count"] == 1:
+                return 0.18, "Prior: Play TR Pokemon Low Bench Recovery Guard"
             # FIX 2 (expert): Early Mewtwo ex and Tarountula setup priority
             if early_game:
                 if card_id == MEWTWO_EX_ID:
                     return 0.20, "Prior: Early Mewtwo ex Main Attacker Deployment (Turn 1-3)"
                 elif card_id == TAROUNTULA_ID:
                     return 0.16, "Prior: Early Tarountula Setup Deployment (Turn 1-3)"
+            # Crustle EX Immunity Matchup Rule: Prioritize playing Tarountula & Spidops ex
+            opp_active_id = ctx.get("opp_active_id", -1)
+            is_crustle = (opp_active_id in (344, 345, 407, 408)) or ("crustle" in opponent_name.lower())
+            if is_crustle and (card_id == SPIDOPS_ID or card_id == TAROUNTULA_ID):
+                return 0.30, "CRITICAL Prior: PRIORITIZE Play & Deploy Spidops Line vs Crustle (EX Immunity Counter)"
+
             if card_id == SPIDOPS_ID or card_id == TAROUNTULA_ID:
-                return 0.12, "Prior: Play Spidops Line Trap Territory Setup"
+                return 0.16, "Prior: Play Spidops Line Trap Territory Setup"
             return 0.08, "Prior: Play Team Rocket Pokemon Setup"
 
 
@@ -323,6 +331,9 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
         # C. Equipment & Recovery
         if card_id == MAXIMUM_BELT_ID:
             return BONUS_MAXIMUM_BELT, "Prior: Equip Maximum Belt ACE SPEC Snipe Tool"
+
+        if card_id in (HEROS_CAPE_ID, 1159):
+            return 0.30, "CRITICAL Prior: Equip Hero's Cape (+100 HP) ACE SPEC Tool"
 
         if card_id == BRAVE_BANGLE_ID:
             is_fast_aggro = any(k in opponent_name.lower() for k in ("starmie", "ogerpon", "garchomp", "dipplin"))
@@ -346,20 +357,20 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
             return BONUS_NIGHT_STRETCHER, "Prior: Night Stretcher Recovery"
 
         if card_id == TR_FACTORY_ID:
-            is_control = any(k in opponent_name.lower() for k in ("iono", "control", "snorlax"))
-            if is_control or early_game:
-                return 0.20, "Prior: Play TR Factory Stadium Counter Iono Hand Disruption"
+            is_control_or_dipplin = any(k in opponent_name.lower() for k in ("iono", "control", "snorlax", "dipplin"))
+            if is_control_or_dipplin or early_game:
+                return 0.25, "Prior: Play TR Factory Stadium Counter Iono/Dipplin Festival Grounds"
             return 0.16, "Prior: Play TR Factory Stadium Draw Engine"
 
         if card_id == PRISM_TOWER_ID:
             return 0.16, "Prior: Play Prism Tower Recurring Discard & Draw"
 
         if card_id == BATTLE_CAGE_ID:
-            bench_counter_keywords = ("dragapult", "froslass", "dusknoir", "dusclops", "munkidori")
+            bench_counter_keywords = ("dragapult", "froslass", "dusknoir", "dusclops", "munkidori", "dipplin")
             is_bench_counter_meta = any(k in opponent_name.lower() for k in bench_counter_keywords) or opponent_name == "DRAGAPULT"
             if is_bench_counter_meta:
-                return 0.20, "Prior: Play Battle Cage Counter Dragapult/Froslass Bench Snipe"
-            return 0.18, "Prior: Play Battle Cage Active/Bench Protection"
+                return 0.30, "CRITICAL Prior: Play Battle Cage Counter Dragapult/Froslass Bench Snipe"
+            return 0.22, "Prior: Play Battle Cage Active/Bench Protection"
 
         # D. Positioning & Tempo Items
         if card_id == SWITCH_ID:
@@ -386,6 +397,8 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
 
         # E. State-Aware Supporters
         if card_id == GIOVANNI_ID:
+            if "archaludon" in opponent_name.lower():
+                return 0.28, "CRITICAL Prior: Giovanni Gust vs Archaludon (Bypass 300 HP Metal Armor Active)"
             if ctx["opp_bench_count"] > 0:
                 has_ex_target = any(b in EX_POKEMON_IDS for b in ctx["opp_bench_ids"])
                 if has_ex_target and close_game:
@@ -411,72 +424,75 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
         if card_id in TACTICAL_SUPPORTER_IDS:
             return BONUS_TACTICAL_SUPPORTER, "Prior: TR Tactical Supporter Play"
 
-    # 2. ENERGY ATTACHMENT ACTIONS (OptionType.ATTACH / 8)
-    elif opt_type in (getattr(OptionType, "ATTACH", 8), 8):
-        if card_id > 0:
-            in_area = _get_val(opt, "inPlayArea", _get_val(opt, "area", _get_val(opt, "targetArea", 4)))
-            in_idx  = _get_val(opt, "inPlayIndex", _get_val(opt, "index", _get_val(opt, "targetIndex", 0)))
+    # 2. ENERGY ATTACHMENT ACTIONS (OptionType.ATTACH / 8 or Target Selection context)
+    select_context = ctx.get("select_context")
+    is_attach_phase = (opt_type in (getattr(OptionType, "ATTACH", 8), 8)) or (select_context in (8, getattr(OptionType, "ATTACH", 8), "AttachEnergy"))
 
-            target_poke = None
-            my_ps = ctx.get("my_ps")
-            if my_ps is not None:
-                active_list = _get_val(my_ps, "active", [])
-                bench_list  = _get_val(my_ps, "bench", [])
-                if (in_area == 4 or in_area == "active") and active_list and active_list[0] is not None:
-                    target_poke = active_list[0]
-                elif (in_area == 5 or in_area == "bench") and bench_list and 0 <= in_idx < len(bench_list) and bench_list[in_idx] is not None:
-                    target_poke = bench_list[in_idx]
+    if is_attach_phase:
+        energy_cid = card_id if card_id in (1, 2, 3, 4, 5, 15, 19) else 1
+        in_area = _get_val(opt, "inPlayArea", _get_val(opt, "area", _get_val(opt, "targetArea", 4)))
+        in_idx  = _get_val(opt, "inPlayIndex", _get_val(opt, "index", _get_val(opt, "targetIndex", 0)))
 
-            opt_target_energy = 0
-            if target_poke is not None:
-                energies = _get_val(target_poke, "energyCards", [])
-                opt_target_energy = len(energies) if isinstance(energies, (list, tuple)) else 0
-                opt_target = _get_val(target_poke, "cardId", _get_val(target_poke, "id", -1))
+        target_poke = None
+        my_ps = ctx.get("my_ps")
+        if my_ps is not None:
+            active_list = _get_val(my_ps, "active", [])
+            bench_list  = _get_val(my_ps, "bench", [])
+            if (in_area == 4 or in_area == "active") and active_list and active_list[0] is not None:
+                target_poke = active_list[0]
+            elif (in_area == 5 or in_area == "bench") and bench_list and 0 <= in_idx < len(bench_list) and bench_list[in_idx] is not None:
+                target_poke = bench_list[in_idx]
+
+        opt_target_energy = 0
+        if target_poke is not None:
+            energies = _get_val(target_poke, "energyCards", [])
+            opt_target_energy = len(energies) if isinstance(energies, (list, tuple)) else 0
+            opt_target = _get_val(target_poke, "cardId", _get_val(target_poke, "id", -1))
+        else:
+            if (in_area == 5 or in_area == "bench") and 0 <= in_idx < len(ctx.get("my_bench_ids", [])):
+                opt_target = ctx["my_bench_ids"][in_idx]
             else:
-                if (in_area == 5 or in_area == "bench") and 0 <= in_idx < len(ctx.get("my_bench_ids", [])):
-                    opt_target = ctx["my_bench_ids"][in_idx]
-                else:
-                    opt_target = _get_val(opt, "targetCardId", active_id) if not isinstance(opt, dict) else opt.get("targetCardId", active_id)
-                opt_target_energy = ctx.get("target_energy", 0)
+                opt_target = _get_val(opt, "targetCardId", active_id) if not isinstance(opt, dict) else opt.get("targetCardId", active_id)
+            opt_target_energy = ctx.get("target_energy", 0)
 
-            # Extract board context for generic evaluator
-            my_bench_ids     = ctx.get("my_bench_ids", [])
-            my_prizes        = ctx.get("my_prizes", 6)
-            opp_prizes       = ctx.get("opp_prizes", 6)
-            my_bench_count   = ctx.get("my_bench_count", 0)
-            hand_ids         = ctx.get("my_hand_ids", [])
-            active_energy    = ctx.get("my_active_energy", 0)
-            active_hp        = ctx.get("my_active_hp", 100)
+        # Extract board context for generic evaluator
+        my_bench_ids     = ctx.get("my_bench_ids", [])
+        my_prizes        = ctx.get("my_prizes", 6)
+        opp_prizes       = ctx.get("opp_prizes", 6)
+        my_bench_count   = ctx.get("my_bench_count", 0)
+        hand_ids         = ctx.get("my_hand_ids", [])
+        active_energy    = ctx.get("my_active_energy", 0)
+        active_hp        = ctx.get("my_active_hp", 100)
 
-            # Build bench energy list generically from my_ps
-            bench_energies = []
-            if my_ps is not None:
-                bench_list_raw = _get_val(my_ps, "bench", [])
-                for bp in bench_list_raw:
-                    if bp is not None:
-                        ben_en = _get_val(bp, "energyCards", [])
-                        bench_energies.append(len(ben_en) if isinstance(ben_en, (list, tuple)) else 0)
+        # Build bench energy list generically from my_ps
+        bench_energies = []
+        if my_ps is not None:
+            bench_list_raw = _get_val(my_ps, "bench", [])
+            for bp in bench_list_raw:
+                if bp is not None:
+                    ben_en = _get_val(bp, "energyCards", [])
+                    bench_energies.append(len(ben_en) if isinstance(ben_en, (list, tuple)) else 0)
 
-            # --- Generic evaluation via energy_evaluator ---
-            try:
-                from src.expert_system.energy_evaluator import evaluate_energy_target
-            except ImportError:
-                from expert_system.energy_evaluator import evaluate_energy_target
+        # --- Generic evaluation via energy_evaluator ---
+        try:
+            from src.expert_system.energy_evaluator import evaluate_energy_target
+        except ImportError:
+            from expert_system.energy_evaluator import evaluate_energy_target
 
-            score, reason = evaluate_energy_target(
-                target_card_id=opt_target,
-                target_current_energy=opt_target_energy,
-                energy_card_id=card_id,
-                hand_ids=hand_ids,
-                my_prizes=my_prizes,
-                opp_prizes=opp_prizes,
-                bench_ids=my_bench_ids,
-                bench_energies=bench_energies,
-                active_id=active_id,
-                active_energy=active_energy,
-                active_hp=active_hp,
-            )
-            return score, f"Prior: {reason}"
+        score, reason = evaluate_energy_target(
+            target_card_id=opt_target,
+            target_current_energy=opt_target_energy,
+            energy_card_id=energy_cid,
+            hand_ids=hand_ids,
+            my_prizes=my_prizes,
+            opp_prizes=opp_prizes,
+            bench_ids=my_bench_ids,
+            bench_energies=bench_energies,
+            active_id=active_id,
+            active_energy=active_energy,
+            active_hp=active_hp,
+        )
+        return score, f"Prior: {reason}"
 
 
 
@@ -491,10 +507,12 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
     elif opt_type in (getattr(OptionType, "RETREAT", 12), 12):
         active_hp = ctx.get("my_active_hp", 280)
         active_energy = ctx.get("my_active_energy", 0)
+        opp_active_id = ctx.get("opp_active_id", -1)
 
-        # Bounded prior discouragement — not a hard block. RL remains the final decision maker.
-        # Rationale: retreating wastes energy and tempo; but the NN may discover edge cases
-        # (type disadvantage, poisoned, opponent lethal threat) where retreat IS correct.
+        # Crustle EX Immunity Rule: Retreat active Mewtwo ex if facing Crustle (344, 345, 407, 408)
+        if active_id == MEWTWO_EX_ID and (opp_active_id in (344, 345, 407, 408) or "crustle" in opponent_name.lower()):
+            return 0.22, "Prior: Retreat Mewtwo ex vs Crustle (EX Immunity Counter - Bring in Spidops)"
+
         if active_id == MEWTWO_EX_ID and active_energy >= 1 and active_hp >= 100:
             return -0.12, "Prior Penalty: Retreat healthy powered Mewtwo ex (energy waste, strongly discouraged)"
         elif active_energy >= 1 and active_hp >= 80:
@@ -507,8 +525,11 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
     elif opt_type in (getattr(OptionType, "ATTACK", 13), 13):
         req_energy = ATTACK_ENERGY_COSTS.get(active_id, 2)
         current_energy = ctx["my_active_energy"]
+        opp_active_id = ctx.get("opp_active_id", -1)
 
-        if active_id == MEWTWO_EX_ID:
+        # Crustle EX Immunity Check: Mewtwo ex deals 0 damage to Crustle
+        if active_id == MEWTWO_EX_ID and (opp_active_id in (344, 345, 407, 408) or "crustle" in opponent_name.lower()):
+            return -0.25, "Prior Penalty: Mewtwo ex Attack Deals 0 Damage to Crustle (EX Immunity)"
             if tr_count < 4:
                 return PENALTY_MEWTWO_POWER_SAVER_UNMET, "Prior Penalty: Mewtwo ex Power Saver Unmet (<4 TR Pokemon)"
             if current_energy >= req_energy:
