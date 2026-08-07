@@ -436,6 +436,109 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
     my_prizes = len(state.players[your_index].prize)
     opp_prizes = len(state.players[1 - your_index].prize)
     sv.add_single((opp_prizes - my_prizes) / 6.0)
+    # Action Economy Features (Supporter played, Energy attached, Retreated, Stadium played)
+    sv.add_single(float(getattr(state, "supporterPlayed", False)))
+    sv.add_single(float(getattr(state, "energyAttached", False)))
+    sv.add_single(float(getattr(state, "retreated", False)))
+    sv.add_single(float(getattr(state, "stadiumPlayed", False)))
+
+    # Enhanced Global Features (Stadium in hand, Deck exhaustion, Attack readiness, Energy efficiency)
+    my_hand = getattr(state.players[your_index], "hand", []) or []
+    # Stadium IDs: 1264 (Battle Cage), 1257 (TR Factory), 1180 (Prism Tower)
+    has_stadium_in_hand = any(getattr(c, "id", -1) in (1264, 1257, 1180) for c in my_hand if c is not None)
+    sv.add_single(float(has_stadium_in_hand))
+
+    my_deck = getattr(state.players[your_index], "deck", []) or []
+    deck_count = len(my_deck) if isinstance(my_deck, (list, tuple)) else getattr(state.players[your_index], "deckCount", 60)
+    sv.add_single(min(1.0, deck_count / 60.0))
+
+    # Phase 1 RL Features: TR Pokemon Count, Power Saver Status & True Active Attack Readiness
+    TR_POKEMON_IDS = {400, 401, 414, 431, 434}
+    tr_count = 0
+
+    def _get_val_local(obj, key: str, default=None):
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            v = obj.get(key)
+            if v is None and key == "id":
+                v = obj.get("cardId")
+            elif v is None and key == "cardId":
+                v = obj.get("id")
+            return v if v is not None else default
+        v = getattr(obj, key, None)
+        if v is None and key == "id":
+            v = getattr(obj, "cardId", None)
+        elif v is None and key == "cardId":
+            v = getattr(obj, "id", None)
+        return v if v is not None else default
+
+    players = _get_val_local(state, "players", [])
+    if isinstance(players, (list, tuple)) and len(players) > your_index:
+        ps_curr = players[your_index]
+        my_active = _get_val_local(ps_curr, "active", []) or []
+        my_bench = _get_val_local(ps_curr, "bench", []) or []
+    else:
+        my_active = []
+        my_bench = []
+
+    for pk in (my_active + my_bench):
+        if pk is not None:
+            pk_id = _get_val_local(pk, "id", -1)
+            if pk_id in TR_POKEMON_IDS:
+                tr_count += 1
+
+    power_saver_unlocked = 1.0 if tr_count >= 4 else 0.0
+    sv.add_single(min(1.0, tr_count / 4.0))        # Feature: TR Pokemon count in play
+    sv.add_single(power_saver_unlocked)            # Feature: Power Saver status (1.0 if unlocked)
+
+    # True Active Attack Readiness (Fix: Handles both Object & Dict attributes safely)
+    act_ready = 0.0
+    if my_active and len(my_active) > 0 and my_active[0] is not None:
+        act_card = my_active[0]
+        act_id = _get_val_local(act_card, "id", -1)
+        energies = _get_val_local(act_card, "energyCards") or _get_val_local(act_card, "energies") or []
+        num_e = len(energies) if isinstance(energies, (list, tuple)) else 0
+        req_e = 3 if act_id == 431 else (2 if act_id in (401, 272, 414) else 1)
+
+        power_saver_ok = (act_id != 431) or (tr_count >= 4)
+        if num_e >= req_e and power_saver_ok:
+            act_ready = 1.0
+    sv.add_single(act_ready)
+
+    # Attack Available in Options Mask Feature (Handles both Object & Dict options)
+    select_obj = _get_val_local(obs, "select")
+    options = _get_val_local(select_obj, "option", []) or []
+    has_attack_opt = 0.0
+    for opt in options:
+        opt_type = _get_val_local(opt, "type", -1)
+        if opt_type in (13, getattr(OptionType, "ATTACK", 13)):
+            has_attack_opt = 1.0
+            break
+    sv.add_single(has_attack_opt)
+
+    # Opponent Stadium Active feature
+    stadium_list = _get_val_local(state, "stadium", []) or []
+    opp_stadium_active = 0.0
+    if stadium_list and len(stadium_list) > 0 and stadium_list[0] is not None:
+        st_card = stadium_list[0]
+        st_owner = _get_val_local(st_card, "playerIndex", -1)
+        if st_owner == (1 - your_index):
+            opp_stadium_active = 1.0
+    sv.add_single(opp_stadium_active)
+
+    # Powered Attackers Count (Active + Bench)
+    powered_count = 0
+    for pk in (my_active + my_bench):
+        if pk is not None:
+            pk_id = _get_val_local(pk, "id", -1)
+            energies = _get_val_local(pk, "energyCards") or _get_val_local(pk, "energies") or []
+            num_e = len(energies) if isinstance(energies, (list, tuple)) else 0
+            req_e = 3 if pk_id == 431 else (2 if pk_id in (401, 272, 414) else 1)
+            pk_ps_ok = (pk_id != 431) or (tr_count >= 4)
+            if num_e >= req_e and pk_ps_ok:
+                powered_count += 1
+    sv.add_single(min(1.0, powered_count / 3.0))
     return sv
 
 

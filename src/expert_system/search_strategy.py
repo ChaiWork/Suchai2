@@ -30,6 +30,7 @@ GIOVANNI_ID          = 1218 # Team Rocket's Giovanni
 PETREL_ID            = 1219 # Team Rocket's Petrel
 PROTON_ID            = 1220 # Team Rocket's Proton
 LILLIES_DETERM_ID    = 1227 # Lillie's Determination
+BATTLE_CAGE_ID       = 1264 # Battle Cage (Anti-Dragapult Bench Protection)
 
 TR_POKEMON_IDS       = frozenset({400, 401, 414, 431, 434})
 SUPPORTER_IDS        = frozenset({1216, 1218, 1219, 1220, 1227})
@@ -138,7 +139,12 @@ def extract_search_context(obs: dict) -> dict:
     ctx["has_tarountula_in_play"] = (TAROUNTULA_ID in in_play)
     ctx["has_supporter_in_hand"] = any(cid in SUPPORTER_IDS for cid in ctx["my_hand_ids"])
 
-    req_e = 3 if ctx["my_active_id"] == MEWTWO_EX_ID else (2 if ctx["my_active_id"] in (SPIDOPS_ID, ARTICUNO_ID) else 1)
+    try:
+        from src.expert_system.energy_evaluator import get_required_energy
+    except ImportError:
+        from expert_system.energy_evaluator import get_required_energy
+    # Use API-driven energy cost lookup instead of hardcoded per-card values
+    req_e = get_required_energy(ctx["my_active_id"])
     ctx["active_attack_ready"] = (ctx["my_active_energy"] >= req_e)
 
     return ctx
@@ -259,6 +265,18 @@ def evaluate_search_target_prior(card_id: int, ctx: dict) -> Tuple[float, str]:
             return 0.14, "Search: Mimikyu Stall Pivot Guard"
         return 0.06, "Search: Mimikyu Stall Candidate"
 
+    elif card_id == BATTLE_CAGE_ID:
+        # Generic state-transition threat evaluation: prevent expected bench damage/snipe
+        opp_name = ctx.get("opponent_name", "")
+        opp_act_id = ctx.get("opp_active_id", -1)
+        my_bench_cnt = ctx.get("my_bench_count", 0)
+        # Check if opponent has bench-damaging capability (e.g. Dragapult ID 121, Alakazam ID 150) or bench is populated
+        _BENCH_SNIPER_IDS = frozenset({121, 150, 414})
+        has_bench_threat = (opp_act_id in _BENCH_SNIPER_IDS) or ("Dragapult" in opp_name or "Alakazam" in opp_name) or (my_bench_cnt >= 2)
+        if has_bench_threat:
+            return 0.20, "Search Priority: Battle Cage Expected Bench Damage Protection"
+        return 0.08, "Search: Stadium Battle Cage"
+
     # -------------------------------------------------------------------------
     # F. POWER SAVER TR POKEMON UNLOCK GUARD (<4 TR Pokemon in play)
     # -------------------------------------------------------------------------
@@ -270,6 +288,8 @@ def evaluate_search_target_prior(card_id: int, ctx: dict) -> Tuple[float, str]:
 
 def score_search_target(card_id: int, ctx: dict, search_card_id: int = -1, opponent_name: str = "") -> float:
     """Computes state-aware strategic prior score for candidate target card_id."""
+    if opponent_name and "opponent_name" not in ctx:
+        ctx["opponent_name"] = opponent_name
     prior_bonus, _ = evaluate_search_target_prior(card_id, ctx)
     # Map prior bonus [-0.10, +0.20] to logit score space
     return prior_bonus
@@ -289,6 +309,9 @@ def choose_best_search_target(
         return -1, 0.0
 
     ctx = extract_search_context(obs)
+    if opponent_name:
+        ctx["opponent_name"] = opponent_name
+        
     best_cid = candidate_card_ids[0]
     best_score = -1.0
     best_reason = "Default"

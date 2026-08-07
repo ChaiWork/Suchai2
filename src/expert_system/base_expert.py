@@ -6,31 +6,45 @@ from cg.api import CardType, OptionType, SelectContext
 USE_EXPERT_GUIDANCE = True
 EXPERT_WEIGHT = 0.10
 
-# Number of training epochs over which expert guidance fully decays to zero.
-# Phase 1:  epoch 1-5   → scale 1.00 (full curriculum guidance)
-# Phase 2:  epoch 6-10  → scale 0.70
-# Phase 3:  epoch 11-20 → scale ~0.40
-# Phase 4:  epoch 21-30 → scale ~0.15
-# Phase 5:  epoch 31+   → scale 0.00 (pure RL — NN decides everything)
-EXPERT_DECAY_EPOCHS = 40
-
+# Expert influence schedule — stepped plateaus rather than linear-to-zero decay.
+# AlphaZero principle: expert priors are never fully removed; the NN learns ON TOP of them.
+# A permanent 10% floor means late-training priors still guide MCTS away from rule violations.
+#
+# Epoch   1-20  → 1.00  (full curriculum: expert leads, NN follows)
+# Epoch  21-50  → 0.50  (mid training:  expert and NN contribute equally)
+# Epoch  51-100 → 0.25  (late training: NN dominates, expert guards boundaries)
+# Epoch  100+   → 0.10  (floor:         permanent strategic prior, no complete removal)
+# Legacy compatibility constant
+EXPERT_DECAY_EPOCHS = 100
 
 def expert_scale(epoch: int) -> float:
     """
-    Returns a [1.0 → 0.0] multiplier that linearly decays the expert system
-    influence to zero over EXPERT_DECAY_EPOCHS epochs.
+    Returns a stepped-plateau multiplier controlling expert system influence.
 
-    Used as a universal decay gate for:
+    Design: AlphaZero systems retain expert priors permanently — the NN learns
+    better strategies on top of the prior, not instead of it. A hard floor of 0.10
+    ensures rule-safety guards (Turn 1 supporter block, Power Saver gate) remain
+    active even at epoch 500+.
+
+    Used as a universal gate for:
     - Expert logit biases in MCTS node priors (agent.py)
-    - Hard logit blocks (overcharge, type mismatch, turn-pass guard)
     - Reward shaping constants in mewtwo_reward.py
 
-    At epoch >= EXPERT_DECAY_EPOCHS the expert system has zero authority;
-    the neural network is the sole decision-maker.
+    Schedule:
+      Epoch   1-20  → 1.00
+      Epoch  21-50  → 0.50
+      Epoch  51-100 → 0.25
+      Epoch  100+   → 0.10 (permanent floor)
     """
     if not USE_EXPERT_GUIDANCE:
         return 0.0
-    return max(0.0, 1.0 - (max(0, epoch - 1) / EXPERT_DECAY_EPOCHS))
+    if epoch <= 20:
+        return 1.00
+    if epoch <= 50:
+        return 0.50
+    if epoch <= 100:
+        return 0.25
+    return 0.10  # Permanent floor — expert priors never fully removed
 
 
 def extract_board_context(obs) -> dict:

@@ -248,13 +248,13 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                         card_idx = opt.get("index", -1)
                                         if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
                                             attached_card_id = hand[card_idx].id
-                                        target_area = opt.get("inPlayArea", -1)
-                                        target_idx = opt.get("inPlayIndex", -1)
-                                        if target_area == 4: # ACTIVE
+                                        target_area = opt.get("inPlayArea", opt.get("area", opt.get("targetArea", -1)))
+                                        target_idx = opt.get("inPlayIndex", opt.get("index", opt.get("targetIndex", -1)))
+                                        if target_area == 4 or target_area == "active": # ACTIVE
                                             if len(state_ps.active) > 0 and state_ps.active[0] is not None:
                                                 attached_target_id = state_ps.active[0].id
                                                 target_energy = len(state_ps.active[0].energyCards) if hasattr(state_ps.active[0], "energyCards") else 0
-                                        elif target_area == 5: # BENCH
+                                        elif target_area == 5 or target_area == "bench": # BENCH
                                             if 0 <= target_idx < len(state_ps.bench) and state_ps.bench[target_idx] is not None:
                                                 attached_target_id = state_ps.bench[target_idx].id
                                                 target_energy = len(state_ps.bench[target_idx].energyCards) if hasattr(state_ps.bench[target_idx], "energyCards") else 0
@@ -329,12 +329,12 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                         card_idx = opt.get("index", -1)
                                         if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
                                             attached_card_id = hand[card_idx].id
-                                        target_area = opt.get("inPlayArea", -1)
-                                        target_idx = opt.get("inPlayIndex", -1)
-                                        if target_area == 4: # ACTIVE
+                                        target_area = opt.get("inPlayArea", opt.get("area", opt.get("targetArea", -1)))
+                                        target_idx = opt.get("inPlayIndex", opt.get("index", opt.get("targetIndex", -1)))
+                                        if target_area == 4 or target_area == "active": # ACTIVE
                                             if len(state_ps.active) > 0 and state_ps.active[0] is not None:
                                                 attached_target_id = state_ps.active[0].id
-                                        elif target_area == 5: # BENCH
+                                        elif target_area == 5 or target_area == "bench": # BENCH
                                             if 0 <= target_idx < len(state_ps.bench) and state_ps.bench[target_idx] is not None:
                                                 attached_target_id = state_ps.bench[target_idx].id
                                     elif opt_type_val == 9: # EVOLVE
@@ -507,20 +507,9 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     r_own_ko = - (own_kos * 0.15) if own_kos > 0 else 0.0
                     
                     action_type = pre.get("action_type", -1)
+                    # NOTE: Inline r_en was removed to eliminate duplicate reward calculation with energy_evaluator.py.
+                    # All energy attachment rewards and overcharge penalties are handled by r_strategic -> energy_evaluator pipeline.
                     r_en = 0.0
-                    if energy_attached > 0:
-                        attached_target = pre.get("attached_target_id", -1)
-                        target_card = get_card_data(attached_target) if attached_target > 0 else None
-                        max_req_en = 2
-                        if target_card and hasattr(target_card, "attacks"):
-                            costs = [len(attack_table[aid].energies) for aid in getattr(target_card, "attacks", []) if aid in attack_table]
-                            if costs:
-                                max_req_en = max(costs)
-                        target_curr_en = pre.get("target_energy", 0) if "target_energy" in pre else (pre.get("active_energies", 0) if attached_target == pre.get("active_id") else 0)
-                        if target_curr_en >= max_req_en:
-                            r_en = -0.50  # Overcharge penalty
-                        else:
-                            r_en = 0.05   # Useful energy attachment
                     r_no_en = -0.05 if (action_type != 8 and pre.get("has_energy_in_hand", False)) else 0.0
                         
                     comp_dict = calculate_strategic_reward_components(pre, post, action_type, step_idx, went_second, i, opponent_name)
@@ -541,7 +530,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         r_deck -= 0.50
                         
                     STRATEGIC_SCALE = 0.50
-                    step_reward = r_stall + r_prize_t + r_prize_l + r_ko + r_own_ko + r_en + r_no_en + r_bench + r_deck + (r_strategic * STRATEGIC_SCALE)
+                    step_reward = r_stall + r_prize_t + r_prize_l + r_ko + r_own_ko + r_no_en + r_bench + r_deck + (r_strategic * STRATEGIC_SCALE)
                     step_reward = max(-0.25, min(0.25, step_reward))
 
                     if i == my_player_idx:
@@ -549,7 +538,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         rc_worker["prize_lost"] += r_prize_l
                         rc_worker["kos"] += r_ko
                         rc_worker["own_kos"] += r_own_ko
-                        rc_worker["energy"] += r_en
+                        rc_worker["energy"] += comp_dict.get("r_attack_ready", 0.0)
                         rc_worker["no_energy"] += r_no_en
                         rc_worker["bench"] += r_bench
                         rc_worker["deckout"] += r_deck

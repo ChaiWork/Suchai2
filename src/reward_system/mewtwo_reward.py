@@ -16,20 +16,36 @@ except ImportError:
             return 1.0
 
 # Card ID Constants
-MEWTWO_EX_ID = 431
+BASIC_G_ENERGY_ID    = 1    # Basic {G} Energy
+TR_ENERGY_ID         = 15   # Team Rocket's Energy
+TAROUNTULA_ID        = 400  # Team Rocket's Tarountula
+SPIDOPS_ID           = 401  # Team Rocket's Spidops
+ARTICUNO_ID          = 414  # Team Rocket's Articuno
+MEWTWO_EX_ID         = 431  # Team Rocket's Mewtwo ex
+MIMIKYU_ID           = 434  # Team Rocket's Mimikyu
+
+TRANSCEIVER_ID       = 1134 # Team Rocket's Transceiver
+BUG_CATCHING_SET_ID  = 1094 # Bug Catching Set
+BRAVE_BANGLE_ID      = 1175 # Brave Bangle
+POKE_PAD_ID          = 1152 # Poké Pad
+NIGHT_STRETCHER_ID   = 1159 # Night Stretcher
+ARIANA_ID            = 1216 # Team Rocket's Ariana
+GIOVANNI_ID          = 1218 # Team Rocket's Giovanni
+
 SUPPORTER_IDS = frozenset({1216, 1218, 1219, 1220, 1227})
 TR_POKEMON_IDS = frozenset({400, 401, 414, 431, 434})
 EX_POKEMON_IDS = frozenset({431})
 
-MIN_STRATEGIC_REWARD = -0.25
-MAX_STRATEGIC_REWARD = 0.25
+MIN_STRATEGIC_REWARD = -0.10
+MAX_STRATEGIC_REWARD = 0.10
 
-# Rule & Safety Penalties (Deck-Agnostic / Rule-Enforced)
-PENALTY_T1_GOING_FIRST_SUPPORTER        = -0.20
-PENALTY_T1_EXPOSED_MEWTWO_EX            = -0.20
-PENALTY_MEWTWO_EX_ATTACK_UNDER_POWER     = -0.20
-PENALTY_EMPTY_BENCH_TURN_GT_1            = -0.08
-REWARD_REACH_FOUR_ROCKET_POKEMON         = 0.08
+# Rule & Safety Penalties — bounded expert safety layer, NOT a replacement for RL learning.
+# All values intentionally small so the neural network remains the final decision maker.
+PENALTY_T1_GOING_FIRST_SUPPORTER        = -0.08
+PENALTY_T1_EXPOSED_MEWTWO_EX            = -0.08
+PENALTY_MEWTWO_EX_ATTACK_UNDER_POWER     = -0.08
+PENALTY_EMPTY_BENCH_TURN_GT_1            = -0.05
+REWARD_REACH_FOUR_ROCKET_POKEMON         = 0.06
 
 
 def _count_tr_pokemon(bench_ids: Iterable[int], active_id: int) -> int:
@@ -41,15 +57,8 @@ def _count_tr_pokemon(bench_ids: Iterable[int], active_id: int) -> int:
     return count
 
 
-USEFUL_ENERGY_THRESHOLDS: dict[int, int] = {
-    431: 3,  # Mewtwo ex (3 energy)
-    401: 2,  # Spidops (2 energy)
-    400: 1,  # Tarountula (1 energy)
-    272: 2,  # Clefairy ex (2 energy)
-    414: 1,  # Articuno (1 energy pivot cap)
-    434: 1,  # Mimikyu (1 energy stall cap)
-    464: 1,  # Sneasel (1 energy pivot cap)
-}
+# NOTE: USEFUL_ENERGY_THRESHOLDS was removed — energy cost lookup is now handled
+# exclusively by energy_evaluator.get_required_energy() via the cg.api cache.
 
 
 
@@ -139,15 +148,16 @@ def calculate_mewtwo_strategic_reward(
         post_id = post.get("active_id", -1)
         pre_hp = pre.get("active_hp", 0)
 
-        # Penalize swapping out healthy, fully powered Mewtwo ex
+        # Penalize swapping out healthy, fully powered Mewtwo ex (bounded prior — RL decides ultimately)
         if pre_id == MEWTWO_EX_ID and post_id != MEWTWO_EX_ID and pre_e >= 3 and pre_hp >= 100:
-            _add(-0.35, "Penalty_Pointless_Switching_Healthy_Powered_Mewtwo_ex")
+            _add(-0.08, "Penalty_Pointless_Switching_Healthy_Powered_Mewtwo_ex")
 
         if action_type == 12:
-            if pre_id == MEWTWO_EX_ID and pre_e >= 1 and pre_hp >= 100:
-                _add(-0.40, "Penalty_Wasteful_Retreat_Discarding_Energy_From_Healthy_Mewtwo_ex")
-            elif pre_e >= 1 and pre_hp >= 60 and post_e <= 0:
-                _add(-0.30, "Penalty_Wasteful_Retreat_Discarding_Energy_From_Healthy_Active")
+            # base_reward.py computes the full V(S')−V(S) retreat delta (readiness + survival + energy cost).
+            # mewtwo_reward.py does NOT add a second flat penalty here — that would double-penalize every retreat.
+            # The only safety guard remaining is the switch-out of a healthy powered Mewtwo ex above (line 152).
+            pass  # intentionally empty — see comment above
+
 
     # D. Attack Execution Reward for Powered Mewtwo ex
     if action_type == 13:  # ATTACK
@@ -155,7 +165,7 @@ def calculate_mewtwo_strategic_reward(
         act_energy = pre.get("my_active_energy", 0)
         bench = pre.get("bench_ids", [])
         if act_id == MEWTWO_EX_ID and act_energy >= 3 and _count_tr_pokemon(bench, act_id) >= 4:
-            _add(0.15, "Reward_Attacking_With_Fully_Powered_Mewtwo_ex")
+            _add(0.08, "Reward_Attacking_With_Fully_Powered_Mewtwo_ex")
 
     # D. Power Saver ability requirement threshold check
     if action_type == 7:
@@ -171,11 +181,22 @@ def calculate_mewtwo_strategic_reward(
             _add(0.05, "Evolved_Bench_Spidops_Attacker")
 
     # F. Unpowered Exposed Active Mewtwo ex Penalty (Power Saver Unmet & Energy < 3)
+    # DESIGN NOTE: This was previously a continuous per-step penalty (-0.10 every step),
+    # which accumulated to -0.60 to -1.00 per episode during normal early-game setup turns
+    # (turns 1-6), overflowing the [-0.10, +0.10] clip and creating a noisy reward baseline.
+    # Fix: gate to turn > 3 (setup is legitimately incomplete on turns 1-3) and reduce
+    # magnitude to -0.03 so even 10 consecutive setup turns = -0.30 before decay, well
+    # within the accumulated episode reward range.
     post_act_id = post.get("active_id", -1)
     post_bench = post.get("bench_ids", [])
     post_energy = post.get("my_active_energy", 0)
-    if post_act_id == MEWTWO_EX_ID and _count_tr_pokemon(post_bench, post_act_id) < 4 and post_energy < 3:
-        _add(-0.10, "Penalty_Exposed_Unpowered_Active_Mewtwo_ex_Power_Saver_Unmet")
+    if (
+        post_act_id == MEWTWO_EX_ID
+        and _count_tr_pokemon(post_bench, post_act_id) < 4
+        and post_energy < 3
+        and turn > 3  # Setup is expected to be incomplete on turns 1-3; only penalize if delayed
+    ):
+        _add(-0.03, "Penalty_Exposed_Unpowered_Active_Mewtwo_ex_Power_Saver_Unmet")
 
 
     # -------------------------------------------------------------------------
@@ -195,6 +216,28 @@ def calculate_mewtwo_strategic_reward(
         opp_prizes_val = pre.get("opp_prizes", 6)
 
         is_active_target = (target_id == active_id)
+
+        # Explicit overcharge penalty for ANY Pokemon (Active or Bench) already at or above max required energy
+        try:
+            from src.expert_system.energy_evaluator import get_required_energy
+            req_energy = get_required_energy(target_id) if target_id > 0 else 2
+        except Exception:
+            req_energy = 2
+
+        if target_energy >= req_energy:
+            if is_active_target:
+                _add(-0.15, f"Penalty_Active_Energy_Overcharge_Target_{target_id}")
+            else:
+                _add(-0.15, f"Penalty_Bench_Energy_Overcharge_Target_{target_id}")
+
+        # Explicit Mimikyu energy cap penalty (max 1 energy on Mimikyu - ID 434)
+        if target_id == 434 and target_energy >= 1:
+            _add(-0.15, "Penalty_Mimikyu_Overcharge_Max_1_Energy")
+
+        # Explicit Mimikyu energy type restriction penalty (TR Energy ID 15 only, never Basic G)
+        if target_id == 434 and attached_id != 15 and attached_id > 0:
+            _add(-0.15, "Penalty_Mimikyu_Wrong_Energy_Type_Restricted_to_TR_Energy")
+
         en_r = compute_energy_attachment_reward(
             action_type=8,
             attached_card_id=attached_id,

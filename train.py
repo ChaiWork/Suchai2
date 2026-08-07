@@ -22,6 +22,10 @@ os.environ["TMPDIR"] = "D:/temp"
 os.environ["TEMP"] = "D:/temp"
 os.environ["TMP"] = "D:/temp"
 os.environ["TORCH_HOME"] = "D:/torch_cache"
+if sys.platform == "win32":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+else:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
 import torch
 import torch.nn
@@ -210,7 +214,7 @@ def main():
                          "r_energy", "r_bench", "r_deckout", "r_terminal", "r_stall", "r_no_energy", "r_strategic",
                          "r_knockout", "r_attack_ready", "r_backup_ready", "r_bench_setup", "r_evolution_progress", "r_stadium_value",
                          "r_retreat_eff", "r_damage_eff", "r_lethal_detection", "r_supporter_eff", "r_supporter_opp_cost",
-                         "r_hand_congestion", "r_deck_preservation", "r_missed_attack", "r_donk_prevention", "r_action_conv",
+                         "r_hand_congestion", "r_deck_preservation", "r_missed_attack", "r_slow_setup", "r_donk_prevention", "r_action_conv",
                          "r_search_quality", "r_search_tempo",
                          "avg_game_length", "policy_entropy", "action_diversity", "explained_variance", "mean_return", "mean_advantage", "value_prediction_mean"])
 
@@ -652,6 +656,11 @@ def main():
             model.train()
             batch_count = min(50, len(replay_buffer) // args.batch_size)
             print(f"Total training buffer size: {len(replay_buffer)}, Batch Count: {batch_count}")
+            if device.type == 'cuda':
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
             
             epoch_losses = []
             epoch_val_losses = []
@@ -808,6 +817,27 @@ def main():
             if args.self_play_episodes > 0:
                 print(f"Skipping training: collected buffer size ({len(replay_buffer)}) less than batch size ({args.batch_size}).")
 
+def safe_torch_save(obj, fpath, max_retries=3):
+    """Safely saves PyTorch checkpoint using atomic temp file replace to prevent Windows IO locks."""
+    tmp_path = f"{fpath}.tmp"
+    for attempt in range(max_retries):
+        try:
+            torch.save(obj, tmp_path)
+            if os.path.exists(fpath):
+                os.replace(tmp_path, fpath)
+            else:
+                os.rename(tmp_path, fpath)
+            return
+        except Exception:
+            if attempt == max_retries - 1:
+                try:
+                    torch.save(obj, fpath)
+                except Exception:
+                    pass
+            else:
+                time.sleep(0.1)
+
+
         avg_reward = sum(epoch_rewards) / len(epoch_rewards) if epoch_rewards else 0.0
 
         epoch_model_path = os.path.join(run_dir, f"model{counter}.pth")
@@ -817,8 +847,8 @@ def main():
                 "state_dict": model.state_dict(),
                 "optimizer_state": optimizer.state_dict()
             }
-        torch.save(checkpoint, epoch_model_path)
-        torch.save(checkpoint, "model.pth")
+        safe_torch_save(checkpoint, epoch_model_path)
+        safe_torch_save(checkpoint, "model.pth")
 
         try:
             from src.configs.active_deck import get_active_deck_name
@@ -827,11 +857,11 @@ def main():
             active_deck_tag = os.getenv("ACTIVE_DECK", "MEWTWO").lower()
 
         deck_model_name = f"model_{active_deck_tag}.pth"
-        torch.save(checkpoint, deck_model_name)
+        safe_torch_save(checkpoint, deck_model_name)
         
         if not args.disable_league:
             league_model_path = os.path.join(league_dir, f"model_epoch_{counter}_run_{version}.pth")
-            torch.save(checkpoint, league_model_path)
+            safe_torch_save(checkpoint, league_model_path)
             print(f"Saved checkpoint: {epoch_model_path}, model.pth, {deck_model_name}, and {league_model_path}")
         else:
             print(f"Saved checkpoint: {epoch_model_path}, model.pth, and {deck_model_name}")

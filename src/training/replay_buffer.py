@@ -1,3 +1,4 @@
+import numpy as np
 import random
 from agent import LearnSample
 
@@ -23,10 +24,11 @@ class PrioritizedReplayBuffer:
             self.pos = (self.pos + 1) % self.capacity
 
     def sample(self, batch_size: int, beta: float = 0.4) -> tuple[list[LearnSample], list[int], list[float]]:
-        total = sum(self.priorities)
         n = len(self.buffer)
-        probs = [p / total for p in self.priorities]
-        indices = random.choices(range(n), weights=probs, k=batch_size)
+        priorities_arr = np.array(self.priorities[:n], dtype=np.float32)
+        total = float(np.sum(priorities_arr))
+        probs = priorities_arr / max(1e-8, total)
+        indices = np.random.choice(n, size=batch_size, p=probs, replace=True)
         samples = [self.buffer[i] for i in indices]
 
         # Importance sampling weights to correct for priority sampling bias

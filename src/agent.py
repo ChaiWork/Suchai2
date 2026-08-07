@@ -343,7 +343,7 @@ def create_node(parent: Node | None,
                         try:
                             exp_bonus, _ = get_expert_bonus(obs_obj, opt, opponent_name=archetype, epoch=epoch)
                             if exp_bonus <= -0.20:
-                                bias -= 2.0
+                                bias -= 1.0  # Soft prior guidance (non-prohibitive, preserves AlphaZero exploration)
                             else:
                                 bias += exp_bonus * 1.0
                         except Exception:

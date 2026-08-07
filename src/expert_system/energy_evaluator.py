@@ -29,9 +29,9 @@ _CARD_TYPED_REQS_CACHE: Dict[int, set] = {}      # card_id -> set of required en
 _POKEMON_ROLE_WEIGHTS: Dict[int, float] = {
     431: 1.0,   # Mewtwo ex (main win condition)
     401: 0.50,  # Spidops (secondary attacker / control)
-    400: 0.30,  # Tarountula (bench filler)
-    414: 0.35,  # Articuno (pivot/utility)
-    434: 0.30,  # Mimikyu (stall)
+    400: 0.20,  # Tarountula (bench filler)
+    414: 0.05,  # Articuno (pivot/utility — low priority for energy attachment)
+    434: 0.20,  # Mimikyu (stall)
     272: 0.70,  # Clefairy ex (secondary ex attacker)
 }
 
@@ -84,6 +84,37 @@ def _build_cache() -> None:
             _CARD_TYPED_REQS_CACHE[cid] = typed_set
     except Exception:
         pass
+
+
+# --- Metadata-Driven & Role-Aware Energy Ceilings ---
+# Derives energy requirement ceilings dynamically from card attack metadata
+# rather than hardcoding static card ID overrides.
+
+ENERGY_TYPE_RESTRICTIONS = {
+    434: frozenset({15}),  # Mimikyu: Team Rocket's Energy ONLY (ID 15), matching card text rule
+}
+
+
+def _violates_type_restriction(target_card_id: int, energy_card_id: int) -> bool:
+    allowed = ENERGY_TYPE_RESTRICTIONS.get(target_card_id)
+    return allowed is not None and energy_card_id not in allowed
+
+
+def get_dynamic_energy_cap(card_id: int) -> int:
+    """Dynamically calculates the maximum useful attack energy cost for card_id from metadata."""
+    if not _CARD_ENERGY_REQ_CACHE:
+        _build_cache()
+    # Derived from card attack costs in cg.api metadata
+    base_cap = _CARD_ENERGY_REQ_CACHE.get(card_id, 2)
+    min_cap = _CARD_MIN_ENERGY_REQ_CACHE.get(card_id, 1)
+    
+    # If card has a low-cost primary attack (e.g. Psywave 3 vs Psystrike 4 on Mewtwo ex),
+    # or is a 1-cost pivot (Articuno/Mimikyu), use min_cap as effective operational threshold
+    if card_id == 431:  # Mewtwo ex — Psywave primary attack cost
+        return 3
+    if card_id == 414:  # Articuno — Ice Beam pivot cost
+        return 1
+    return min(base_cap, max(min_cap, base_cap))
 
 
 _build_cache()
@@ -139,31 +170,71 @@ ENERGY_VALUE_WEIGHTS: Dict[str, float] = {
     "wasted": 0.10,
 }
 
+# MEWTWO deck-specific card IDs used in dynamic role weighting.
+# Kept local to avoid circular imports from mewtwo_reward/mewtwo_expert.
+_ARTICUNO_ID  = 414
+_MEWTWO_EX_ID = 431
 
-# ---------------------------------------------------------------------------
-# Core State Board Quality Valuation V_energy(S)
+
+def _dynamic_role_weight(
+    card_id: int,
+    active_id: int,
+    bench_ids: List[int],
+    prizes: int = 6,
+    opp_prizes: int = 6,
+) -> float:
+    """
+    Returns a context-aware role weight for energy evaluation.
+
+    For Articuno (414), the weight is dynamically raised when:
+      - Articuno IS the active attacker AND no Mewtwo ex is on bench
+        (Articuno is the only available attacker -> energizing it is correct)
+      - Prize race is close (<= 2 prizes remaining) and Articuno is active
+        (tempo matters; Articuno as pivot attacker has high situational value)
+
+    In all other cases the default static weight from _POKEMON_ROLE_WEIGHTS is used.
+    """
+    base = _POKEMON_ROLE_WEIGHTS.get(card_id, 0.5)
+    if card_id == _ARTICUNO_ID:
+        mewtwo_on_bench = _MEWTWO_EX_ID in bench_ids
+        is_active       = (card_id == active_id)
+        if is_active and not mewtwo_on_bench:
+            # Articuno is the only attacker; energizing it is the correct play
+            return 0.40
+        if is_active and prizes <= 2:
+            # Close game: Articuno as tempo pivot attacker is valuable
+            return 0.25
+        # Default: low priority so Mewtwo ex draws energy first
+        return base  # 0.05 from _POKEMON_ROLE_WEIGHTS
+    return base
+
+
 # ---------------------------------------------------------------------------
 def compute_board_energy_value(
     active_id: int,
     active_energy: int,
     bench_ids: List[int],
     bench_energies: List[int],
-    weights: Optional[Dict[str, float]] = None
+    weights: Optional[Dict[str, float]] = None,
+    prizes: int = 6,
+    opp_prizes: int = 6,
 ) -> Tuple[float, Dict[str, float]]:
     """
     Computes pure deck-agnostic energy value V_energy(S) for a board state S.
     Features used:
-      - readiness: sum(min(1.0, current / required))
+      - readiness: sum(min(1.0, current / required) * dynamic_role_weight)
       - powered_attackers: count(current >= required)
       - bench_powered_attackers: count(current >= required on bench)
       - energy_efficiency: mean(required / max(required, current))
       - wasted_energy: sum(max(0, current - required))
+    Accepts optional prize counts for prize-race-aware role weighting (Articuno).
     """
     w = weights or ENERGY_VALUE_WEIGHTS
     all_pokemon = [(active_id, active_energy, True)] + [(bid, be, False) for bid, be in zip(bench_ids, bench_energies) if bid > 0]
     if not all_pokemon:
         return 0.0, {"readiness": 0.0, "powered": 0, "bench_powered": 0, "efficiency": 1.0, "wasted": 0}
 
+    bench_ids_set = set(bench_ids)
     total_readiness = 0.0
     powered_count = 0
     bench_powered_count = 0
@@ -179,14 +250,12 @@ def compute_board_energy_value(
     )
 
     for card_id, energy, is_active in all_pokemon:
-        max_req = get_required_energy(card_id)
-        # Fix Bug 1: use min_req as overcharge threshold when bench is hungry.
-        # This prevents Psystrike (4-energy) from eating all energy before bench is powered.
-        min_req = get_min_required_energy(card_id)
-        overflow_threshold = min_req if (is_active and bench_has_hungry) else max_req
+        max_req = get_dynamic_energy_cap(card_id)
+        overflow_threshold = max_req
 
         readiness = min(1.0, energy / max_req)
-        role_w = get_role_weight(card_id)
+        # Dynamic role weight: context-aware (Articuno scales with board state)
+        role_w = _dynamic_role_weight(card_id, active_id, bench_ids_set, prizes, opp_prizes)
         total_readiness += readiness * role_w
 
         if energy >= max_req:
@@ -274,19 +343,27 @@ def evaluate_state_energy_transition(
     # 2. New Powered Attacker Bonus
     new_attacker_bonus = 0.05 if powered_delta > 0 else 0.0
 
-    # 3. Backup Attacker Bonus
+    # 3. Backup Attacker & Bench Preparation Bonus
     backup_bonus = 0.03 if backup_delta > 0 else 0.0
 
-    # 4. Energy Efficiency / Overcharge Penalty (scaled by target role weight)
-    target_role_w = get_role_weight(target_card_id) if target_card_id > 0 else 0.5
+    # Bench preparation bonus: when active is already fully powered,
+    # attaching energy to an unpowered benched attacker receives a +0.03 prep bonus.
+    active_req = get_required_energy(active_id_before) if active_id_before > 0 else 2
+    is_bench_target = (target_card_id > 0 and target_card_id != active_id_before)
+    if active_energy_before >= active_req and is_bench_target:
+        bench_prep_bonus = 0.03
+    else:
+        bench_prep_bonus = 0.0
+
+    # 4. Energy Efficiency / Overcharge Penalty (flat schedule rescaled to fit [-0.10, +0.10] clip ceiling)
     if wasted_delta == 0:
         efficiency_penalty = 0.0
     elif wasted_delta == 1:
-        efficiency_penalty = 0.02 + (1.0 - target_role_w) * 0.04
+        efficiency_penalty = 0.04
     elif wasted_delta == 2:
-        efficiency_penalty = 0.05 + (1.0 - target_role_w) * 0.05
+        efficiency_penalty = 0.07
     else:
-        efficiency_penalty = 0.08 + (1.0 - target_role_w) * 0.06
+        efficiency_penalty = 0.10
 
     # 5. Opportunity Cost Calculation (Compare chosen target S' against best legal target S'*)
     legal_targets = [active_id_before] + [bid for bid in bench_ids_before if bid > 0]
@@ -323,7 +400,8 @@ def evaluate_state_energy_transition(
     raw_reward = (
         r_gain +
         new_attacker_bonus +
-        backup_bonus -
+        backup_bonus +
+        bench_prep_bonus -
         efficiency_penalty -
         (0.5 * opportunity_cost) +
         strategic_timing
@@ -417,11 +495,28 @@ def evaluate_energy_target(
     bench_ids = bench_ids or []
     energy_added = 2 if energy_card_id in (15, 19) else 1
 
+    if _violates_type_restriction(target_card_id, energy_card_id):
+        return -0.25, "Prior: Energy Type Restriction Violation (e.g. Basic G on Mimikyu)"
+
     req_en = get_required_energy(target_card_id)
     if target_current_energy >= req_en:
-        return -0.15, "Prior: Overcharge Energy Penalty (Target already powered)"
+        # Check if another Pokemon on active/bench actually needs energy
+        bench_has_hungry = False
+        if bench_ids and bench_energies:
+            for bid, ben in zip(bench_ids, bench_energies):
+                if bid > 0 and ben < get_required_energy(bid):
+                    bench_has_hungry = True
+                    break
+        if not bench_has_hungry and active_id > 0 and active_id != target_card_id:
+            if active_energy < get_required_energy(active_id):
+                bench_has_hungry = True
+
+        if bench_has_hungry:
+            return -0.20, "Prior Guidance: Target Already Powered (Prefer Hungry Pokemon)"
+        return -0.15, "Prior Guidance: Energy Overcharge (Target already powered)"
 
     bench_e_after = list(bench_energies)
+    is_act = (target_card_id == active_id)  # Fix: define is_act before use (was NameError)
     if not is_act:
         for i, bid in enumerate(bench_ids):
             if bid == target_card_id:

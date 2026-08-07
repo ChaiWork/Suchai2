@@ -84,7 +84,7 @@ BONUS_TACTICAL_SUPPORTER             = 0.10
 BONUS_REACH_FOUR_TR_POKEMON          = 0.16
 BONUS_TRANSCEIVER                    = 0.18
 BONUS_BUG_CATCHING                   = 0.16
-BONUS_EARLY_POFFIN                   = 0.22
+BONUS_EARLY_POFFIN                   = 0.18  # was 0.22 — capped at expert prior ceiling
 BONUS_LATE_POFFIN                    = 0.08
 
 BONUS_ULTRA_BALL                     = 0.14
@@ -283,6 +283,11 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
 
     # 1. PLAY CARD ACTIONS (OptionType.PLAY / 7)
     if opt_type in (getattr(OptionType, "PLAY", 7), 7):
+        # Anti-deckout guard: suppress draw/search cards when deck count is low (<= 5)
+        my_ps = ctx.get("my_ps")
+        deck_cnt = _get_val(my_ps, "deckCount", 60) if my_ps else 60
+        if deck_cnt <= 5 and card_id in (1134, 1135, 1136, 1256, 1258, 1259):
+            return -0.25, "Prior Penalty: Anti-Deckout Guard (Deck Count <= 5)"
         # A. Team Rocket Pokémon Play & 4-Pokémon Power Saver Unlock
         if card_id in TR_POKEMON_IDS:
             if tr_count == 3:
@@ -353,7 +358,7 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
             bench_counter_keywords = ("dragapult", "froslass", "dusknoir", "dusclops", "munkidori")
             is_bench_counter_meta = any(k in opponent_name.lower() for k in bench_counter_keywords) or opponent_name == "DRAGAPULT"
             if is_bench_counter_meta:
-                return 0.22, "Prior: Play Battle Cage Counter Dragapult/Froslass Bench Snipe"
+                return 0.20, "Prior: Play Battle Cage Counter Dragapult/Froslass Bench Snipe"
             return 0.18, "Prior: Play Battle Cage Active/Bench Protection"
 
         # D. Positioning & Tempo Items
@@ -363,9 +368,10 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
             active_e = ctx.get("my_active_energy", 0)
             active_hp = ctx.get("my_active_hp", 280)
 
-            # Prevent pointless switching of healthy, fully-powered active Mewtwo ex
+            # Discourage pointless switching of healthy, fully-powered active Mewtwo ex.
+            # Bounded prior: RL will override this if retreat is genuinely strategic.
             if active_id == MEWTWO_EX_ID and active_e >= 3 and active_hp >= 100 and tr_count >= 4:
-                return -0.35, "Prior Penalty: Do NOT switch out a healthy, fully-powered active Mewtwo ex"
+                return -0.12, "Prior Penalty: Switch out healthy powered Mewtwo ex (strongly discouraged)"
 
             # Penalize switching if neither active nor bench has energy
             if active_e == 0 and not has_bench_attacker:
@@ -408,17 +414,17 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
     # 2. ENERGY ATTACHMENT ACTIONS (OptionType.ATTACH / 8)
     elif opt_type in (getattr(OptionType, "ATTACH", 8), 8):
         if card_id > 0:
-            in_area = getattr(opt, "inPlayArea", 4) if not isinstance(opt, dict) else opt.get("inPlayArea", 4)
-            in_idx  = getattr(opt, "inPlayIndex", 0) if not isinstance(opt, dict) else opt.get("inPlayIndex", 0)
+            in_area = _get_val(opt, "inPlayArea", _get_val(opt, "area", _get_val(opt, "targetArea", 4)))
+            in_idx  = _get_val(opt, "inPlayIndex", _get_val(opt, "index", _get_val(opt, "targetIndex", 0)))
 
             target_poke = None
             my_ps = ctx.get("my_ps")
             if my_ps is not None:
                 active_list = _get_val(my_ps, "active", [])
                 bench_list  = _get_val(my_ps, "bench", [])
-                if in_area == 4 and active_list and active_list[0] is not None:
+                if (in_area == 4 or in_area == "active") and active_list and active_list[0] is not None:
                     target_poke = active_list[0]
-                elif in_area == 5 and bench_list and 0 <= in_idx < len(bench_list) and bench_list[in_idx] is not None:
+                elif (in_area == 5 or in_area == "bench") and bench_list and 0 <= in_idx < len(bench_list) and bench_list[in_idx] is not None:
                     target_poke = bench_list[in_idx]
 
             opt_target_energy = 0
@@ -427,7 +433,10 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
                 opt_target_energy = len(energies) if isinstance(energies, (list, tuple)) else 0
                 opt_target = _get_val(target_poke, "cardId", _get_val(target_poke, "id", -1))
             else:
-                opt_target = getattr(opt, "targetCardId", active_id) if not isinstance(opt, dict) else opt.get("targetCardId", active_id)
+                if (in_area == 5 or in_area == "bench") and 0 <= in_idx < len(ctx.get("my_bench_ids", [])):
+                    opt_target = ctx["my_bench_ids"][in_idx]
+                else:
+                    opt_target = _get_val(opt, "targetCardId", active_id) if not isinstance(opt, dict) else opt.get("targetCardId", active_id)
                 opt_target_energy = ctx.get("target_energy", 0)
 
             # Extract board context for generic evaluator
@@ -483,13 +492,16 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
         active_hp = ctx.get("my_active_hp", 280)
         active_energy = ctx.get("my_active_energy", 0)
 
+        # Bounded prior discouragement — not a hard block. RL remains the final decision maker.
+        # Rationale: retreating wastes energy and tempo; but the NN may discover edge cases
+        # (type disadvantage, poisoned, opponent lethal threat) where retreat IS correct.
         if active_id == MEWTWO_EX_ID and active_energy >= 1 and active_hp >= 100:
-            return -0.50, "Prior Penalty: Do NOT retreat healthy active Mewtwo ex with energy!"
+            return -0.12, "Prior Penalty: Retreat healthy powered Mewtwo ex (energy waste, strongly discouraged)"
         elif active_energy >= 1 and active_hp >= 80:
-            return -0.40, "Prior Penalty: Do NOT retreat healthy active with energy!"
+            return -0.10, "Prior Penalty: Retreat healthy active with energy (wasteful)"
         elif active_hp <= 30:
             return 0.15, "Prior: Tactical retreat of low-HP active"
-        return -0.20, "Prior Penalty: General wasteful retreat"
+        return -0.08, "Prior Penalty: General wasteful retreat"
 
     # 5. ATTACK ACTIONS (OptionType.ATTACK / 13)
     elif opt_type in (getattr(OptionType, "ATTACK", 13), 13):
@@ -522,8 +534,8 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
                         return 0.20, f"Prior: Spidops Lethal Window Bench{bench_size}"
                     return 0.15, f"Prior: Spidops Good Bench Attack {spidops_damage} Damage"
                 elif bench_size <= 1:
-                    # Thin bench — low damage, prefer to fill bench first
-                    return -0.08, f"Prior Penalty: Spidops Thin Bench ({bench_size}) Only {spidops_damage} Damage"
+                    # Thin bench — lower damage (20-40), but attacking is still ALWAYS positive over passing
+                    return 0.10, f"Prior: Spidops Thin Bench ({bench_size}) {spidops_damage} Damage Attack"
                 mewtwo_bench_present = MEWTWO_EX_ID in ctx["my_bench_ids"]
                 if mewtwo_bench_present:
                     return BONUS_SPIDOPS_ATTACK_MEWTWO_PRIORITY, "Prior: Spidops Attack (Mewtwo On Bench)"
