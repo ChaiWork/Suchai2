@@ -48,7 +48,9 @@ class MetricsLogger:
         "r_retreat_eff", "r_damage_eff", "r_lethal_detection", "r_supporter_eff", "r_supporter_opp_cost",
         "r_hand_congestion", "r_deck_preservation", "r_missed_attack", "r_donk_prevention", "r_action_conv",
         "r_search_quality", "r_search_tempo",
-        "avg_game_length", "policy_entropy", "action_diversity", "explained_variance", "mean_return", "mean_advantage", "value_prediction_mean"
+        "avg_game_length", "policy_entropy", "action_diversity", "explained_variance", "mean_return", "mean_advantage", "value_prediction_mean",
+        "reference_kl", "parameter_delta", "gradient_norm", "end_action_ratio", "attack_action_ratio", "attach_action_ratio", "play_action_ratio", "ability_action_ratio", "retreat_action_ratio",
+        "checkpoint_loaded", "checkpoint_epoch"
     ]
 
     ACTION_DIST_HEADER = [
@@ -125,6 +127,17 @@ class MetricsLogger:
         avg_return: float,
         avg_advantage: float,
         avg_val_pred: float,
+        reference_kl: float = 0.0,
+        parameter_delta: float = 0.0,
+        gradient_norm: float = 0.0,
+        end_action_ratio: float = 0.0,
+        attack_action_ratio: float = 0.0,
+        attach_action_ratio: float = 0.0,
+        play_action_ratio: float = 0.0,
+        ability_action_ratio: float = 0.0,
+        retreat_action_ratio: float = 0.0,
+        checkpoint_loaded: str = "",
+        checkpoint_epoch: int = 0,
     ) -> None:
         """Logs comprehensive epoch statistics with immediate disk synchronization."""
         row = [
@@ -143,7 +156,9 @@ class MetricsLogger:
             rc.get("r_missed_attack", 0.0) / rc_div, rc.get("r_donk_prevention", 0.0) / rc_div,
             rc.get("r_action_conv", 0.0) / rc_div,
             rc.get("r_search_quality", 0.0) / rc_div, rc.get("r_search_tempo", 0.0) / rc_div,
-            avg_gl, avg_entropy, avg_diversity, avg_exp_var, avg_return, avg_advantage, avg_val_pred
+            avg_gl, avg_entropy, avg_diversity, avg_exp_var, avg_return, avg_advantage, avg_val_pred,
+            reference_kl, parameter_delta, gradient_norm, end_action_ratio, attack_action_ratio, attach_action_ratio, play_action_ratio, ability_action_ratio, retreat_action_ratio,
+            checkpoint_loaded, checkpoint_epoch
         ]
         self._write_and_flush(self.metrics_path, row)
 

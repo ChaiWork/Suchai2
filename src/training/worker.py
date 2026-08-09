@@ -182,26 +182,19 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
     
                     if curr_player == my_player_idx:
                         turn = obs_class.current.turn if (obs_class.current is not None) else 1
-                        warmup_threshold = max(0, 5 - (current_epoch // 5))
-                        
-                        use_warmup = (turn <= warmup_threshold)
-                        if use_warmup:
-                            try:
-                                rb_selected = rule_based_opponent_agent("Rulebasedmodel_Mewtwo", obs)
-                                temperature = 1.0 if turn <= 15 else 0.1
-                                selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature, force_action=rb_selected, opponent_name=opponent_name, epoch=current_epoch)
-                            except Exception as e:
-                                use_warmup = False
-                                
-                        if not use_warmup:
-                            temperature = 1.0 if turn <= 15 else 0.1
-                            try:
-                                selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=temperature, opponent_name=opponent_name, epoch=current_epoch)
-                            except Exception as mcts_err:
-                                selected = [0]
-                                sample = None
-                            if sample is not None:
-                                sample.pred_val = sample.value
+                        temperature = 1.0 if turn <= 15 else 0.1
+                        try:
+                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=100, temperature=temperature, opponent_name=opponent_name, epoch=current_epoch)
+                        except Exception as mcts_err:
+                            import traceback
+                            import sys
+                            print(f"[MCTS FALLBACK] worker={worker_id} epoch={current_epoch} turn={obs_class.current.turn}: {mcts_err}", file=sys.stderr)
+                            traceback.print_exc(file=sys.stderr)
+                            sys.stderr.flush()
+                            selected = [0]
+                            sample = None
+                        if sample is not None:
+                            sample.pred_val = sample.value
                             
                             if selected and len(selected) > 0:
                                 try:
@@ -487,15 +480,18 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                     active_energy_attached = post.get("active_energy", 0) - pre.get("active_energy", 0)
                     bench_energy_attached = energy_attached - active_energy_attached
                     
+                    action_type = pre.get("action_type", -1)
+                    
                     lockout_turns = pre.get("lockout_turns", 0)
                     opp_deck_size = pre.get("opp_deck_size", 40)
-                    if opp_deck_size <= 5:
+                    if action_type not in (0, 14):  # Active move (play, attach, evolve, attack, etc.)
+                        r_stall = 0.0
+                    elif opp_deck_size <= 5:
                         r_stall = 0.0
                     else:
                         r_stall = -0.002
                         if lockout_turns > 3:
                             r_stall -= min(0.05, 0.005 * (lockout_turns - 3))
-                        
                     r_prize_t = prizes_taken * 0.5 if prizes_taken > 0 else 0.0
                     if prizes_taken > 0 and not has_taken_prize_flag:
                         r_prize_t += 0.50
@@ -506,8 +502,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         has_lost_prize_flag = True
                     r_ko = prizes_taken * 0.30 if prizes_taken > 0 else 0.0
                     r_own_ko = - (own_kos * 0.15) if own_kos > 0 else 0.0
-                    
-                    action_type = pre.get("action_type", -1)
+
                     # NOTE: Inline r_en was removed to eliminate duplicate reward calculation with energy_evaluator.py.
                     # All energy attachment rewards and overcharge penalties are handled by r_strategic -> energy_evaluator pipeline.
                     r_en = 0.0

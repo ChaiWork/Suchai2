@@ -51,15 +51,15 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
     pre_opp_pk = pre.get("opp_pokemon", 0)
     post_opp_pk = post.get("opp_pokemon", 0)
     if pre_opp_pk > post_opp_pk and post_opp_pk >= 0 and pre_opp_pk > 0:
-        components["r_knockout"] = (pre_opp_pk - post_opp_pk) * 0.15
+        components["r_knockout"] = (pre_opp_pk - post_opp_pk) * 0.25
 
     pre_opp_hp = pre.get("opp_active_hp", 0)
     post_opp_hp = post.get("opp_active_hp", 0)
     if pre_opp_hp > post_opp_hp and pre_opp_hp > 0:
         opp_hp_loss = pre_opp_hp - post_opp_hp
-        components["r_damage_eff"] = min(0.10, (opp_hp_loss / 200.0) * 0.10)
+        components["r_damage_eff"] = min(0.15, (opp_hp_loss / 200.0) * 0.15)
         if post_opp_hp <= 0:
-            components["r_lethal_detection"] = 0.12
+            components["r_lethal_detection"] = 0.20
 
     # 2. Board Power & Attack Readiness
     # Use API-driven minimum attack cost so r_attack_ready fires at the correct threshold
@@ -77,7 +77,7 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
     except Exception:
         _attack_threshold = 2  # Safe fallback if cg.api cache unavailable
     if post_act_en >= _attack_threshold and pre_act_en < _attack_threshold:
-        components["r_attack_ready"] = 0.15
+        components["r_attack_ready"] = 0.20
     elif action_type == 8 and pre_act_en >= _attack_threshold and post_act_en > pre_act_en:
         # Active is ALREADY powered — harshly penalize over-attaching energy to active (-0.25)
         components["r_attack_ready"] = -0.25
@@ -94,31 +94,31 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
     # 3. Early Bench Setup & Donk Guard
     turn_curr = post.get("turn", 1)
     if post_bench_size > pre_bench_size and turn_curr <= 3:
-        components["r_bench_setup"] = min(0.08, 0.04 * (post_bench_size - pre_bench_size))
+        components["r_bench_setup"] = min(0.10, 0.05 * (post_bench_size - pre_bench_size))
 
     if post_bench_size == 0 and turn_curr <= 2:
         components["r_donk_prevention"] = -0.20
 
     # 4. Evolution Progress
     if action_type == 9:  # EVOLVE
-        components["r_evolution_progress"] = 0.08
+        components["r_evolution_progress"] = 0.10
 
     # 5. Supporter Play & Opportunity Cost
     played_card_id = pre.get("played_card_id", -1)
     if action_type == 7 and played_card_id in SUPPORTER_IDS:
-        components["r_supporter_eff"] = 0.05
+        components["r_supporter_eff"] = 0.08
 
     post_hand_ids = post.get("hand_ids", [])
     has_supporter_in_hand = any(cid in SUPPORTER_IDS for cid in post_hand_ids)
     if action_type in (0, 14) and (played_card_id not in SUPPORTER_IDS) and has_supporter_in_hand:  # END_TURN
-        components["r_supporter_opp_cost"] = -0.08
+        components["r_supporter_opp_cost"] = -0.02
 
     # 6. Search Quality & Tempo
     # r_search_quality is a tempo-only signal (resources spent searching).
     # Card-level quality is already evaluated by mewtwo_expert search candidate priors.
     if (action_type == 7 and played_card_id in SEARCH_CARD_IDS) or action_type == 3:
-        components["r_search_quality"] = 0.03   # halved — quality lives in card-select priors
-        components["r_search_tempo"] = 0.03
+        components["r_search_quality"] = 0.05   # quality lives in card-select priors
+        components["r_search_tempo"] = 0.05
 
     # 7. Action Conversion & Hand Congestion
     # Require genuine board development (energy attached to active/bench or bench expanded)
@@ -126,7 +126,7 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
         pre_total_en = pre.get("energy", 0)
         post_total_en = post.get("energy", 0)
         if post_total_en > pre_total_en or post_bench_size > pre_bench_size or action_type == 9:
-            components["r_action_conv"] = 0.04
+            components["r_action_conv"] = 0.08
 
     post_hand_size = post.get("hand_size", 0)
     if post_hand_size > 10 and action_type == 7:

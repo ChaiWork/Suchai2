@@ -90,7 +90,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for model training (default: 128)")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate (default: 5e-5)")
     parser.add_argument("--patience", type=int, default=10, help="Patience for early stopping based on evaluation win rate (default: 10)")
-    parser.add_argument("--buffer-size", type=int, default=50000, help="Capacity of the Prioritized Replay Buffer (default: 50000)")
+    parser.add_argument("--buffer-size", type=int, default=20000, help="Capacity of the Prioritized Replay Buffer (default: 20000)")
     default_workers = min(8, max(1, mp.cpu_count() - 1)) if sys.platform == "win32" else max(1, mp.cpu_count() - 1)
     parser.add_argument("--num-workers", type=int, default=default_workers, help="Number of parallel worker processes")
     parser.add_argument("--disable-league", action="store_true", help="Disable league play and checkpoint saving in league directory")
@@ -183,6 +183,37 @@ def main():
         print("--> [--reset-epoch] Resetting epoch counter to 0! Full expert guidance (100%) & LR schedule restored while preserving all trained model weights.")
         start_epoch = 0
 
+    import copy
+    reference_model = copy.deepcopy(model)
+    reference_model.eval()
+    for p in reference_model.parameters():
+        p.requires_grad = False
+
+    def compute_model_norm(m):
+        return torch.norm(torch.stack([torch.norm(p.detach()) for p in m.parameters() if p.requires_grad])).item()
+
+    def compute_module_norm(mod):
+        return torch.norm(torch.stack([torch.norm(p.detach()) for p in mod.parameters()])).item()
+
+    model_param_norm = compute_model_norm(model)
+    policy_head_norm = compute_module_norm(model.decoder_fc)
+    value_head_norm = compute_module_norm(model.encoder_fc)
+
+    print("\n" + "="*50)
+    print("CHECKPOINT AUDIT")
+    print("="*50)
+    print(f"checkpoint_path:                       {target_ckpt if target_ckpt else 'None (random init)'}")
+    print(f"checkpoint_exists:                     {bool(target_ckpt and os.path.exists(target_ckpt))}")
+    print(f"checkpoint_epoch:                      {start_epoch}")
+    print(f"model_loaded:                          {bool(target_ckpt)}")
+    print(f"optimizer_loaded:                      {bool(target_ckpt)}")
+    print(f"scheduler_loaded:                      {bool(target_ckpt)}")
+    print(f"model_parameter_norm:                  {model_param_norm:.4f}")
+    print(f"model_parameter_delta_from_checkpoint: 0.0000")
+    print(f"policy_head_norm:                      {policy_head_norm:.4f}")
+    print(f"value_head_norm:                       {value_head_norm:.4f}")
+    print("="*50 + "\n")
+
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 
     league_dir = "out/league"
@@ -264,6 +295,21 @@ def main():
     inference_server = GPUInferenceServer(model, parent_conns, model_lock, batch_size=args.batch_size)
     inference_server.start(device)
     print("GPU Inference Server started successfully.")
+
+    if args.eval_episodes > 0:
+        print("\n--> Running pre-training evaluation using loaded checkpoint...")
+        pre_test_opponents = [opp for opp in tier1_opponents if opp in opponent_decks] or all_opponent_names
+        _, pre_eval_wr, _, _, _, _ = run_sprt_evaluation(
+            command_queues, result_queue, num_workers, sample_deck, opponent_decks, pre_test_opponents,
+            alpha=0.05, beta=0.1, p0=0.50, p1=0.54, max_eval_games=min(20, args.eval_episodes)
+        )
+        print("\n" + "="*50)
+        print("LOADED CHECKPOINT EVALUATION")
+        print("="*50)
+        print(f"loaded_checkpoint_win_rate: {pre_eval_wr:.2f}%")
+        print("="*50 + "\n")
+        if best_win_rate < 0:
+            best_win_rate = pre_eval_wr
 
     counter = start_epoch
 
@@ -357,11 +403,29 @@ def main():
             elif decision is False:
                 patience_counter += 1
                 print(f"  -> Model rejected. No improvement for {patience_counter} consecutive epochs.")
+                if best_win_rate > 0 and win_rate < (best_win_rate - 15.0):
+                    print(f"  -> [AUTOMATIC ROLLBACK] Severe win rate regression detected ({win_rate:.1f}% vs best {best_win_rate:.1f}%). Restoring best model checkpoint!")
+                    best_ckpt = os.path.join(run_dir, "best_model.pth")
+                    if not os.path.exists(best_ckpt) and os.path.exists("best_model.pth"):
+                        best_ckpt = "best_model.pth"
+                    if os.path.exists(best_ckpt):
+                        CheckpointManager.load_checkpoint(best_ckpt, model, optimizer, scheduler, device)
                 if patience_counter >= args.patience:
                     print(f"Early stopping triggered.")
                     break
         
         if args.self_play_episodes > 0:
+            p1_norm = compute_model_norm(model)
+            p1_hash = hex(abs(hash(tuple(p.view(-1)[0].item() for p in model.parameters() if p.requires_grad))))[-8:]
+            print("\n" + "-"*30)
+            print("SELF PLAY AUDIT")
+            print("-" * 30)
+            print(f"player_1_checkpoint:       active_model (epoch {counter})")
+            print(f"player_2_checkpoint:       mixed (league/rulebased/self)")
+            print(f"player_1_parameter_hash:   {p1_hash}")
+            print(f"player_1_parameter_norm:   {p1_norm:.4f}")
+            print("-" * 30 + "\n")
+
             drain_queue(result_queue)
             games_sent = 0
             games_received = 0
@@ -519,11 +583,12 @@ def main():
         epoch_losses, epoch_val_losses, epoch_pol_losses = [], [], []
         epoch_entropies, epoch_diversities, epoch_exp_vars = [], [], []
         epoch_returns, epoch_advantages, epoch_val_preds = [], [], []
+        epoch_ref_kls, epoch_param_deltas, epoch_grad_norms = [], [], []
 
         if len(replay_buffer) >= args.batch_size:
             trained_this_epoch = True
             model.train()
-            batch_count = min(50, len(replay_buffer) // args.batch_size)
+            batch_count = min(20, len(replay_buffer) // args.batch_size)
 
             for i in range(batch_count):
                 try:
@@ -565,13 +630,25 @@ def main():
                             torch.tensor(input_dec.offset, dtype=torch.int32, device=device)
                         )
 
+                        with torch.no_grad():
+                            ref_enc, ref_dec = reference_model(
+                                torch.tensor(input_enc.index, dtype=torch.int32, device=device),
+                                torch.tensor(input_enc.value, dtype=torch.float32, device=device),
+                                torch.tensor(input_enc.offset, dtype=torch.int32, device=device),
+                                torch.tensor(input_dec.index, dtype=torch.int32, device=device),
+                                torch.tensor(input_dec.value, dtype=torch.float32, device=device),
+                                torch.tensor(input_dec.offset, dtype=torch.int32, device=device)
+                            )
+                            ref_logits = torch.clamp(ref_dec.float(), min=-20.0, max=20.0).masked_fill(mask_tensor == 0, -100.0)
+                            ref_log_probs = torch.nn.functional.log_softmax(ref_logits, dim=-1)
+
                         is_weight_tensor = torch.tensor(is_weights, dtype=torch.float32, device=device).view(args.batch_size, 1)
 
                         loss_enc_elem = torch.nn.functional.huber_loss(out_enc, label_tensor_enc, reduction="none", delta=1.0)
                         loss_enc = (loss_enc_elem * is_weight_tensor).mean()
 
-                        out_dec_fp32 = out_dec.float()
-                        valid_logits = out_dec_fp32.masked_fill(mask_tensor == 0, -1e4)
+                        out_dec_fp32 = torch.clamp(out_dec.float(), min=-20.0, max=20.0)
+                        valid_logits = out_dec_fp32.masked_fill(mask_tensor == 0, -100.0)
                         log_probs = torch.nn.functional.log_softmax(valid_logits, dim=-1)
 
                         LABEL_SMOOTHING = 0.05
@@ -581,21 +658,31 @@ def main():
                         loss_dec_ce = -(smoothed_labels * log_probs * mask_tensor)
                         loss_dec_ce = (loss_dec_ce.sum(dim=-1, keepdim=True) * is_weight_tensor).mean()
 
-                        dist = torch.distributions.Categorical(logits=valid_logits)
-                        policy_entropy = dist.entropy().mean()
-
-                        if counter <= 20:
-                            ENTROPY_WEIGHT = 0.02
-                        elif counter <= 50:
-                            ENTROPY_WEIGHT = 0.01
-                        else:
-                            ENTROPY_WEIGHT = 0.005
-
-                        # Standard AlphaZero/PPO Loss Weighting: L_policy + 0.5 * L_value - c_2 * Entropy
-                        VALUE_LOSS_WEIGHT = 0.5
-                        loss = loss_dec_ce + VALUE_LOSS_WEIGHT * loss_enc - ENTROPY_WEIGHT * policy_entropy
+                        ref_probs = torch.exp(ref_log_probs) * mask_tensor
+                        batch_ref_kl = (ref_probs * (ref_log_probs - log_probs) * mask_tensor).sum(dim=-1).mean().item()
+                        batch_ref_kl = max(0.0, batch_ref_kl)
 
                         probs = torch.exp(log_probs) * mask_tensor
+                        policy_entropy = -((probs * log_probs * mask_tensor).sum(dim=-1) / n_valid_actions.squeeze(-1)).mean()
+                        policy_entropy = torch.nan_to_num(policy_entropy, nan=0.0)
+
+                        if counter <= 20:
+                            ENTROPY_WEIGHT = 0.035
+                        elif counter <= 50:
+                            ENTROPY_WEIGHT = 0.025
+                        else:
+                            ENTROPY_WEIGHT = 0.015
+
+                        # Standard AlphaZero/PPO Loss Weighting: L_policy + 0.25 * L_value - c_2 * Entropy
+                        VALUE_LOSS_WEIGHT = 0.25
+                        loss = loss_dec_ce + VALUE_LOSS_WEIGHT * loss_enc - ENTROPY_WEIGHT * policy_entropy
+
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f"[WARNING] NaN/Inf loss detected on training batch {i}. Skipping gradient update to protect model weights!")
+                            with model_lock:
+                                optimizer.zero_grad(set_to_none=True)
+                            continue
+
                         diversity_elem = ((probs > 0.01).float().sum(dim=-1, keepdim=True) / n_valid_actions).mean()
                         var_y = torch.var(label_tensor_enc)
                         exp_var = 1.0 - (torch.var(label_tensor_enc - out_enc) / (var_y + 1e-8))
@@ -606,17 +693,26 @@ def main():
                         epoch_returns.append(label_tensor_enc.mean().item())
                         epoch_advantages.append(is_weight_tensor.mean().item())
                         epoch_val_preds.append(out_enc.mean().item())
+                        epoch_ref_kls.append(batch_ref_kl)
 
                     if scaler is not None:
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        g_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        g_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
                         optimizer.step()
+
+                    p_delta = torch.norm(torch.stack([
+                        torch.norm(p.detach() - ref_p.detach())
+                        for p, ref_p in zip(model.parameters(), reference_model.parameters())
+                    ])).item()
+
+                    epoch_grad_norms.append(g_norm)
+                    epoch_param_deltas.append(p_delta)
 
                     epoch_losses.append(loss.item())
                     epoch_val_losses.append(loss_enc.item())
@@ -648,6 +744,7 @@ def main():
             avg_val_loss = sum(epoch_val_losses) / len(epoch_val_losses) if epoch_val_losses else 0.0
             avg_pol_loss = sum(epoch_pol_losses) / len(epoch_pol_losses) if epoch_pol_losses else 0.0
             print(f"Training Complete. Avg Total Loss: {avg_loss:.4f} (Value Loss: {avg_val_loss:.4f}, Policy Loss: {avg_pol_loss:.4f})")
+            scheduler.step()
         else:
             print(f"Skipping training update (replay buffer size {len(replay_buffer)} < batch size {args.batch_size}).")
 
@@ -671,14 +768,29 @@ def main():
         avg_return = sum(epoch_returns) / len(epoch_returns) if epoch_returns else 0.0
         avg_advantage = sum(epoch_advantages) / len(epoch_advantages) if epoch_advantages else 0.0
         avg_val_pred = sum(epoch_val_preds) / len(epoch_val_preds) if epoch_val_preds else 0.0
+        avg_ref_kl = sum(epoch_ref_kls) / len(epoch_ref_kls) if epoch_ref_kls else 0.0
+        avg_param_delta = sum(epoch_param_deltas) / len(epoch_param_deltas) if epoch_param_deltas else 0.0
+        avg_grad_norm = sum(epoch_grad_norms) / len(epoch_grad_norms) if epoch_grad_norms else 0.0
         rc_div = max(1, rc_count)
+
+        total_act_count = max(1, sum(epoch_action_counts.values()))
+        end_act_ratio = epoch_action_counts.get("end", 0) / total_act_count
+        attack_act_ratio = epoch_action_counts.get("attack", 0) / total_act_count
+        attach_act_ratio = epoch_action_counts.get("attach", 0) / total_act_count
+        play_act_ratio = epoch_action_counts.get("play", 0) / total_act_count
+        ability_act_ratio = epoch_action_counts.get("ability", 0) / total_act_count
+        retreat_act_ratio = epoch_action_counts.get("retreat", 0) / total_act_count
 
         win_rate = (epoch_self_play_wins / max(1.0, epoch_self_play_games)) * 100.0 if epoch_self_play_games > 0 else 0.0
         wr_first, wr_second = 0.0, 0.0 # simplified for brevity
         
         logger.log_epoch_metrics(
             counter, win_rate, wr_first, wr_second, avg_loss, avg_val_loss, avg_pol_loss, avg_reward,
-            rc, rc_div, avg_gl, avg_entropy, avg_diversity, avg_exp_var, avg_return, avg_advantage, avg_val_pred
+            rc, rc_div, avg_gl, avg_entropy, avg_diversity, avg_exp_var, avg_return, avg_advantage, avg_val_pred,
+            reference_kl=avg_ref_kl, parameter_delta=avg_param_delta, gradient_norm=avg_grad_norm,
+            end_action_ratio=end_act_ratio, attack_action_ratio=attack_act_ratio, attach_action_ratio=attach_act_ratio,
+            play_action_ratio=play_act_ratio, ability_action_ratio=ability_act_ratio, retreat_action_ratio=retreat_act_ratio,
+            checkpoint_loaded=target_ckpt, checkpoint_epoch=start_epoch
         )
         logger.log_deck_matchup(counter, epoch_deck_stats)
         logger.log_action_distribution(counter, epoch_action_counts)
