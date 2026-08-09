@@ -28,8 +28,8 @@ _CARD_HP_CACHE: Dict[int, int] = {}              # card_id -> max HP
 _CARD_TYPED_REQS_CACHE: Dict[int, set] = {}      # card_id -> set of required energy type codes
 _POKEMON_ROLE_WEIGHTS: Dict[int, float] = {
     431: 1.0,   # Mewtwo ex (main win condition)
-    401: 0.50,  # Spidops (secondary attacker / control)
-    400: 0.20,  # Tarountula (bench filler)
+    401: 0.85,  # Spidops (secondary attacker / bench energy battery for Erasure Ball KO scaling)
+    400: 0.25,  # Tarountula (bench filler / pre-evolution)
     414: 0.05,  # Articuno (pivot/utility — low priority for energy attachment)
     434: 0.20,  # Mimikyu (stall)
     272: 0.70,  # Clefairy ex (secondary ex attacker)

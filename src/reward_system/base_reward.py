@@ -47,19 +47,20 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
         "r_search_tempo": 0.0,
     }
 
-    # 1. Knockout Execution & Damage Efficiency & Lethal Detection
+    # 1. Knockout Execution & Damage Efficiency & Lethal Detection (MAIN WIN OBJECTIVE: DOMINANT REWARD SIGNAL)
     pre_opp_pk = pre.get("opp_pokemon", 0)
     post_opp_pk = post.get("opp_pokemon", 0)
     if pre_opp_pk > post_opp_pk and post_opp_pk >= 0 and pre_opp_pk > 0:
-        components["r_knockout"] = (pre_opp_pk - post_opp_pk) * 0.25
+        prizes_taken = pre_opp_pk - post_opp_pk
+        components["r_knockout"] = prizes_taken * 0.40  # Dominant KO prize reward signal
 
     pre_opp_hp = pre.get("opp_active_hp", 0)
     post_opp_hp = post.get("opp_active_hp", 0)
     if pre_opp_hp > post_opp_hp and pre_opp_hp > 0:
         opp_hp_loss = pre_opp_hp - post_opp_hp
-        components["r_damage_eff"] = min(0.15, (opp_hp_loss / 200.0) * 0.15)
+        components["r_damage_eff"] = min(0.20, (opp_hp_loss / 200.0) * 0.20)
         if post_opp_hp <= 0:
-            components["r_lethal_detection"] = 0.20
+            components["r_lethal_detection"] = 0.35  # High priority lethal KO completion reward
 
     # 2. Board Power & Attack Readiness
     # Use API-driven minimum attack cost so r_attack_ready fires at the correct threshold
@@ -87,17 +88,22 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
     pre_bench_en = sum(pre.get("bench_energies", [])) if "bench_energies" in pre else max(0, pre.get("energy", 0) - pre_act_en)
     post_bench_en = sum(post.get("bench_energies", [])) if "bench_energies" in post else max(0, post.get("energy", 0) - post_act_en)
 
-    # Symmetrical bench energy preparation reward: award +0.15 whenever energy on bench increases
+    # Symmetrical bench energy preparation reward: award +0.35 whenever energy on bench increases
     if post_bench_en > pre_bench_en:
-        components["r_backup_ready"] = 0.15
+        components["r_backup_ready"] = 0.35
 
-    # 3. Early Bench Setup & Donk Guard
+    # 3. Early Bench Setup, Donk Guard & 5-Bench Spidops Damage Scaling
     turn_curr = post.get("turn", 1)
-    if post_bench_size > pre_bench_size and turn_curr <= 3:
-        components["r_bench_setup"] = min(0.10, 0.05 * (post_bench_size - pre_bench_size))
+    if post_bench_size > pre_bench_size:
+        if post_bench_size == 5:
+            components["r_bench_setup"] = 0.25  # Max reward for expanding to full 5 bench slots (Spidops damage scaling & Power Saver stability)
+        elif pre_bench_size < 2 and turn_curr >= 5:
+            components["r_bench_setup"] = 0.25  # Rebuilding empty/low bench in mid-game prevents 25-turn stalling
+        elif turn_curr <= 4 or post_bench_size >= 3:
+            components["r_bench_setup"] = min(0.20, 0.10 * (post_bench_size - pre_bench_size))
 
-    if post_bench_size == 0 and turn_curr <= 2:
-        components["r_donk_prevention"] = -0.20
+    if post_bench_size == 0 and turn_curr <= 6:
+        components["r_donk_prevention"] = -0.50
 
     # 4. Evolution Progress
     if action_type == 9:  # EVOLVE
@@ -164,26 +170,27 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
         readiness_delta = post_readiness - pre_readiness
         survival_delta  = post_survival  - pre_survival
 
-        # Only charge an energy cost penalty when the discarded active was healthy.
-        # If pre_hp < 40 the active was dying — the survival loss already covers the cost.
-        if pre_hp >= 80 and pre_act_en > 0:
-            energy_cost = -0.10 * pre_act_en   # softer than -0.15; correctness depends on V delta
+        # Powered/Healthy Attacker Retreat Penalty:
+        # If pre-active had ANY energy (>= 1) AND (pre_hp > 30 or had legal attack option),
+        # retreating discards energy and wastes turn tempo.
+        had_legal_attack = pre.get("has_attack_option", False)
+        if pre_act_en >= 1 and (pre_hp > 30 or had_legal_attack):
+            components["r_retreat_eff"] = -0.50
         else:
-            energy_cost = 0.0
+            energy_cost = -0.10 * pre_act_en if (pre_hp >= 80 and pre_act_en > 0) else 0.0
+            board_delta = 0.60 * readiness_delta + 0.40 * survival_delta + energy_cost
+            components["r_retreat_eff"] = max(-0.50, min(0.10, board_delta))
 
-        board_delta = 0.60 * readiness_delta + 0.40 * survival_delta + energy_cost
-        components["r_retreat_eff"] = max(-0.25, min(0.10, board_delta))
-
-    # 9. Anti-Deckout Warning & Smooth Deck Preservation (Triggers smoothly at <= 8 cards)
+    # 9. Anti-Deckout Warning & Smooth Deck Preservation (Triggers at <= 6 cards remaining)
     deck_cnt_post = post.get("deck_size", 60)
-    if deck_cnt_post <= 8:
-        preservation_scale = (8.0 - deck_cnt_post) / 8.0
-        base_preservation = -0.04 * preservation_scale
+    if deck_cnt_post <= 6:
+        preservation_scale = (6.0 - deck_cnt_post) / 6.0
+        base_preservation = -0.10 - (0.25 * preservation_scale)
         played_card_id = pre.get("played_card_id", -1)
         DRAW_SEARCH_CARDS = frozenset({1134, 1135, 1136, 1256, 1258, 1259})
         if action_type in (7, 3) and (played_card_id in DRAW_SEARCH_CARDS or played_card_id in SUPPORTER_IDS):
-            base_preservation -= 0.10 * preservation_scale
-        components["r_deck_preservation"] = max(-0.20, base_preservation)
+            base_preservation -= 0.30 * preservation_scale
+        components["r_deck_preservation"] = max(-0.50, base_preservation)
 
     # 10. Stadium Deployment — state-transition delta: value(new_stadium) - value(replaced_stadium).
     # Replaces fixed +0.06 so that playing Battle Cage over TR Factory is penalized, not rewarded.
@@ -205,13 +212,10 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
 
     # 11. Missed Attack Penalty (powered attacker passed without attacking)
     # Requires a *legal* attack option in the pre-state, not just sufficient energy.
-    # This avoids penalizing correct plays:
-    #   - Bench + attach + Boss then KO next turn (Mimikyu immunity wall)
-    #   - End turn when only available attack does 0 damage (immunity)
     act_ready = (pre_act_en >= _attack_threshold)
     had_legal_attack = pre.get("has_attack_option", False)
     if action_type in (0, 14) and act_ready and had_legal_attack and (pre_opp_hp - post_opp_hp <= 0):
-        components["r_missed_attack"] = -0.25
+        components["r_missed_attack"] = -0.40
 
     # 12. Slow Setup / Idle Pass Penalty (turns 2-5 with zero energy or empty bench)
     if action_type in (0, 14):

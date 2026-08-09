@@ -181,22 +181,15 @@ def calculate_mewtwo_strategic_reward(
             _add(0.05, "Evolved_Bench_Spidops_Attacker")
 
     # F. Unpowered Exposed Active Mewtwo ex Penalty (Power Saver Unmet & Energy < 3)
-    # DESIGN NOTE: This was previously a continuous per-step penalty (-0.10 every step),
-    # which accumulated to -0.60 to -1.00 per episode during normal early-game setup turns
-    # (turns 1-6), overflowing the [-0.10, +0.10] clip and creating a noisy reward baseline.
-    # Fix: gate to turn > 3 (setup is legitimately incomplete on turns 1-3) and reduce
-    # magnitude to -0.03 so even 10 consecutive setup turns = -0.30 before decay, well
-    # within the accumulated episode reward range.
     post_act_id = post.get("active_id", -1)
     post_bench = post.get("bench_ids", [])
     post_energy = post.get("my_active_energy", 0)
     if (
         post_act_id == MEWTWO_EX_ID
-        and _count_tr_pokemon(post_bench, post_act_id) < 4
-        and post_energy < 3
-        and turn > 3  # Setup is expected to be incomplete on turns 1-3; only penalize if delayed
+        and (_count_tr_pokemon(post_bench, post_act_id) < 4 or post_energy < 3)
+        and turn <= 4
     ):
-        _add(-0.03, "Penalty_Exposed_Unpowered_Active_Mewtwo_ex_Power_Saver_Unmet")
+        _add(-0.10, "Penalty_Exposed_Unpowered_Active_Mewtwo_ex_Power_Saver_Unmet")
 
 
     # -------------------------------------------------------------------------
@@ -226,17 +219,21 @@ def calculate_mewtwo_strategic_reward(
 
         if target_energy >= req_energy:
             if is_active_target:
-                _add(-0.15, f"Penalty_Active_Energy_Overcharge_Target_{target_id}")
+                _add(-0.25, f"Penalty_Active_Energy_Overcharge_Target_{target_id}")
             else:
-                _add(-0.15, f"Penalty_Bench_Energy_Overcharge_Target_{target_id}")
+                _add(-0.25, f"Penalty_Bench_Energy_Overcharge_Target_{target_id}")
 
         # Explicit Mimikyu energy cap penalty (max 1 energy on Mimikyu - ID 434)
         if target_id == 434 and target_energy >= 1:
-            _add(-0.15, "Penalty_Mimikyu_Overcharge_Max_1_Energy")
+            _add(-0.25, "Penalty_Mimikyu_Overcharge_Max_1_Energy")
 
         # Explicit Mimikyu energy type restriction penalty (TR Energy ID 15 only, never Basic G)
         if target_id == 434 and attached_id != 15 and attached_id > 0:
-            _add(-0.15, "Penalty_Mimikyu_Wrong_Energy_Type_Restricted_to_TR_Energy")
+            _add(-0.25, "Penalty_Mimikyu_Wrong_Energy_Type_Restricted_to_TR_Energy")
+
+        # Explicit reward for powering benched Spidops / Tarountula to supply Erasure Ball KO damage scaling
+        if not is_active_target and target_id in (401, 400, 414, 431) and target_energy < 2:
+            _add(0.30, "Reward_Benched_Energy_Fuel_For_Erasure_Ball_And_Backup")
 
         en_r = compute_energy_attachment_reward(
             action_type=8,

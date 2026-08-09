@@ -288,20 +288,26 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
         deck_cnt = _get_val(my_ps, "deckCount", 60) if my_ps else 60
         if deck_cnt <= 5 and card_id in (1134, 1135, 1136, 1256, 1258, 1259):
             return -0.25, "Prior Penalty: Anti-Deckout Guard (Deck Count <= 5)"
-        # A. Team Rocket Pokémon Play & 4-Pokémon Power Saver Unlock
+        # A. Team Rocket Pokémon Play & 4-Pokémon Power Saver Unlock & 5-Bench Spidops Scaling
         if card_id in TR_POKEMON_IDS:
-            if tr_count == 3:
-                return 0.28, "CRITICAL Prior: Play 4th TR Pokemon Unlocking Mewtwo ex Power Saver Ability"
             if ctx["my_bench_count"] == 0:
-                return 0.28, "CRITICAL Prior: Donk Prevention - Play Basic Pokemon to Empty Bench Immediately"
-            elif ctx["my_bench_count"] == 1:
-                return 0.18, "Prior: Play TR Pokemon Low Bench Recovery Guard"
-            # FIX 2 (expert): Early Mewtwo ex and Tarountula setup priority
-            if early_game:
-                if card_id == MEWTWO_EX_ID:
-                    return 0.20, "Prior: Early Mewtwo ex Main Attacker Deployment (Turn 1-3)"
-                elif card_id == TAROUNTULA_ID:
-                    return 0.16, "Prior: Early Tarountula Setup Deployment (Turn 1-3)"
+                return 0.35, "CRITICAL Prior: Donk/Bench-Out Prevention - Play Basic Pokemon to Empty Bench Immediately"
+            if tr_count == 3:
+                return 0.35, "CRITICAL Prior: Play 4th TR Pokemon Unlocking Mewtwo ex Power Saver Ability"
+            if ctx["my_bench_count"] < 2:
+                return 0.35, "CRITICAL Prior: Mid-Game Bench Recovery - Rebuild Empty/Low Bench Immediately"
+            if ctx["my_bench_count"] == 4 or (SPIDOPS_ID in ctx["my_bench_ids"] or active_id == SPIDOPS_ID):
+                return 0.30, "CRITICAL Prior: Fill 5th Bench Slot to Maximize Spidops Damage & Board Power"
+            elif tr_count < 3:
+                return 0.25, "CRITICAL Prior: Play TR Pokemon to Accelerate Power Saver Unlock"
+            elif ctx["my_bench_count"] <= 2:
+                return 0.22, "Prior: Play TR Pokemon Low Bench Recovery Guard"
+            # FIX 2 (expert): Early/Mid Mewtwo ex and Tarountula setup priority
+            opp_active_hp = ctx.get("opp_active_hp", 100)
+            if card_id == MEWTWO_EX_ID and (early_game or opp_active_hp >= 180):
+                return 0.35, "CRITICAL Prior: Deploy Mewtwo ex Main Attacker vs High-HP/EX Opponent"
+            elif card_id == TAROUNTULA_ID and early_game:
+                return 0.20, "Prior: Early Tarountula Setup Deployment (Turn 1-3)"
             # Crustle EX Immunity Matchup Rule: Prioritize playing Tarountula & Spidops ex
             opp_active_id = ctx.get("opp_active_id", -1)
             is_crustle = (opp_active_id in (344, 345, 407, 408)) or ("crustle" in opponent_name.lower())
@@ -309,23 +315,27 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
                 return 0.30, "CRITICAL Prior: PRIORITIZE Play & Deploy Spidops Line vs Crustle (EX Immunity Counter)"
 
             if card_id == SPIDOPS_ID or card_id == TAROUNTULA_ID:
-                return 0.16, "Prior: Play Spidops Line Trap Territory Setup"
-            return 0.08, "Prior: Play Team Rocket Pokemon Setup"
+                return 0.18, "Prior: Play Spidops Line Trap Territory Setup"
+            return 0.10, "Prior: Play Team Rocket Pokemon Setup"
 
 
         # B. Search & Tutor Engines
         if card_id == TRANSCEIVER_ID:
+            if ctx["my_bench_count"] <= 1 or tr_count < 4:
+                return 0.35, "CRITICAL Prior: TR Transceiver Bench & Power Saver Tutor"
             return BONUS_TRANSCEIVER, "Prior: TR Transceiver Supporter Tutor"
 
         if card_id == BUG_CATCHING_SET_ID:
             return BONUS_BUG_CATCHING, "Prior: Bug Catching Set Grass Search"
 
         if card_id == POFFIN_ID:
-            if early_game or ctx["my_bench_count"] <= 1:
-                return BONUS_EARLY_POFFIN, "Prior: Early Poffin Bench Fill"
+            if ctx["my_bench_count"] <= 1 or tr_count < 4 or early_game:
+                return 0.35, "CRITICAL Prior: Poffin Immediate Bench & Power Saver Fill"
             return BONUS_LATE_POFFIN, "Prior: Late Poffin Bench Fill"
 
         if card_id == ULTRA_BALL_ID:
+            if ctx["my_bench_count"] <= 1 or tr_count < 4:
+                return 0.35, "CRITICAL Prior: Ultra Ball Immediate Bench & Power Saver Fill"
             return BONUS_ULTRA_BALL, "Prior: Ultra Ball Key Search"
 
         # C. Equipment & Recovery
@@ -513,13 +523,35 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
         if active_id == MEWTWO_EX_ID and (opp_active_id in (344, 345, 407, 408) or "crustle" in opponent_name.lower()):
             return 0.22, "Prior: Retreat Mewtwo ex vs Crustle (EX Immunity Counter - Bring in Spidops)"
 
-        if active_id == MEWTWO_EX_ID and active_energy >= 1 and active_hp >= 100:
-            return -0.12, "Prior Penalty: Retreat healthy powered Mewtwo ex (energy waste, strongly discouraged)"
-        elif active_energy >= 1 and active_hp >= 80:
-            return -0.10, "Prior Penalty: Retreat healthy active with energy (wasteful)"
-        elif active_hp <= 30:
-            return 0.15, "Prior: Tactical retreat of low-HP active"
-        return -0.08, "Prior Penalty: General wasteful retreat"
+        # Check if any benched Pokemon has energy to attack
+        bench_energies = []
+        my_ps = ctx.get("my_ps")
+        if my_ps is not None:
+            bench_list_raw = _get_val(my_ps, "bench", [])
+            for bp in bench_list_raw:
+                if bp is not None:
+                    ben_en = _get_val(bp, "energyCards", [])
+                    bench_energies.append(len(ben_en) if isinstance(ben_en, (list, tuple)) else 0)
+
+        has_ready_bench_attacker = any(e >= 1 for e in bench_energies)
+
+        # Strict Attacker Retreat Prohibition:
+        # Never retreat ANY Active Pokemon (Spidops, Mewtwo ex, Articuno) that has energy attached (>= 1)
+        # when active_hp > 30 (not dying).
+        if active_energy >= 1 and active_hp > 30:
+            return -0.35, f"Prior Penalty: Retreat Forbidden for Active with Energy (ID {active_id}) - ATTACK INSTEAD"
+
+        # Wasted retreat prevention: never discard energy to promote a 0-energy bench Pokemon unless active is dying (hp <= 30)
+        if active_energy >= 1 and not has_ready_bench_attacker:
+            return -0.35, "Prior Penalty: Wasted Retreat - No Benched Attacker Ready to Attack"
+
+        if active_id == MEWTWO_EX_ID and active_energy >= 1 and active_hp >= 40:
+            return -0.35, "Prior Penalty: Retreat healthy/powered Mewtwo ex (energy waste, forbidden)"
+        elif active_energy >= 1 and active_hp >= 60:
+            return -0.25, "Prior Penalty: Retreat healthy active with energy (wasteful)"
+        elif active_hp <= 30 and has_ready_bench_attacker:
+            return 0.15, "Prior: Tactical retreat of low-HP active to ready benched attacker"
+        return -0.20, "Prior Penalty: General wasteful retreat"
 
     # 5. ATTACK ACTIONS (OptionType.ATTACK / 13)
     elif opt_type in (getattr(OptionType, "ATTACK", 13), 13):
@@ -544,25 +576,17 @@ def evaluate_mewtwo_expert_bonus(obs: dict, opt, opponent_name: str = "") -> tup
             if active_id == SPIDOPS_ID:
                 # Venomous Whip scales: 20 + 20 per bench Pokemon (full bench=5 → 120 dmg)
                 bench_size = ctx.get("my_bench_count", len(ctx["my_bench_ids"]))
-                spidops_damage = 20 + (20 * bench_size)
                 opp_hp = ctx.get("opp_active_hp", 9999)
-                if bench_size == 5:
-                    # Full bench — max damage 120, always attack!
-                    return 0.20, f"Prior: Spidops Full Bench Attack 120 Damage"
-                elif bench_size >= 3:
-                    # Good bench — decent damage 80-100
-                    if 0 < opp_hp <= spidops_damage:
-                        return 0.20, f"Prior: Spidops Lethal Window Bench{bench_size}"
-                    return 0.15, f"Prior: Spidops Good Bench Attack {spidops_damage} Damage"
-                elif bench_size <= 1:
-                    # Thin bench — lower damage (20-40), but attacking is still ALWAYS positive over passing
-                    return 0.10, f"Prior: Spidops Thin Bench ({bench_size}) {spidops_damage} Damage Attack"
-                mewtwo_bench_present = MEWTWO_EX_ID in ctx["my_bench_ids"]
-                if mewtwo_bench_present:
-                    return BONUS_SPIDOPS_ATTACK_MEWTWO_PRIORITY, "Prior: Spidops Attack (Mewtwo On Bench)"
-                return BONUS_SPIDOPS_ATTACK, "Prior: Affordable Spidops Attack"
-
-
+                if bench_size >= 4:
+                    return 0.35, "CRITICAL Prior: Spidops Full Bench Attack - ATTACK NOW FOR KO"
+                return 0.30, "Prior: Spidops Powered Attack Immediately"
+            elif active_id == MEWTWO_EX_ID:
+                opp_hp = ctx.get("opp_active_hp", 9999)
+                if opp_hp <= 160:
+                    return 0.35, "CRITICAL Prior: Mewtwo ex Fully Powered - Lethal Window - ATTACK NOW FOR KO"
+                return 0.30, "Prior: Mewtwo ex Fully Powered - Attack Immediately"
+            return 0.30, "Prior: Powered Active Attacker - ATTACK NOW"
+            
             if active_id == ARTICUNO_ID:
                 return BONUS_ARTICUNO_ATTACK, "Prior: Affordable Articuno Snipe Attack"
             return BONUS_GENERIC_ATTACK, "Prior: Affordable Active Attack"
