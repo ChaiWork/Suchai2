@@ -11,7 +11,19 @@ Model weights (`.pth` / `.pt` files) are **not committed** to this repository du
 
 ## Obtaining the Checkpoints
 
-**Option 1 — Train from scratch:**
+**Option 1 — Download the trained checkpoint (recommended):**
+
+```bash
+# Linux / macOS
+wget https://github.com/<your-username>/<your-repo>/releases/download/v1.0.0/best_model.pth
+
+# Windows PowerShell
+Invoke-WebRequest -Uri "https://github.com/<your-username>/<your-repo>/releases/download/v1.0.0/best_model.pth" -OutFile "best_model.pth"
+```
+
+Or download manually from the [GitHub Releases page](https://github.com/<your-username>/<your-repo>/releases/latest).
+
+**Option 2 — Train from scratch:**
 ```bash
 python train.py --epochs 15 --self-play-episodes 100 --batch-size 256 --lr 5e-5 --eval-episodes 120 --num-workers 4
 ```
