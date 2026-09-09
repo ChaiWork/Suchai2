@@ -44,43 +44,43 @@ To address these challenges, our architecture combines:
 ```mermaid
 flowchart TD
     subgraph Environment ["Pokémon TCG Game Engine (cg-lib)"]
-        OBS[Raw Observation obs_dict]
-        API[C++ Engine cg.api / cg.game]
+        OBS["Raw Observation (obs_dict)"]
+        API["C++ Engine (cg.api / cg.game)"]
     end
 
     subgraph StateRepresentation ["State Tokenization"]
-        OBS --> ENC_INP[Encoder SparseVector: Hand, Active, Bench, Discard]
-        OBS --> DEC_INP[Decoder SparseVector: Available Legal Actions]
-        FEAT[36 Dense Card Features] --> EMB[EmbeddingBag + Feature Projection]
+        OBS --> ENC_INP["Encoder SparseVector (Hand, Active, Bench, Discard)"]
+        OBS --> DEC_INP["Decoder SparseVector (Available Legal Actions)"]
+        FEAT["36 Dense Card Features"] --> EMB["EmbeddingBag + Feature Projection"]
         FEAT --> ENC_INP
         FEAT --> DEC_INP
     end
 
     subgraph NeuralNetwork ["Transformer Policy-Value Network (MyModel: 26.65M Params)"]
         ENC_INP --> EMB
-        EMB --> TRANS_ENC[Transformer Encoder: 3 Layers, 4 Heads, d=256]
-        TRANS_ENC --> VAL_HEAD[Value Head: Scalar V in [-1, +1]]
-        TRANS_ENC --> TRANS_DEC[Transformer Decoder: 1 Layer, 4 Heads, d=256]
+        EMB --> TRANS_ENC["Transformer Encoder (3 Layers, 4 Heads, d=256)"]
+        TRANS_ENC --> VAL_HEAD["Value Head: Scalar V in range (-1, +1)"]
+        TRANS_ENC --> TRANS_DEC["Transformer Decoder (1 Layer, 4 Heads, d=256)"]
         DEC_INP --> TRANS_DEC
-        TRANS_DEC --> POL_HEAD[Policy Head: Action Logits]
+        TRANS_DEC --> POL_HEAD["Policy Head: Action Logits"]
     end
 
     subgraph SearchDecision ["MCTS & Expert Guidance"]
-        POL_HEAD --> LOGITS[Policy Logits]
-        EXP[Expert System: Mewtwo Expert] -->|Risk & Entropy Scaled Bonus| PRIOR[PUCT Action Priors]
+        POL_HEAD --> LOGITS["Policy Logits"]
+        EXP["Expert System: Mewtwo Expert"] -->|Risk & Entropy Scaled Bonus| PRIOR["PUCT Action Priors"]
         LOGITS --> PRIOR
-        VAL_HEAD --> MCTS[Information-State MCTS: Determinization + Rollouts]
+        VAL_HEAD --> MCTS["Information-State MCTS (Determinization + Rollouts)"]
         PRIOR --> MCTS
-        MCTS --> ACTION[Selected Action]
+        MCTS --> ACTION["Selected Action"]
     end
 
     subgraph TrainingLoop ["Self-Play & Reinforcement Learning"]
         ACTION --> API
-        API --> NEXT_STATE[State Transition S to S']
-        NEXT_STATE --> REWARD[Reward Engine: Base + Mewtwo Specific]
-        REWARD --> GAE_BUF[GAE Return & Advantage Calculation]
-        GAE_BUF --> REPLAY[Prioritized Replay Buffer]
-        REPLAY --> PPO_UPDATE[PPO / AlphaZero Optimization Step]
+        API --> NEXT_STATE["State Transition: S to S'"]
+        NEXT_STATE --> REWARD["Reward Engine (Base + Mewtwo Specific)"]
+        REWARD --> GAE_BUF["GAE Return & Advantage Calculation"]
+        GAE_BUF --> REPLAY["Prioritized Replay Buffer"]
+        REPLAY --> PPO_UPDATE["PPO / AlphaZero Optimization Step"]
         PPO_UPDATE -->|Update Weights| NeuralNetwork
     end
 ```
@@ -169,7 +169,7 @@ $$\text{Confidence} = \text{Scale}_{\text{epoch}} \times \text{Scale}_{\text{unc
    * **Incomplete Bench Setup ($1.20\times$)**: Fewer than 3 Team Rocket Pokémon in play.
 
 ### Strict Negative Vetoes
-While positive bonuses are subject to epoch and entropy decay, **negative vetoes** ($\text{bonus} < 0$) are applied with fixed intensity ($\text{EXPERT\_WEIGHT} = 0.25$) to permanently disincentivize catastrophic blunders.
+While positive bonuses are subject to epoch and entropy decay, **negative vetoes** (`bonus < 0`) are applied with fixed intensity (`EXPERT_WEIGHT = 0.25`) to permanently disincentivize catastrophic blunders.
 
 ---
 
@@ -418,7 +418,7 @@ pokemon-tcg-ai-battle-challenge-strategy/
 * **PyTorch**: Version 2.0 or newer with CUDA support (for GPU training)
 * **Hardware**:
   * **Inference**: Any modern CPU (sub-5ms per decision).
-  * **Training**: 8+ CPU cores and an NVIDIA GPU with $\ge 8\text{ GB}$ VRAM recommended.
+  * **Training**: 8+ CPU cores and an NVIDIA GPU with &ge; 8 GB VRAM recommended.
 
 ### Setup Instructions
 
