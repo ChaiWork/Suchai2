@@ -597,4 +597,11 @@ This project was developed for the **Kaggle Pokémon TCG AI Battle Challenge** a
 
 ## 20. License
 
-License information will be added.
+DISCLAIMER ON POKÉMON INTELLECTUAL PROPERTY:
+Pokémon, Pokémon character names, card designs, and card text are registered 
+trademarks of Nintendo, Creatures Inc., and GAME FREAK inc. 
+
+All card imagery and deck compositions presented in this submission are 
+reproduced under the Fair Use doctrine for non-commercial academic research, 
+technical analysis, and algorithmic benchmarking within the Kaggle Pokémon TCG 
+AI Battle Challenge.
