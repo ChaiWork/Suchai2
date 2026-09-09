@@ -10,6 +10,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append("src")
 sys.path.append("cg")
 
+os.environ["KAGGLE_KERNEL_RUN_TYPE"] = "Interactive"
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -34,9 +36,13 @@ EASY_OPPONENTS = [
 
 HARD_OPPONENTS = [
     "Rulebasedmodel_Alakazam",
+    "Rulebasedmodel_Best5th_Alakazam",
+    "Rulebasedmodel_Codex_Sol_Eclipse_Alakazam",
     "Rulebasedmodel_Archaludon",
     "Rulebasedmodel_Dipplin",
     "Rulebasedmodel_Dragapult",
+    "Rulebasedmodel_PhantomDive_Dragapult",
+    "Rulebasedmodel_MegaKangaskhan_Speed",
     "Rulebasedmodel_Grimmsnarl",
     "Rulebasedmodel_Iono",
     "Rulebasedmodel_Kangaskhan_Crustle",
@@ -56,7 +62,25 @@ HARD_OPPONENTS = [
     "Rulebasedmodel_Metagross_Grass",
     "Rulebasedmodel_Tyranitar",
     "Rulebasedmodel_Crustle_Stall",
-    "DRAGOPULT"
+    "Rulebasedmodel_SixthSense_Dragapult",
+    "DRAGOPULT",
+    "Rulebasedmodel_TopPlayer_AlphaStarmie_Archetype",
+    "Rulebasedmodel_TopPlayer_ANDPAD_kaggler_team_Teal_Mask_Ogerpon_ex_Meganium",
+    "Rulebasedmodel_TopPlayer_ANDPAD_kaggler_team_Teal_Mask_Ogerpon_ex_Meowth_ex",
+    "Rulebasedmodel_TopPlayer_Dipam_Chakraborty_Teal_Mask_Ogerpon_ex_Meowth_ex",
+    "Rulebasedmodel_TopPlayer_flg_Archetype",
+    "Rulebasedmodel_TopPlayer_flg_Dragapult_ex",
+    "Rulebasedmodel_TopPlayer_James_Cox_and_Henry_Chao_Meowth_ex_Mega_Kangaskhan_ex",
+    "Rulebasedmodel_TopPlayer_LiamK_Archetype",
+    "Rulebasedmodel_TopPlayer_LiamK_Dragapult_ex",
+    "Rulebasedmodel_TopPlayer_Luca_Mega_Lucario_ex",
+    "Rulebasedmodel_TopPlayer_LumenLiquidity_Archetype",
+    "Rulebasedmodel_TopPlayer_Majkel1337_Mega_Lucario_ex",
+    "Rulebasedmodel_TopPlayer_Oshbocker_Teal_Mask_Ogerpon_ex_Meganium",
+    "Rulebasedmodel_TopPlayer_palsystem_Archetype",
+    "Rulebasedmodel_TopPlayer_Phil_Hellmuth_Archetype",
+    "Rulebasedmodel_TopPlayer_Raihan_Ramadistra_Dragapult_ex",
+    "Rulebasedmodel_TopPlayer_やる気元気ミワハルキ_Dragapult_ex"
 ]
 
 ALL_OPPONENTS = EASY_OPPONENTS + HARD_OPPONENTS
@@ -118,12 +142,18 @@ def run_single_match(opponent_name: str, game_idx: int = 1, save_replay: bool = 
         if not isinstance(selected, list):
             selected = [selected]
 
-        options = obs.get("select", {}).get("option", [])
+        select_info = obs.get("select", {}) or {}
+        options = select_info.get("option", []) or []
         num_opts = len(options) if options else 1
-        if not selected or len(selected) == 0:
-            selected = [0]
-        elif selected[0] < 0 or selected[0] >= num_opts:
-            selected = [0]
+        min_cnt = max(1, select_info.get("minCount", 1) or 1)
+
+        selected = [idx for idx in selected if isinstance(idx, int) and 0 <= idx < num_opts]
+        if len(selected) < min_cnt:
+            needed = min_cnt - len(selected)
+            available = [i for i in range(num_opts) if i not in selected]
+            selected.extend(available[:needed])
+        if not selected:
+            selected = list(range(min(min_cnt, num_opts)))
 
         step_record = [{
             "action": selected,

@@ -6,45 +6,44 @@ from cg.api import CardType, OptionType, SelectContext
 USE_EXPERT_GUIDANCE = True
 EXPERT_WEIGHT = 0.25
 
-# Expert influence schedule — stepped plateaus rather than linear-to-zero decay.
-# AlphaZero principle: expert priors are never fully removed; the NN learns ON TOP of them.
-# A permanent 10% floor means late-training priors still guide MCTS away from rule violations.
+# Expert influence schedule — graduated decay allowing the NN to become genuinely dominant.
 #
-# Epoch   1-20  → 1.00  (full curriculum: expert leads, NN follows)
-# Epoch  21-50  → 0.50  (mid training:  expert and NN contribute equally)
-# Epoch  51-100 → 0.25  (late training: NN dominates, expert guards boundaries)
-# Epoch  100+   → 0.10  (floor:         permanent strategic prior, no complete removal)
-# Legacy compatibility constant
+# Design principle: Expert is a COACH, not a PLAYER.
+# - Early training (Epoch 1-20):  Expert leads strongly to build curriculum.
+# - Mid training (Epoch 21-50):   Expert and NN share influence equally.
+# - Late training (Epoch 51-100): NN dominates; expert provides safety guidance only.
+# - Mature (Epoch 100+):          NN drives strategy; expert only activates on HIGH-RISK states.
+#
+# NOTE: There is NO hard floor. Strategic-risk situations in expert_router.py
+# amplify expert influence selectively when the state demands it.
+# This allows NN discovery of strategies the expert never modeled.
 EXPERT_DECAY_EPOCHS = 100
+
 
 def expert_scale(epoch: int) -> float:
     """
-    Returns a stepped-plateau multiplier controlling expert system influence.
-
-    Design: AlphaZero systems retain expert priors permanently — the NN learns
-    better strategies on top of the prior, not instead of it. A hard floor of 0.10
-    ensures rule-safety guards (Turn 1 supporter block, Power Saver gate) remain
-    active even at epoch 500+.
-
-    Used as a universal gate for:
-    - Expert logit biases in MCTS node priors (agent.py)
-    - Reward shaping constants in mewtwo_reward.py
+    Returns a graduated epoch-based multiplier controlling BASE expert influence.
+    The router then multiplies this by uncertainty_scale × risk_scale,
+    so expert activates strongly only on high-risk game states.
 
     Schedule:
-      Epoch   1-20  → 1.00
-      Epoch  21-50  → 0.50
-      Epoch  51-100 → 0.25
-      Epoch  100+   → 0.10 (permanent floor)
+      Epoch   1-20  → 1.00  (full curriculum guidance)
+      Epoch  21-50  → 0.70  (shared NN + expert)
+      Epoch  51-100 → 0.40  (NN dominant, expert as safety net)
+      Epoch 101-200 → 0.25  (NN leads, expert only for high-risk states)
+      Epoch  200+   → 0.15  (minimum signal: prevents total expert removal)
     """
     if not USE_EXPERT_GUIDANCE:
         return 0.0
-    if epoch <= 30:
+    if epoch <= 20:
         return 1.00
-    if epoch <= 60:
-        return 0.80
-    if epoch <= 100:
+    if epoch <= 50:
         return 0.70
-    return 0.60  # Permanent strong floor — preserves expert priors during late fine-tuning (Epoch 30+)
+    if epoch <= 100:
+        return 0.40
+    if epoch <= 200:
+        return 0.25
+    return 0.15  # Minimum floor: prevents total expert signal removal at epoch 200+
 
 
 def extract_board_context(obs) -> dict:

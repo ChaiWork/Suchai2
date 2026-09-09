@@ -86,6 +86,8 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
 
             try:
                 action_counts = {"attack": 0, "play": 0, "attach": 0, "evolve": 0, "ability": 0, "retreat": 0, "end": 0, "other": 0}
+                total_steps = 0
+                disagreement_steps = 0
                 played_cards = {}
                 samples = [[], []]
                 expert_log = []  # Per-step expert guidance log
@@ -184,7 +186,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         turn = obs_class.current.turn if (obs_class.current is not None) else 1
                         temperature = 1.0 if turn <= 15 else 0.1
                         try:
-                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=100, temperature=temperature, opponent_name=opponent_name, epoch=current_epoch)
+                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=10, temperature=temperature, opponent_name=opponent_name, epoch=current_epoch)
                         except Exception as mcts_err:
                             import traceback
                             import sys
@@ -195,6 +197,10 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             sample = None
                         if sample is not None:
                             sample.pred_val = sample.value
+                            total_steps += 1
+                            nn_top1 = getattr(sample, "nn_top1_idx", 0)
+                            if selected and len(selected) > 0 and selected[0] != nn_top1:
+                                disagreement_steps += 1
                             
                             if selected and len(selected) > 0:
                                 try:
@@ -247,11 +253,13 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                         if target_area == 4 or target_area == "active": # ACTIVE
                                             if len(state_ps.active) > 0 and state_ps.active[0] is not None:
                                                 attached_target_id = state_ps.active[0].id
-                                                target_energy = len(state_ps.active[0].energyCards) if hasattr(state_ps.active[0], "energyCards") else 0
+                                                en_cards = getattr(state_ps.active[0], "energyCards", [])
+                                                target_energy = sum(2 if getattr(ec, "id", getattr(ec, "cardId", -1)) in (15, 19) else 1 for ec in (en_cards or []))
                                         elif target_area == 5 or target_area == "bench": # BENCH
                                             if 0 <= target_idx < len(state_ps.bench) and state_ps.bench[target_idx] is not None:
                                                 attached_target_id = state_ps.bench[target_idx].id
-                                                target_energy = len(state_ps.bench[target_idx].energyCards) if hasattr(state_ps.bench[target_idx], "energyCards") else 0
+                                                en_cards = getattr(state_ps.bench[target_idx], "energyCards", [])
+                                                target_energy = sum(2 if getattr(ec, "id", getattr(ec, "cardId", -1)) in (15, 19) else 1 for ec in (en_cards or []))
                                     elif opt_type_val == 9: # EVOLVE
                                         hand = state_ps.hand
                                         card_idx = opt.get("index", -1)
@@ -274,19 +282,19 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             options = obs.get("select", {}).get("option", [])
                             if sel_idx < len(options):
                                 opt_type = options[sel_idx].get("type")
-                                if opt_type == 13:
+                                if opt_type in (13, getattr(OptionType, "ATTACK", 13), "Attack", "attack"):
                                     action_counts["attack"] += 1
-                                elif opt_type == 7:
+                                elif opt_type in (7, getattr(OptionType, "PLAY", 7), "Play", "play"):
                                     action_counts["play"] += 1
-                                elif opt_type == 8:
+                                elif opt_type in (8, getattr(OptionType, "ATTACH", 8), "Attach", "attach"):
                                     action_counts["attach"] += 1
-                                elif opt_type == 9:
+                                elif opt_type in (9, getattr(OptionType, "EVOLVE", 9), "Evolve", "evolve"):
                                     action_counts["evolve"] += 1
-                                elif opt_type == 10:
+                                elif opt_type in (10, 17, getattr(OptionType, "ABILITY", 10), "Ability", "ability"):
                                     action_counts["ability"] += 1
-                                elif opt_type == 12:
+                                elif opt_type in (12, getattr(OptionType, "RETREAT", 12), "Retreat", "retreat"):
                                     action_counts["retreat"] += 1
-                                elif opt_type == 14:
+                                elif opt_type in (14, getattr(OptionType, "END", 14), "End", "end"):
                                     action_counts["end"] += 1
                                 else:
                                     action_counts["other"] += 1
@@ -298,7 +306,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                                 selected = random_agent(obs)
                         elif opponent_type == "Current":
                             opp_temperature = 1.0 if turn_num <= 15 else 0.1
-                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=50, temperature=opp_temperature, epoch=current_epoch)
+                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=10, temperature=opp_temperature, epoch=current_epoch)
                             sample.pred_val = sample.value
                             
                             opt_type_val = -1
@@ -348,7 +356,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                             if sample is not None:
                                 samples[my_player_idx].append((sample, pre_metrics))
                         elif opp_model is not None:
-                            selected, sample = mcts_agent(obs, curr_deck, opp_model, search_count=50)
+                            selected, sample = mcts_agent(obs, curr_deck, opp_model, search_count=10)
                         else:
                             selected = random_agent(obs)
                     
@@ -394,7 +402,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 "r_damage_eff": 0.0, "r_lethal_detection": 0.0, "r_supporter_eff": 0.0,
                 "r_supporter_opp_cost": 0.0, "r_hand_congestion": 0.0, "r_deck_preservation": 0.0,
                 "r_missed_attack": 0.0, "r_donk_prevention": 0.0, "r_action_conv": 0.0,
-                "r_search_quality": 0.0, "r_search_tempo": 0.0,
+                "r_search_quality": 0.0, "r_search_tempo": 0.0, "r_early_aggro": 0.0,
             }
             
             for i in range(2):
@@ -408,7 +416,16 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 
                 num_attacks = sum(1 for _, pre in player_samples if pre.get("action_type") == 13)
                 if i == result:
-                    terminal_reward = 1.0
+                    if num_attacks == 0:
+                        terminal_reward = -0.50  # Disqualify passive 0-attack deckout wins
+                    elif final_turn <= 5:
+                        terminal_reward = 1.50   # Early Win Velocity Bonus (+0.50)
+                    elif final_turn <= 10:
+                        terminal_reward = 1.25   # Fast Win Velocity Bonus (+0.25)
+                    elif final_turn <= 20:
+                        terminal_reward = 1.00   # Standard Win
+                    else:
+                        terminal_reward = 0.50   # Slow Win Decay
                 elif result == 2:
                     terminal_reward = 0.0
                 elif result == -1:
@@ -564,7 +581,7 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                         entropy_accum += entropy
                         entropy_count += 1
                         
-            result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, processed_samples, result, final_turn, rc_worker, entropy_accum, entropy_count, action_counts, played_cards, expert_log, went_second, my_player_idx)))
+            result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, processed_samples, result, final_turn, rc_worker, entropy_accum, entropy_count, action_counts, played_cards, expert_log, went_second, my_player_idx, total_steps, disagreement_steps)))
             
         elif cmd == "EVAL":
             sample_deck, opponent_deck, opponent_name = args
@@ -588,13 +605,12 @@ def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_s
                 curr_player = obs["current"]["yourIndex"]
                 
                 if curr_player == your_index:
-                    eval_search_count = 50
-
-
-
-
-                        
-                    selected, _ = mcts_agent(obs, sample_deck, client, search_count=eval_search_count, temperature=0.0)
+                    options = obs.get("select", {}).get("option", [])
+                    if len(options) <= 1:
+                        selected = [0]
+                    else:
+                        eval_search_count = 0
+                        selected, _ = mcts_agent(obs, sample_deck, client, search_count=eval_search_count, temperature=0.0, opponent_name=opponent_name)
 
                 else:
                     if opponent_name.startswith("Rulebasedmodel"):

@@ -30,7 +30,7 @@ _POKEMON_ROLE_WEIGHTS: Dict[int, float] = {
     431: 1.0,   # Mewtwo ex (main win condition)
     401: 0.85,  # Spidops (secondary attacker / bench energy battery for Erasure Ball KO scaling)
     400: 0.25,  # Tarountula (bench filler / pre-evolution)
-    414: 0.05,  # Articuno (pivot/utility — low priority for energy attachment)
+    414: 0.0,   # Articuno (defensive pivot only — requires Water Energy to attack, deck runs Grass/TR only)
     434: 0.20,  # Mimikyu (stall)
     272: 0.70,  # Clefairy ex (secondary ex attacker)
 }
@@ -92,6 +92,7 @@ def _build_cache() -> None:
 
 ENERGY_TYPE_RESTRICTIONS = {
     434: frozenset({15}),  # Mimikyu: Team Rocket's Energy ONLY (ID 15), matching card text rule
+    414: frozenset(),      # Articuno: Requires Water energy to attack; deck contains only Grass/TR energy
 }
 
 
@@ -195,17 +196,13 @@ def _dynamic_role_weight(
     In all other cases the default static weight from _POKEMON_ROLE_WEIGHTS is used.
     """
     base = _POKEMON_ROLE_WEIGHTS.get(card_id, 0.5)
+    if card_id == 431 and card_id != active_id:
+        # Benched Mewtwo ex: highest priority to reach 3 energy to 1-shot tank opponents with Erasure Ball
+        return 1.20
     if card_id == _ARTICUNO_ID:
-        mewtwo_on_bench = _MEWTWO_EX_ID in bench_ids
-        is_active       = (card_id == active_id)
-        if is_active and not mewtwo_on_bench:
-            # Articuno is the only attacker; energizing it is the correct play
-            return 0.40
-        if is_active and prizes <= 2:
-            # Close game: Articuno as tempo pivot attacker is valuable
-            return 0.25
-        # Default: low priority so Mewtwo ex draws energy first
-        return base  # 0.05 from _POKEMON_ROLE_WEIGHTS
+        # Articuno cannot attack with Grass or TR Energy (requires Water Energy, which is not in the deck).
+        # Role weight is strictly 0.0 to prevent wasting attachments on Articuno.
+        return 0.0
     return base
 
 
@@ -344,15 +341,19 @@ def evaluate_state_energy_transition(
     new_attacker_bonus = 0.05 if powered_delta > 0 else 0.0
 
     # 3. Backup Attacker & Bench Preparation Bonus
-    backup_bonus = 0.15 if backup_delta > 0 else 0.0
-
-    # Bench preparation bonus: when active is already fully powered,
-    # attaching energy to an unpowered benched attacker receives a +0.15 prep bonus.
+    # ONLY reward bench backup attachment if the active attacker is ALREADY fully powered!
     active_req = get_required_energy(active_id_before) if active_id_before > 0 else 2
-    is_bench_target = (target_card_id > 0 and target_card_id != active_id_before)
+    is_active_target = (target_card_id > 0 and target_card_id == active_id_before)
+    is_bench_target  = (target_card_id > 0 and target_card_id != active_id_before)
+
     if active_energy_before >= active_req and is_bench_target:
+        backup_bonus = 0.15
         bench_prep_bonus = 0.15
+    elif is_active_target and powered_delta > 0:
+        backup_bonus = 0.20  # Active attacker reached attack readiness THIS turn!
+        bench_prep_bonus = 0.0
     else:
+        backup_bonus = 0.0
         bench_prep_bonus = 0.0
 
     # 4. Energy Efficiency / Overcharge Penalty (harsh penalty schedule)
@@ -544,6 +545,30 @@ def evaluate_energy_target(
             return -1.50, "Prior Guidance: Active Already at Max Energy (HARD BLOCK - Mandatory Bench Energy Setup)"
         return -0.40, "Prior Guidance: Energy Overcharge (Target already powered)"
 
+    # Rule 3: Mewtwo ex Main Attacker Energy Priority (Builds 3 Energy for Psystrike/Psywave)
+    if target_card_id == 431 and target_current_energy < 3:
+        # Check if active is already powered or if target IS active
+        req_act = 3 if active_id == 431 else (2 if active_id == 401 else 1)
+        if target_card_id == active_id or active_energy >= req_act:
+            return 0.35, "Prior Guidance: HIGH PRIORITY - Build Up Mewtwo ex Main Attacker Energy"
+
+    # Rule 4: Active Attacker Energy Priority (Prevents 0-Energy Active Starvation)
+    if target_card_id == active_id and active_id in (401, 414, 431):
+        req_a = 3 if active_id == 431 else (2 if active_id == 401 else 1)
+        if target_current_energy < req_a:
+            return 0.30, "Prior Guidance: Active Attacker Energy Priority (Power Active Attacker)"
+
+    # Rule 5: Suppress Spidops Bench Overcharging when Mewtwo ex is Hungry
+    if target_card_id in (400, 401) and target_current_energy >= 1:
+        mewtwo_hungry = (active_id == 431 and active_energy < 3)
+        if not mewtwo_hungry and bench_ids and bench_energies:
+            for b, ben in zip(bench_ids, bench_energies):
+                if b == 431 and ben < 3:
+                    mewtwo_hungry = True
+                    break
+        if mewtwo_hungry:
+            return -0.25, "Prior Guidance: Suppress Spidops Bench Overcharge (Mewtwo ex Needs Energy First)"
+
     bench_e_after = list(bench_energies)
     is_act = (target_card_id == active_id)  # Fix: define is_act before use (was NameError)
     if not is_act:
@@ -565,7 +590,6 @@ def evaluate_energy_target(
         energy_card_id=energy_card_id
     )
 
-    # Fix Bug 3: Normalize to [0.0, 1.0] for proper MCTS PUCT formula.
-    # bounded_reward is in [-0.10, +0.10]; mapping: (x + 0.10) / 0.20 -> [0.0, 1.0]
-    prior_score = (eval_res.bounded_reward + 0.10) / 0.20
+    # Normalize bounded_reward [-0.10, +0.10] to standard prior bonus range [-0.20, +0.20]
+    prior_score = max(-0.20, min(0.20, eval_res.bounded_reward * 2.0))
     return prior_score, "StateTransition_Energy_Valuation"

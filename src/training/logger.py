@@ -50,7 +50,11 @@ class MetricsLogger:
         "r_search_quality", "r_search_tempo",
         "avg_game_length", "policy_entropy", "action_diversity", "explained_variance", "mean_return", "mean_advantage", "value_prediction_mean",
         "reference_kl", "parameter_delta", "gradient_norm", "end_action_ratio", "attack_action_ratio", "attach_action_ratio", "play_action_ratio", "ability_action_ratio", "retreat_action_ratio",
-        "checkpoint_loaded", "checkpoint_epoch"
+        "checkpoint_loaded", "checkpoint_epoch",
+        # Architecture health metrics: NN vs MCTS decision quality
+        "nn_mcts_disagreement_rate",  # Fraction of steps where MCTS chose different action than NN top-1
+        "expert_scale_mean",           # Average expert confidence scale this epoch
+        "expert_bonus_mean",           # Average absolute expert bonus magnitude
     ]
 
     ACTION_DIST_HEADER = [
@@ -69,21 +73,31 @@ class MetricsLogger:
         "epoch", "opponent_name", "trigger", "action_type", "bonus", "result", "turn", "my_prizes", "opp_prizes"
     ]
 
+    NN_VS_MCTS_HEADER = [
+        # Per-game record of when MCTS disagreed with the NN's raw top-1 choice
+        "epoch", "opponent_name", "result", "total_steps",
+        "disagreement_steps",    # Steps where MCTS chose different action than NN top-1
+        "disagreement_rate",     # disagreement_steps / total_steps
+        "nn_won_disagreements",  # Steps where final action matched NN, not MCTS-expert
+    ]
+
     def __init__(self, run_dir: str):
         self.run_dir = run_dir
         os.makedirs(self.run_dir, exist_ok=True)
 
-        self.metrics_path = os.path.join(self.run_dir, "training_metrics.csv")
+        self.metrics_path     = os.path.join(self.run_dir, "training_metrics.csv")
         self.action_dist_path = os.path.join(self.run_dir, "action_distribution.csv")
         self.deck_matchup_path = os.path.join(self.run_dir, "deck_matchup.csv")
-        self.self_play_path = os.path.join(self.run_dir, "self_play_games.csv")
-        self.expert_log_path = os.path.join(self.run_dir, "expert_guidance.csv")
+        self.self_play_path   = os.path.join(self.run_dir, "self_play_games.csv")
+        self.expert_log_path  = os.path.join(self.run_dir, "expert_guidance.csv")
+        self.nn_vs_mcts_path  = os.path.join(self.run_dir, "nn_vs_mcts.csv")
 
         self._init_file(self.metrics_path, self.METRICS_HEADER)
         self._init_file(self.action_dist_path, self.ACTION_DIST_HEADER)
         self._init_file(self.deck_matchup_path, self.DECK_MATCHUP_HEADER)
         self._init_file(self.self_play_path, self.SELF_PLAY_HEADER)
         self._init_file(self.expert_log_path, self.EXPERT_LOG_HEADER)
+        self._init_file(self.nn_vs_mcts_path, self.NN_VS_MCTS_HEADER)
 
     def _init_file(self, filepath: str, header: List[str]) -> None:
         """Creates CSV file with header if it does not already exist."""
@@ -217,16 +231,30 @@ class MetricsLogger:
                 writer.writerow([
                     epoch,
                     opp_name,
-                    entry.get("trigger", "NONE"),
-                    entry.get("action_type", -1),
-                    entry.get("bonus", 0.0),
-                    entry.get("result", -1),
-                    entry.get("turn", -1),
-                    entry.get("my_prizes", -1),
-                    entry.get("opp_prizes", -1),
+                    entry.get("trigger", ""),
+                    entry.get("action_type", ""),
+                    f"{entry.get('bonus', 0.0):.4f}",
+                    entry.get("result", ""),
+                    entry.get("turn", 0),
+                    entry.get("my_prizes", 6),
+                    entry.get("opp_prizes", 6),
                 ])
             f.flush()
             try:
                 os.fsync(f.fileno())
             except Exception:
                 pass
+
+    def log_nn_vs_mcts(self, epoch: int, opp_name: str, result_label: str, total_steps: int, disagreement_steps: int) -> None:
+        """Logs NN vs MCTS disagreement metrics for a single completed game."""
+        disagreement_rate = (disagreement_steps / max(1, total_steps)) * 100.0
+        row = [
+            epoch,
+            opp_name,
+            result_label,
+            total_steps,
+            disagreement_steps,
+            f"{disagreement_rate:.2f}%",
+            total_steps - disagreement_steps,
+        ]
+        self._write_and_flush(self.nn_vs_mcts_path, row)

@@ -1,18 +1,81 @@
-*.pdf
-*.csv
+# ============================================================
+# Pokémon TCG AI — .gitignore
+# ============================================================
 
-# Ignore generated images and metrics plots
-*.png
-
-# Ignore packaged submission tarballs
-*.gz
-*.tar.gz
-
-
-# Ignore local checkpoints and models
+# ---- Model Checkpoints (too large for GitHub; see models/README.md) ----
 *.pth
-out/
+*.pt
+*.ckpt
 
-# Ignore Python bytecode and runtime caches
+# ---- Submission Archives ----
+*.tar.gz
+*.gz
+
+# ---- Card Data PDFs (large reference files) ----
+*.pdf
+
+# ---- Generated Analysis CSVs (not needed for reproducibility) ----
+retreat_audit.csv
+deep_retreat_audit.csv
+retreat_audit_matches.csv
+
+# Note: deck.csv, deck_mewtwo.csv, decks/**/deck.csv, EN_Card_Data.csv are tracked.
+# Do NOT add a blanket *.csv rule as it cannot be negated in subdirectories.
+
+# ---- Training Run Outputs ----
+out/
+runs_dragapult/
+
+# ---- Replay / Match JSON Dumps ----
+replays/
+replays_student_vs_teacher/
+lostNEW/
+LOSTLAST/
+
+# ---- Generated Visualization / Analysis Files ----
+*.png
+vis.json
+vis_crustle.json
+extracted_deck_images/
+
+# ---- Generated Analysis CSVs ----
+retreat_audit.csv
+deep_retreat_audit.csv
+retreat_audit_matches.csv
+
+# ---- Temporary / Debug Files ----
+*.log
+*.tmp
+*.bak
+*.txt
+# Track only documentation text files
+!documentation/*.md
+!src/strategies/*.md
+
+# ---- Python Bytecode & Caches ----
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
 .ipynb_checkpoints/
+*.ipynb
+
+# ---- Virtual Environments ----
+.venv/
+venv/
+env/
+.env
+
+# ---- IDE Configuration ----
+.vscode/
+.idea/
+*.code-workspace
+
+# ---- OS Artifacts ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Scratch / One-off Scripts ----
+scratch/

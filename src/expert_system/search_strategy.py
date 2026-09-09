@@ -203,13 +203,26 @@ def evaluate_search_target_prior(card_id: int, ctx: dict) -> Tuple[float, str]:
     # B. SPIDOPS LINE (Evolution & Territory Control)
     # -------------------------------------------------------------------------
     elif card_id == SPIDOPS_ID:
+        opp_act_id = ctx.get("opp_active_id", -1)
+        opp_name = ctx.get("opponent_name", "")
+        is_crustle = (opp_act_id in (344, 345, 407, 408)) or any(k in opp_name.lower() for k in ("crustle", "dwebble"))
+        if is_crustle:
+            return 0.55, "CRITICAL Search Priority: Fetch Spidops vs Crustle (Single-Prize EX Immunity Hard Counter!)"
+        is_darkness = (opp_act_id in (646, 647, 648, 112, 104)) or any(k in opp_name.lower() for k in ("grimmsnarl", "marnie", "darkness"))
+        if is_darkness:
+            return 0.50, "CRITICAL Search Priority: Fetch Spidops vs Darkness EX (2x Grass Weakness OHKO!)"
         if ctx.get("has_tarountula_in_play", False) and not ctx.get("has_spidops_in_play", False):
-            return 0.18, "Search Priority: Spidops Evolution Ready Target"
+            return 0.25, "Search Priority: Spidops Evolution Ready Target"
         elif not ctx.get("has_spidops_in_play", False):
-            return 0.12, "Search Priority: Spidops Line Setup Target"
-        return 0.06, "Search: Secondary Spidops"
+            return 0.18, "Search Priority: Spidops Line Setup Target"
+        return 0.05, "Search: Additional Spidops"
 
     elif card_id == TAROUNTULA_ID:
+        opp_act_id = ctx.get("opp_active_id", -1)
+        opp_name = ctx.get("opponent_name", "")
+        is_crustle = (opp_act_id in (344, 345, 407, 408)) or any(k in opp_name.lower() for k in ("crustle", "dwebble"))
+        if is_crustle and not ctx.get("has_tarountula_in_play", False):
+            return 0.40, "CRITICAL Search Priority: Fetch Tarountula vs Crustle Base Line"
         if not ctx.get("has_tarountula_in_play", False) and not ctx.get("has_spidops_in_play", False):
             return 0.16, "Search Priority: Deploy Tarountula Base Line"
         elif ctx.get("my_bench_count", 0) <= 1:

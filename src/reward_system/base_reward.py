@@ -45,6 +45,7 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
         "r_action_conv": 0.0,
         "r_search_quality": 0.0,
         "r_search_tempo": 0.0,
+        "r_early_spidops": 0.0,  # ALL10 evidence: Spidops attack turn 7.9 wins vs 10.7 losses (2.8-turn gap)
     }
 
     # 1. Knockout Execution & Damage Efficiency & Lethal Detection (MAIN WIN OBJECTIVE: DOMINANT REWARD SIGNAL)
@@ -170,11 +171,13 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
         readiness_delta = post_readiness - pre_readiness
         survival_delta  = post_survival  - pre_survival
 
-        # Powered/Healthy Attacker Retreat Penalty:
-        # If pre-active had ANY energy (>= 1) AND (pre_hp > 30 or had legal attack option),
-        # retreating discards energy and wastes turn tempo.
+        # Powered/Healthy Attacker or Pointless Unpowered Retreat Penalty:
+        # If pre-active had energy (>= 1) AND (pre_hp > 30 or had_legal_attack),
+        # OR if pre-active was healthy (pre_hp > 30) and post-active has no ready attacker (post_act_en < post_min_req),
+        # penalize as a wasteful retreat.
         had_legal_attack = pre.get("has_attack_option", False)
-        if pre_act_en >= 1 and (pre_hp > 30 or had_legal_attack):
+        post_has_ready = (post_act_en >= post_min_req)
+        if (pre_act_en >= 1 and (pre_hp > 30 or had_legal_attack)) or (pre_hp > 30 and not post_has_ready):
             components["r_retreat_eff"] = -0.50
         else:
             energy_cost = -0.10 * pre_act_en if (pre_hp >= 80 and pre_act_en > 0) else 0.0
@@ -215,7 +218,7 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
     act_ready = (pre_act_en >= _attack_threshold)
     had_legal_attack = pre.get("has_attack_option", False)
     if action_type in (0, 14) and act_ready and had_legal_attack and (pre_opp_hp - post_opp_hp <= 0):
-        components["r_missed_attack"] = -0.40
+        components["r_missed_attack"] = -1.00 if turn_curr > 5 else -0.75
 
     # 12. Slow Setup / Idle Pass Penalty (turns 2-5 with zero energy or empty bench)
     if action_type in (0, 14):
@@ -223,6 +226,18 @@ def calculate_base_strategic_reward_components(pre: dict, post: dict, action_typ
         bench_cnt = pre.get("bench_size", 0)
         if 2 <= turn_curr <= 5 and (total_board_en == 0 or bench_cnt == 0):
             components["r_slow_setup"] = -0.10
+
+    # 13. Early Aggro Attack Velocity Reward (turns 1-5)
+    if action_type == 13 and turn_curr <= 5:
+        components["r_early_aggro"] = 0.15
+
+    # 14. Spidops Early Attack Bonus (ALL10 evidence-based)
+    # Spidops first attack: turn 7.9 in wins vs 10.7 in losses (2.8-turn gap = strongest win predictor)
+    # +0.08 when Spidops attacks before turn 9. Small, bounded; stacks with r_early_aggro only on turns 1-5.
+    _SPIDOPS_ID = 401
+    _pre_active_id = pre.get("active_id", -1)
+    if action_type == 13 and _pre_active_id == _SPIDOPS_ID and turn_curr < 9:
+        components["r_early_spidops"] = 0.08
 
     return components
 

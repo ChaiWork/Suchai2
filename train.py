@@ -10,18 +10,18 @@ import queue
 import threading
 import multiprocessing as mp
 
-# Configure D drive for temporary storage and PyTorch cache to save space on C drive
-for path in ["D:/temp", "D:/torch_cache"]:
-    if not os.path.exists(path):
-        try:
-            os.makedirs(path, exist_ok=True)
-        except Exception:
-            pass
-
-os.environ["TMPDIR"] = "D:/temp"
-os.environ["TEMP"] = "D:/temp"
-os.environ["TMP"] = "D:/temp"
-os.environ["TORCH_HOME"] = "D:/torch_cache"
+# Allow overriding temp/cache directories via environment variables.
+# Set POKEMON_AI_TMPDIR and/or POKEMON_AI_TORCH_HOME before running to
+# redirect temporary files (e.g. on a machine with limited C: space).
+_tmp = os.environ.get("POKEMON_AI_TMPDIR")
+if _tmp:
+    os.makedirs(_tmp, exist_ok=True)
+    os.environ.setdefault("TMPDIR", _tmp)
+    os.environ.setdefault("TEMP", _tmp)
+    os.environ.setdefault("TMP", _tmp)
+_torch_home = os.environ.get("POKEMON_AI_TORCH_HOME")
+if _torch_home:
+    os.environ.setdefault("TORCH_HOME", _torch_home)
 if sys.platform == "win32":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 else:
@@ -112,13 +112,24 @@ def main():
         "Rulebasedmodel_Crustle", "Rulebasedmodel_Honchkrow", "Rulebasedmodel_Lopunny",
         "Rulebasedmodel_Marnie_Kangaskhan", "Rulebasedmodel_Typhlosion",
         # --- HARD OPPONENT DECKS ---
-        "Rulebasedmodel_Dragapult", "Rulebasedmodel_Lucario", "Rulebasedmodel_Starmie",
-        "Rulebasedmodel_Dipplin", "Rulebasedmodel_Iono", "Rulebasedmodel_Archaludon",
-        "Rulebasedmodel_Alakazam", "Rulebasedmodel_Kangaskhan_Crustle", "Rulebasedmodel_Grimmsnarl",
-        "Rulebasedmodel_Trevenant", "Rulebasedmodel_Mewtwo_Wobbuffet", "Rulebasedmodel_Garchomp_ex",
-        "Rulebasedmodel_Garchomp_ex_2", "Rulebasedmodel_Grimmsnarl_ex", "Rulebasedmodel_HoOh_HeartGold",
-        "Rulebasedmodel_Hydrapple_ex", "Rulebasedmodel_Hydrapple_Ogerpon", "Rulebasedmodel_Metagross_Grass",
-        "Rulebasedmodel_Ogerpon_ex", "Rulebasedmodel_Starmie_ex_2"
+        "Rulebasedmodel_Dragapult", "Rulebasedmodel_PhantomDive_Dragapult", "Rulebasedmodel_MegaKangaskhan_Speed",
+        "Rulebasedmodel_Lucario", "Rulebasedmodel_Starmie", "Rulebasedmodel_Dipplin", "Rulebasedmodel_Iono",
+        "Rulebasedmodel_Archaludon", "Rulebasedmodel_Alakazam", "Rulebasedmodel_Codex_Sol_Eclipse_Alakazam", "Rulebasedmodel_Kangaskhan_Crustle",
+        "Rulebasedmodel_Grimmsnarl", "Rulebasedmodel_Trevenant", "Rulebasedmodel_Mewtwo_Wobbuffet",
+        "Rulebasedmodel_Garchomp_ex", "Rulebasedmodel_Garchomp_ex_2", "Rulebasedmodel_Grimmsnarl_ex",
+        "Rulebasedmodel_HoOh_HeartGold", "Rulebasedmodel_Hydrapple_ex", "Rulebasedmodel_Hydrapple_Ogerpon",
+        "Rulebasedmodel_Metagross_Grass", "Rulebasedmodel_Ogerpon_ex", "Rulebasedmodel_Starmie_ex_2",
+        "Rulebasedmodel_SixthSense_Dragapult", "Rulebasedmodel_TopPlayer_AlphaStarmie_Archetype",
+        "Rulebasedmodel_TopPlayer_ANDPAD_kaggler_team_Teal_Mask_Ogerpon_ex_Meganium",
+        "Rulebasedmodel_TopPlayer_ANDPAD_kaggler_team_Teal_Mask_Ogerpon_ex_Meowth_ex",
+        "Rulebasedmodel_TopPlayer_Dipam_Chakraborty_Teal_Mask_Ogerpon_ex_Meowth_ex",
+        "Rulebasedmodel_TopPlayer_flg_Archetype", "Rulebasedmodel_TopPlayer_flg_Dragapult_ex",
+        "Rulebasedmodel_TopPlayer_James_Cox_and_Henry_Chao_Meowth_ex_Mega_Kangaskhan_ex",
+        "Rulebasedmodel_TopPlayer_LiamK_Archetype", "Rulebasedmodel_TopPlayer_LiamK_Dragapult_ex",
+        "Rulebasedmodel_TopPlayer_Luca_Mega_Lucario_ex", "Rulebasedmodel_TopPlayer_LumenLiquidity_Archetype",
+        "Rulebasedmodel_TopPlayer_Majkel1337_Mega_Lucario_ex", "Rulebasedmodel_TopPlayer_Oshbocker_Teal_Mask_Ogerpon_ex_Meganium",
+        "Rulebasedmodel_TopPlayer_palsystem_Archetype", "Rulebasedmodel_TopPlayer_Phil_Hellmuth_Archetype",
+        "Rulebasedmodel_TopPlayer_Raihan_Ramadistra_Dragapult_ex", "Rulebasedmodel_TopPlayer_やる気元気ミワハルキ_Dragapult_ex"
     ]
     opponent_decks = {k: v for k, v in opponent_decks.items() if k in allowed_opponents}
     if not opponent_decks:
@@ -414,6 +425,13 @@ def main():
                     print(f"Early stopping triggered.")
                     break
         
+        epoch_self_play_games = 0.0
+        epoch_self_play_wins = 0.0
+        epoch_first_wins = 0.0
+        epoch_first_games = 0.0
+        epoch_second_wins = 0.0
+        epoch_second_games = 0.0
+
         if args.self_play_episodes > 0:
             p1_norm = compute_model_norm(model)
             p1_hash = hex(abs(hash(tuple(p.view(-1)[0].item() for p in model.parameters() if p.requires_grad))))[-8:]
@@ -429,12 +447,6 @@ def main():
             drain_queue(result_queue)
             games_sent = 0
             games_received = 0
-            epoch_self_play_games = 0.0
-            epoch_self_play_wins = 0.0
-            epoch_first_wins = 0.0
-            epoch_first_games = 0.0
-            epoch_second_wins = 0.0
-            epoch_second_games = 0.0
             active_tasks = {}
             active_elo = league_elos.get("active", 1500.0)
             league_completed = 0
@@ -493,6 +505,8 @@ def main():
                 expert_log    = data[9] if len(data) > 9 else []
                 went_second   = data[10] if len(data) > 10 else False
                 my_player_idx = data[11] if len(data) > 11 else 0
+                tot_steps     = data[12] if len(data) > 12 else final_turn
+                disag_steps   = data[13] if len(data) > 13 else 0
                 games_received += 1
 
                 if action_counts:
@@ -514,6 +528,7 @@ def main():
 
                 logger.log_self_play_game(counter, opp_name, result_label, final_turn, action_counts)
                 logger.log_expert_guidance(counter, opp_name, expert_log)
+                logger.log_nn_vs_mcts(counter, opp_name, result_label, tot_steps, disag_steps)
 
                 if result >= 0:
                     epoch_self_play_games += 1.0

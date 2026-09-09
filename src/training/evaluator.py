@@ -6,46 +6,92 @@ import queue
 import random
 import importlib
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
-def rule_based_opponent_agent(opponent_name, obs):
-    mapping = {
-        "Rulebasedmodel": ["easy.main"],
-        "Rulebasedmodel_Mewtwo_Easy": ["easy.mewtwo_agent_easy"],
-        "Rulebasedmodel_Mewtwo": ["easy.mewtwo_agent"],
-        "Rulebasedmodel_Abomasnow": ["easy.abomasnow_agent"],
-        "Rulebasedmodel_Crustle": ["easy.crustle_agent"],
-        "Rulebasedmodel_Lopunny": ["easy.lopunny_agent"],
-        "Rulebasedmodel_Typhlosion": ["easy.typhlosion_agent"],
-        "Rulebasedmodel_Marnie_Kangaskhan": ["easy.marnie_kangaskhan_agent"],
-        "Rulebasedmodel_Honchkrow": ["easy.honchkrow_agent"],
-        
-        "Rulebasedmodel_Alakazam": ["hard.alakazam_agent"],
-        "Rulebasedmodel_Archaludon": ["hard.archaludon_agent"],
-        "Rulebasedmodel_Dipplin": ["hard.dipplin_agent"],
-        "Rulebasedmodel_Dragapult": ["hard.dragapult_agent"],
-        "Rulebasedmodel_Grimmsnarl": ["hard.grimmsnarl_agent"],
-        "Rulebasedmodel_Iono": ["hard.iono_agent"],
-        "Rulebasedmodel_Kangaskhan_Crustle": ["hard.kangaskhan_crustle_agent"],
-        "Rulebasedmodel_Lucario": ["hard.lucario_agent"],
-        "Rulebasedmodel_Mewtwo_Wobbuffet": ["hard.mewtwo_wobbuffet_agent"],
-        "Rulebasedmodel_Starmie": ["hard.starmie_agent"],
-        "Rulebasedmodel_Trevenant": ["hard.trevenant_agent"],
-        "Rulebasedmodel_TR_Mewtwo": ["team_rocket_mewtwo_rule_agent"],
-        
-        "Rulebasedmodel_Hydrapple_Ogerpon": ["hard.hydrapple_ogerpon_agent"],
-        "Rulebasedmodel_Grimmsnarl_ex": ["hard.grimmsnarl_ex_agent"],
-        "Rulebasedmodel_Garchomp_ex": ["hard.garchomp_ex_agent"],
-        "Rulebasedmodel_Hydrapple_ex": ["hard.hydrapple_ex_agent"],
-        "Rulebasedmodel_Ogerpon_ex": ["hard.ogerpon_ex_agent"],
-        "Rulebasedmodel_Garchomp_ex_2": ["hard.garchomp_ex_2_agent"],
-        "Rulebasedmodel_HoOh_HeartGold": ["hard.hooh_heartgold_agent"],
-        "Rulebasedmodel_Starmie_ex_2": ["hard.starmie_ex_2_agent"],
-        "Rulebasedmodel_Metagross_Grass": ["hard.metagross_grass_agent"],
-        "Rulebasedmodel_Tyranitar": ["hard.tyranitar_sandaconda_agent"],
-        "Rulebasedmodel_Crustle_Stall": ["hard.crustle_stall_agent"],
-        "DRAGOPULT": ["hard.dragapult_agent"]
-    }
+
+def safe_print(msg: str):
+    """Safely print message preventing UnicodeEncodeError on Windows CP1252 consoles."""
+    try:
+        print(msg)
+    except Exception:
+        try:
+            safe_msg = msg.encode("ascii", "backslashreplace").decode("ascii")
+            print(safe_msg)
+        except Exception:
+            pass
+
+
+MAPPING = {
+    "Rulebasedmodel": ["easy.main"],
+    "Rulebasedmodel_Mewtwo_Easy": ["easy.mewtwo_agent_easy"],
+    "Rulebasedmodel_Mewtwo": ["easy.mewtwo_agent"],
+    "Rulebasedmodel_Abomasnow": ["easy.abomasnow_agent"],
+    "Rulebasedmodel_Crustle": ["easy.crustle_agent"],
+    "Rulebasedmodel_Lopunny": ["easy.lopunny_agent"],
+    "Rulebasedmodel_Typhlosion": ["easy.typhlosion_agent"],
+    "Rulebasedmodel_Marnie_Kangaskhan": ["easy.marnie_kangaskhan_agent"],
+    "Rulebasedmodel_Honchkrow": ["easy.honchkrow_agent"],
     
+    "Rulebasedmodel_Alakazam": ["hard.alakazam_agent"],
+    "Rulebasedmodel_Best5th_Alakazam": ["hard.best_5th_alakazam_agent"],
+    "Rulebasedmodel_Codex_Sol_Eclipse_Alakazam": ["hard.codex_sol_eclipse_alakazam_agent"],
+    "Rulebasedmodel_Archaludon": ["hard.archaludon_agent"],
+    "Rulebasedmodel_Dipplin": ["hard.dipplin_agent"],
+    "Rulebasedmodel_Dragapult": ["hard.top_player_dragapult_agent"],
+    "Rulebasedmodel_PhantomDive_Dragapult": ["hard.phantom_dive_dragapult_agent"],
+    "Rulebasedmodel_MegaKangaskhan_Speed": ["hard.mega_kangaskhan_speed_agent"],
+    "Rulebasedmodel_Grimmsnarl": ["hard.grimmsnarl_agent"],
+    "Rulebasedmodel_Iono": ["hard.iono_agent"],
+    "Rulebasedmodel_Kangaskhan_Crustle": ["hard.kangaskhan_crustle_agent"],
+    "Rulebasedmodel_Lucario": ["hard.lucario_agent"],
+    "Rulebasedmodel_Mewtwo_Wobbuffet": ["hard.mewtwo_wobbuffet_agent"],
+    "Rulebasedmodel_Starmie": ["hard.starmie_agent"],
+    "Rulebasedmodel_Trevenant": ["hard.trevenant_agent"],
+    "Rulebasedmodel_TR_Mewtwo": ["easy.mewtwo_agent", "hard.mewtwo_agent"],
+    
+    "Rulebasedmodel_Hydrapple_Ogerpon": ["hard.hydrapple_ogerpon_agent"],
+    "Rulebasedmodel_Grimmsnarl_ex": ["hard.grimmsnarl_ex_agent"],
+    "Rulebasedmodel_Garchomp_ex": ["hard.garchomp_ex_agent"],
+    "Rulebasedmodel_Hydrapple_ex": ["hard.hydrapple_ex_agent"],
+    "Rulebasedmodel_Ogerpon_ex": ["hard.ogerpon_ex_agent"],
+    "Rulebasedmodel_Garchomp_ex_2": ["hard.garchomp_ex_2_agent"],
+    "Rulebasedmodel_HoOh_HeartGold": ["hard.hooh_heartgold_agent"],
+    "Rulebasedmodel_Starmie_ex_2": ["hard.starmie_ex_2_agent"],
+    "Rulebasedmodel_Metagross_Grass": ["hard.metagross_grass_agent"],
+    "Rulebasedmodel_Tyranitar": ["hard.tyranitar_sandaconda_agent"],
+    "Rulebasedmodel_Crustle_Stall": ["hard.crustle_stall_agent"],
+    "Rulebasedmodel_SixthSense_Dragapult": ["hard.top_player_dragapult_agent"],
+    "DRAGOPULT": ["hard.top_player_dragapult_agent"],
+
+    # --- TOP PLAYER ARCHETYPES ---
+    "Rulebasedmodel_TopPlayer_AlphaStarmie_Archetype": ["hard.starmie_agent"],
+    "Rulebasedmodel_TopPlayer_ANDPAD_kaggler_team_Teal_Mask_Ogerpon_ex_Meganium": ["hard.ogerpon_ex_agent"],
+    "Rulebasedmodel_TopPlayer_ANDPAD_kaggler_team_Teal_Mask_Ogerpon_ex_Meowth_ex": ["hard.ogerpon_ex_agent"],
+    "Rulebasedmodel_TopPlayer_Dipam_Chakraborty_Teal_Mask_Ogerpon_ex_Meowth_ex": ["hard.ogerpon_ex_agent"],
+    "Rulebasedmodel_TopPlayer_flg_Archetype": ["hard.top_player_dragapult_agent"],
+    "Rulebasedmodel_TopPlayer_flg_Dragapult_ex": ["hard.top_player_dragapult_agent"],
+    "Rulebasedmodel_TopPlayer_James_Cox_and_Henry_Chao_Meowth_ex_Mega_Kangaskhan_ex": ["hard.mega_kangaskhan_speed_agent"],
+    "Rulebasedmodel_TopPlayer_LiamK_Archetype": ["hard.top_player_dragapult_agent"],
+    "Rulebasedmodel_TopPlayer_LiamK_Dragapult_ex": ["hard.top_player_dragapult_agent"],
+    "Rulebasedmodel_TopPlayer_Luca_Mega_Lucario_ex": ["hard.lucario_agent"],
+    "Rulebasedmodel_TopPlayer_LumenLiquidity_Archetype": ["hard.starmie_agent"],
+    "Rulebasedmodel_TopPlayer_Majkel1337_Mega_Lucario_ex": ["hard.lucario_agent"],
+    "Rulebasedmodel_TopPlayer_Oshbocker_Teal_Mask_Ogerpon_ex_Meganium": ["hard.ogerpon_ex_agent"],
+    "Rulebasedmodel_TopPlayer_palsystem_Archetype": ["hard.top_player_dragapult_agent"],
+    "Rulebasedmodel_TopPlayer_Phil_Hellmuth_Archetype": ["hard.top_player_dragapult_agent"],
+    "Rulebasedmodel_TopPlayer_Raihan_Ramadistra_Dragapult_ex": ["hard.top_player_dragapult_agent"],
+    "Rulebasedmodel_TopPlayer_やる気元気ミワハルキ_Dragapult_ex": ["hard.top_player_dragapult_agent"],
+}
+
 _opponent_module_cache = {}
 
 
@@ -53,7 +99,30 @@ def rule_based_opponent_agent(opponent_name, obs):
     if opponent_name in _opponent_module_cache:
         return _opponent_module_cache[opponent_name].agent(obs)
 
-    modules = mapping.get(opponent_name, [opponent_name])
+    modules = MAPPING.get(opponent_name, None)
+    if modules is None and "TopPlayer" in opponent_name:
+        name_lower = opponent_name.lower()
+        if "starmie" in name_lower:
+            modules = ["hard.starmie_agent"]
+        elif "dragapult" in name_lower:
+            modules = ["hard.top_player_dragapult_agent"]
+        elif "lucario" in name_lower:
+            modules = ["hard.lucario_agent"]
+        elif "ogerpon" in name_lower or "meganium" in name_lower:
+            modules = ["hard.ogerpon_ex_agent"]
+        elif "kangaskhan" in name_lower or "meowth" in name_lower:
+            modules = ["hard.mega_kangaskhan_speed_agent"]
+        elif "garchomp" in name_lower:
+            modules = ["hard.garchomp_ex_agent"]
+        elif "alakazam" in name_lower:
+            modules = ["hard.alakazam_agent"]
+        elif "grimmsnarl" in name_lower:
+            modules = ["hard.grimmsnarl_agent"]
+        else:
+            modules = ["easy.main"]
+    elif modules is None:
+        modules = [opponent_name]
+
     for mod_path in modules:
         try:
             mod = importlib.import_module(f"Rulebasedmodel.{mod_path}")
@@ -61,6 +130,14 @@ def rule_based_opponent_agent(opponent_name, obs):
             return mod.agent(obs)
         except Exception:
             pass
+
+    # Fallback to easy main if specific module fails
+    try:
+        mod = importlib.import_module("Rulebasedmodel.easy.main")
+        _opponent_module_cache[opponent_name] = mod
+        return mod.agent(obs)
+    except Exception:
+        pass
 
     raise ValueError(f"Unknown rule-based opponent: {opponent_name}")
 
@@ -102,11 +179,11 @@ def load_all_decks():
                         card_ids = [int(line.strip()) for line in f if line.strip()]
                         if len(card_ids) == 60:
                             decks[folder_name] = card_ids
-                            print(f"Loaded deck '{folder_name}' from {deck_file}")
+                            safe_print(f"Loaded deck '{folder_name}' from {deck_file}")
                         else:
-                            print(f"Warning: Deck in {deck_file} has {len(card_ids)} cards (must be 60). Skipping.")
+                            safe_print(f"Warning: Deck in {deck_file} has {len(card_ids)} cards (must be 60). Skipping.")
                 except Exception as e:
-                    print(f"Error loading deck from {deck_file}: {e}")
+                    safe_print(f"Error loading deck from {deck_file}: {e}")
     return decks
 
 
