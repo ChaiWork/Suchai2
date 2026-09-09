@@ -15,13 +15,13 @@ Model weights (`.pth` / `.pt` files) are **not committed** to this repository du
 
 ```bash
 # Linux / macOS
-wget https://github.com/<your-username>/<your-repo>/releases/download/v1.0.0/best_model.pth
+wget https://github.com/ChaiWork/Suchai2/releases/download/v1.0.0/best_model.pth
 
 # Windows PowerShell
-Invoke-WebRequest -Uri "https://github.com/<your-username>/<your-repo>/releases/download/v1.0.0/best_model.pth" -OutFile "best_model.pth"
+Invoke-WebRequest -Uri "https://github.com/ChaiWork/Suchai2/releases/download/v1.0.0/best_model.pth" -OutFile "best_model.pth"
 ```
 
-Or download manually from the [GitHub Releases page](https://github.com/<your-username>/<your-repo>/releases/latest).
+Or download manually from the [GitHub Releases page](https://github.com/ChaiWork/Suchai2/releases/latest).
 
 **Option 2 — Train from scratch:**
 ```bash
