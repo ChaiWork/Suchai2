@@ -1,0 +1,639 @@
+import sys
+import random
+import torch
+from cg.game import battle_start, battle_finish, battle_select
+from cg.api import to_observation_class, OptionType, SelectContext, CardType, EnergyType
+
+from model import (
+    MyModel,
+    MODEL_D_MODEL,
+    MODEL_NUM_HEADS,
+    MODEL_D_FEEDFORWARD,
+    MODEL_NUM_LAYERS_ENCODER,
+    MODEL_NUM_LAYERS_DECODER,
+)
+from agent import mcts_agent, random_agent, GPUInferenceClient
+try:
+    from expert_knowledge import get_expert_bonus
+except ImportError:
+    from src.expert_knowledge import get_expert_bonus
+
+from training.card_database import (
+    get_card_data, is_defensive_blocker, can_attack,
+    count_effective_energy_cards, count_attached_energy,
+    count_active_energy, count_pokemon, attack_table
+)
+from training.evaluator import rule_based_opponent_agent
+from training.gae import compute_gae_advantages
+from training.rewards import calculate_strategic_reward, calculate_strategic_reward_components
+
+
+def worker_loop(worker_id, command_queue, result_queue, inference_conn, device_str):
+    """The game worker execution loop."""
+    random.seed(42 + worker_id)
+    torch.manual_seed(42 + worker_id)
+    device = torch.device(device_str)
+    
+    client = GPUInferenceClient(inference_conn)
+    
+    while True:
+        try:
+            cmd, args = command_queue.get()
+        except KeyboardInterrupt:
+            break
+            
+        if cmd == "STOP":
+            break
+            
+        elif cmd == "PLAY_SELF":
+            sample_deck, opponent_deck, opponent_type, opponent_path = args[:4]
+            opponent_name = args[4] if len(args) > 4 else "Current (Self)"
+            current_epoch = args[5] if len(args) > 5 else 0  # epoch counter for warmup schedule
+            
+            opp_model = None
+            if opponent_path is not None:
+                try:
+                    _opp_model_module = MyModel(
+                        MODEL_D_MODEL,
+                        MODEL_NUM_HEADS,
+                        MODEL_D_FEEDFORWARD,
+                        MODEL_NUM_LAYERS_ENCODER,
+                        MODEL_NUM_LAYERS_DECODER
+                    ).to(device)
+                    checkpoint = torch.load(opponent_path, map_location=device, weights_only=True)
+                    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                        _opp_model_module.load_state_dict(checkpoint["state_dict"], strict=False)
+                    else:
+                        _opp_model_module.load_state_dict(checkpoint, strict=False)
+                    _opp_model_module.eval()
+                    opp_model = GPUInferenceClient(_opp_model_module, device)
+                except Exception as e:
+                    opp_model = None
+            
+            went_second = (random.random() < 0.5)
+            d0 = opponent_deck if went_second else sample_deck
+            d1 = sample_deck if went_second else opponent_deck
+            my_player_idx = 1 if went_second else 0
+
+            try:
+                obs, start_data = battle_start(d0, d1)
+                if start_data.errorPlayer >= 0:
+                    result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {}, [], went_second, my_player_idx)))
+                    continue
+            except Exception as e:
+                result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {}, [], went_second, my_player_idx)))
+                continue
+
+            try:
+                action_counts = {"attack": 0, "play": 0, "attach": 0, "evolve": 0, "ability": 0, "retreat": 0, "end": 0, "other": 0}
+                total_steps = 0
+                disagreement_steps = 0
+                played_cards = {}
+                samples = [[], []]
+                expert_log = []  # Per-step expert guidance log
+                
+                # Episode-state active spot lockout trackers
+                episode_lockouts = [0, 0]
+                episode_active_serials = [None, None]
+                episode_attacked = [False, False]
+                episode_last_turns = [None, None]
+                
+                step_count = 0
+                while True:
+                    step_count += 1
+                    if obs["current"]["result"] >= 0 or step_count > 400:
+                        if step_count > 400 and obs["current"]["result"] < 0:
+                            obs["current"]["result"] = 2  # Force game draw on timeout to prevent infinite worker hangs
+                        break
+    
+                    curr_player = obs["current"]["yourIndex"]
+                    curr_deck = sample_deck if curr_player == my_player_idx else opponent_deck
+                    
+                    obs_class = to_observation_class(obs)
+                    state_ps = obs_class.current.players[curr_player]
+                    opp_ps = obs_class.current.players[1 - curr_player]
+                    
+                    active_pk = state_ps.active[0] if (len(state_ps.active) > 0 and state_ps.active[0] is not None) else None
+                    active_id = active_pk.id if active_pk else -1
+                    active_energies = count_effective_energy_cards(active_pk.energyCards) if active_pk else 0
+                    
+                    # Track active spot lockout at the episode level
+                    active_serial = active_pk.serial if active_pk else None
+                    turn_num = obs_class.current.turn
+                    
+                    if episode_active_serials[curr_player] != active_serial:
+                        episode_active_serials[curr_player] = active_serial
+                        episode_lockouts[curr_player] = 0
+                        episode_attacked[curr_player] = False
+                        
+                    if episode_last_turns[curr_player] is not None and turn_num != episode_last_turns[curr_player]:
+                        if not episode_attacked[curr_player]:
+                            episode_lockouts[curr_player] += 1
+                        episode_attacked[curr_player] = False
+                    episode_last_turns[curr_player] = turn_num
+                    
+                    opp_active_pk = opp_ps.active[0] if (len(opp_ps.active) > 0 and opp_ps.active[0] is not None) else None
+                    opp_active_id = opp_active_pk.id if opp_active_pk else -1
+                    
+                    bench_list = [p for p in state_ps.bench if p is not None]
+                    bench_ids = [p.id for p in bench_list]
+                    
+                    has_attack_option = False
+                    has_attach_option = False
+                    if obs_class.select is not None and obs_class.select.option is not None:
+                        for opt in obs_class.select.option:
+                            if opt.type == OptionType.ATTACK:
+                                has_attack_option = True
+                            elif opt.type == OptionType.ATTACH:
+                                has_attach_option = True
+
+                    stadium_id = obs_class.current.stadium[0].id if (len(obs_class.current.stadium) > 0 and obs_class.current.stadium[0] is not None) else -1
+                    
+                    pre_metrics = {
+                        "prizes": len(state_ps.prize),
+                        "opp_prizes": len(opp_ps.prize),
+                        "energy": count_attached_energy(state_ps),
+                        "active_energy": count_active_energy(state_ps),
+                        "pokemon": count_pokemon(state_ps),
+                        "opp_pokemon": count_pokemon(opp_ps),
+                        "opp_bench_ids": [p.id for p in opp_ps.bench if p is not None],
+                        "bench_size": len(bench_list),
+                        "deck_size": state_ps.deckCount,
+                        "opp_deck_size": opp_ps.deckCount,
+                        "energy_attached_flag": obs_class.current.energyAttached,
+                        "active_id": active_id,
+                        "active_energies": active_energies,
+                        "opp_active_id": opp_active_id,
+                        "active_hp": active_pk.hp if active_pk else 0,
+                        "opp_active_hp": opp_active_pk.hp if opp_active_pk else 0,
+                        "stadium_id": stadium_id,
+                        "bench_ids": bench_ids,
+                        "bench_energies": [count_effective_energy_cards(p.energyCards) for p in state_ps.bench if p is not None],
+                        "bench_damage": [p.maxHp - p.hp for p in state_ps.bench if p is not None],
+                        "hand_size": len(state_ps.hand) if state_ps.hand is not None else 0,
+                        "hand_ids": [c.id for c in state_ps.hand if c is not None] if state_ps.hand is not None else [],
+                        "discard_size": len(state_ps.discard) if state_ps.discard is not None else 0,
+                        "discard_energy": sum(1 for c in state_ps.discard if c is not None and c.id in [1, 5, 15]),
+                        "turn": obs_class.current.turn,
+                        "has_attack_option": has_attack_option,
+                        "has_attach_option": has_attach_option,
+                        "has_energy_in_hand": any(cid in (1, 15, 2, 3, 4, 5) for cid in ([c.id for c in state_ps.hand if c is not None] if state_ps.hand else [])),
+                        "context": obs_class.select.context if (obs_class.select is not None) else None,
+                        "lockout_turns": episode_lockouts[curr_player]
+                    }
+    
+                    if curr_player == my_player_idx:
+                        turn = obs_class.current.turn if (obs_class.current is not None) else 1
+                        temperature = 1.0 if turn <= 15 else 0.1
+                        try:
+                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=10, temperature=temperature, opponent_name=opponent_name, epoch=current_epoch)
+                        except Exception as mcts_err:
+                            import traceback
+                            import sys
+                            print(f"[MCTS FALLBACK] worker={worker_id} epoch={current_epoch} turn={obs_class.current.turn}: {mcts_err}", file=sys.stderr)
+                            traceback.print_exc(file=sys.stderr)
+                            sys.stderr.flush()
+                            selected = [0]
+                            sample = None
+                        if sample is not None:
+                            sample.pred_val = sample.value
+                            total_steps += 1
+                            nn_top1 = getattr(sample, "nn_top1_idx", 0)
+                            if selected and len(selected) > 0 and selected[0] != nn_top1:
+                                disagreement_steps += 1
+                            
+                            if selected and len(selected) > 0:
+                                try:
+                                    options = obs.get("select", {}).get("option", [])
+                                    if selected[0] < len(options):
+                                        chosen_opt = options[selected[0]]
+                                        exp_bonus, exp_trigger = get_expert_bonus(obs, chosen_opt, opponent_name=opponent_name, epoch=current_epoch)
+                                        if exp_trigger and str(exp_trigger).lower() not in ("none", "disabled") and abs(exp_bonus) > 1e-6:
+                                            curr_turn = obs.get("current", {}).get("turn", 1) if isinstance(obs.get("current"), dict) else 1
+                                            players_list = obs.get("current", {}).get("players", [{}, {}]) if isinstance(obs.get("current"), dict) else [{}, {}]
+                                            my_p = len(players_list[curr_player].get("prize", [])) if len(players_list) > curr_player else 6
+                                            opp_p = len(players_list[1 - curr_player].get("prize", [])) if len(players_list) > (1 - curr_player) else 6
+                                            expert_log.append({
+                                                "trigger":     exp_trigger,
+                                                "action_type": chosen_opt.get("type", -1) if isinstance(chosen_opt, dict) else getattr(chosen_opt, "type", -1),
+                                                "bonus":       exp_bonus,
+                                                "turn":        curr_turn,
+                                                "my_prizes":   my_p,
+                                                "opp_prizes":  opp_p,
+                                            })
+                                except Exception:
+                                    pass
+                            
+                            opt_type_val = -1
+                            played_card_id = -1
+                            attached_card_id = -1
+                            attached_target_id = -1
+                            target_energy = 0
+                            evolved_card_id = -1
+                            attack_id = -1
+                            if selected and len(selected) > 0:
+                                sel_idx = selected[0]
+                                options = obs.get("select", {}).get("option", [])
+                                if sel_idx < len(options):
+                                    opt = options[sel_idx]
+                                    opt_type_val = opt.get("type", -1)
+                                    if opt_type_val == 7: # PLAY
+                                        hand = state_ps.hand
+                                        card_idx = opt.get("index", -1)
+                                        if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
+                                            played_card_id = hand[card_idx].id
+                                            played_cards[played_card_id] = played_cards.get(played_card_id, 0) + 1
+                                    elif opt_type_val == 8: # ATTACH
+                                        hand = state_ps.hand
+                                        card_idx = opt.get("index", -1)
+                                        if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
+                                            attached_card_id = hand[card_idx].id
+                                        target_area = opt.get("inPlayArea", opt.get("area", opt.get("targetArea", -1)))
+                                        target_idx = opt.get("inPlayIndex", opt.get("index", opt.get("targetIndex", -1)))
+                                        if target_area == 4 or target_area == "active": # ACTIVE
+                                            if len(state_ps.active) > 0 and state_ps.active[0] is not None:
+                                                attached_target_id = state_ps.active[0].id
+                                                en_cards = getattr(state_ps.active[0], "energyCards", [])
+                                                target_energy = sum(2 if getattr(ec, "id", getattr(ec, "cardId", -1)) in (15, 19) else 1 for ec in (en_cards or []))
+                                        elif target_area == 5 or target_area == "bench": # BENCH
+                                            if 0 <= target_idx < len(state_ps.bench) and state_ps.bench[target_idx] is not None:
+                                                attached_target_id = state_ps.bench[target_idx].id
+                                                en_cards = getattr(state_ps.bench[target_idx], "energyCards", [])
+                                                target_energy = sum(2 if getattr(ec, "id", getattr(ec, "cardId", -1)) in (15, 19) else 1 for ec in (en_cards or []))
+                                    elif opt_type_val == 9: # EVOLVE
+                                        hand = state_ps.hand
+                                        card_idx = opt.get("index", -1)
+                                        if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
+                                            evolved_card_id = hand[card_idx].id
+                                    elif opt_type_val == 13: # ATTACK
+                                        attack_id = opt.get("attackId", -1)
+                                        
+                            pre_metrics["action_type"] = opt_type_val
+                            pre_metrics["played_card_id"] = played_card_id
+                            pre_metrics["attached_card_id"] = attached_card_id
+                            pre_metrics["attached_target_id"] = attached_target_id
+                            pre_metrics["target_energy"] = target_energy
+                            pre_metrics["evolved_card_id"] = evolved_card_id
+                            pre_metrics["attack_id"] = attack_id
+                            samples[0].append((sample, pre_metrics))
+
+                        if selected and len(selected) > 0:
+                            sel_idx = selected[0]
+                            options = obs.get("select", {}).get("option", [])
+                            if sel_idx < len(options):
+                                opt_type = options[sel_idx].get("type")
+                                if opt_type in (13, getattr(OptionType, "ATTACK", 13), "Attack", "attack"):
+                                    action_counts["attack"] += 1
+                                elif opt_type in (7, getattr(OptionType, "PLAY", 7), "Play", "play"):
+                                    action_counts["play"] += 1
+                                elif opt_type in (8, getattr(OptionType, "ATTACH", 8), "Attach", "attach"):
+                                    action_counts["attach"] += 1
+                                elif opt_type in (9, getattr(OptionType, "EVOLVE", 9), "Evolve", "evolve"):
+                                    action_counts["evolve"] += 1
+                                elif opt_type in (10, 17, getattr(OptionType, "ABILITY", 10), "Ability", "ability"):
+                                    action_counts["ability"] += 1
+                                elif opt_type in (12, getattr(OptionType, "RETREAT", 12), "Retreat", "retreat"):
+                                    action_counts["retreat"] += 1
+                                elif opt_type in (14, getattr(OptionType, "END", 14), "End", "end"):
+                                    action_counts["end"] += 1
+                                else:
+                                    action_counts["other"] += 1
+                    else:
+                        if opponent_name.startswith("Rulebasedmodel"):
+                            try:
+                                selected = rule_based_opponent_agent(opponent_name, obs)
+                            except Exception as e:
+                                selected = random_agent(obs)
+                        elif opponent_type == "Current":
+                            opp_temperature = 1.0 if turn_num <= 15 else 0.1
+                            selected, sample = mcts_agent(obs, curr_deck, client, search_count=10, temperature=opp_temperature, epoch=current_epoch)
+                            sample.pred_val = sample.value
+                            
+                            opt_type_val = -1
+                            played_card_id = -1
+                            attached_card_id = -1
+                            attached_target_id = -1
+                            evolved_card_id = -1
+                            attack_id = -1
+                            if selected and len(selected) > 0:
+                                sel_idx = selected[0]
+                                options = obs.get("select", {}).get("option", [])
+                                if sel_idx < len(options):
+                                    opt = options[sel_idx]
+                                    opt_type_val = opt.get("type", -1)
+                                    if opt_type_val == 7: # PLAY
+                                        hand = state_ps.hand
+                                        card_idx = opt.get("index", -1)
+                                        if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
+                                            played_card_id = hand[card_idx].id
+                                    elif opt_type_val == 8: # ATTACH
+                                        hand = state_ps.hand
+                                        card_idx = opt.get("index", -1)
+                                        if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
+                                            attached_card_id = hand[card_idx].id
+                                        target_area = opt.get("inPlayArea", opt.get("area", opt.get("targetArea", -1)))
+                                        target_idx = opt.get("inPlayIndex", opt.get("index", opt.get("targetIndex", -1)))
+                                        if target_area == 4 or target_area == "active": # ACTIVE
+                                            if len(state_ps.active) > 0 and state_ps.active[0] is not None:
+                                                attached_target_id = state_ps.active[0].id
+                                        elif target_area == 5 or target_area == "bench": # BENCH
+                                            if 0 <= target_idx < len(state_ps.bench) and state_ps.bench[target_idx] is not None:
+                                                attached_target_id = state_ps.bench[target_idx].id
+                                    elif opt_type_val == 9: # EVOLVE
+                                        hand = state_ps.hand
+                                        card_idx = opt.get("index", -1)
+                                        if 0 <= card_idx < len(hand) and hand[card_idx] is not None:
+                                            evolved_card_id = hand[card_idx].id
+                                    elif opt_type_val == 13: # ATTACK
+                                        attack_id = opt.get("attackId", -1)
+                                        
+                            pre_metrics["action_type"] = opt_type_val
+                            pre_metrics["played_card_id"] = played_card_id
+                            pre_metrics["attached_card_id"] = attached_card_id
+                            pre_metrics["attached_target_id"] = attached_target_id
+                            pre_metrics["evolved_card_id"] = evolved_card_id
+                            pre_metrics["attack_id"] = attack_id
+                            if sample is not None:
+                                samples[my_player_idx].append((sample, pre_metrics))
+                        elif opp_model is not None:
+                            selected, sample = mcts_agent(obs, curr_deck, opp_model, search_count=10)
+                        else:
+                            selected = random_agent(obs)
+                    
+                    if selected and len(selected) > 0:
+                        sel_idx = selected[0]
+                        options = obs.get("select", {}).get("option", [])
+                        if sel_idx < len(options):
+                            opt = options[sel_idx]
+                            opt_type = opt.get("type", -1)
+                            if opt_type == 13 or opt_type == OptionType.ATTACK:
+                                episode_attacked[curr_player] = True
+                                
+                    try:
+                        obs = battle_select(selected)
+                    except IndexError:
+                        selected = random_agent(obs)
+                        try:
+                            obs = battle_select(selected)
+                        except IndexError:
+                            obs = battle_select([0])
+
+                    
+                battle_finish()
+            except Exception as e:
+                import traceback
+                print(f"Error in worker {worker_id} simulation:", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+                sys.stderr.flush()
+                result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, [], -1, 0, {}, 0.0, 0, {}, {})))
+                continue
+            
+            result = obs["current"]["result"]
+            obs_class = to_observation_class(obs)
+            final_turn = obs_class.current.turn if (obs_class is not None and obs_class.current is not None) else 0
+            
+            processed_samples = []
+            rc_worker = {
+                "prize_taken": 0.0, "prize_lost": 0.0, "kos": 0.0, "own_kos": 0.0,
+                "energy": 0.0, "bench": 0.0, "deckout": 0.0, "terminal": 0.0, "stall": 0.0,
+                "no_energy": 0.0, "strategic": 0.0,
+                "r_knockout": 0.0, "r_attack_ready": 0.0, "r_backup_ready": 0.0, "r_bench_setup": 0.0,
+                "r_evolution_progress": 0.0, "r_stadium_value": 0.0, "r_retreat_eff": 0.0,
+                "r_damage_eff": 0.0, "r_lethal_detection": 0.0, "r_supporter_eff": 0.0,
+                "r_supporter_opp_cost": 0.0, "r_hand_congestion": 0.0, "r_deck_preservation": 0.0,
+                "r_missed_attack": 0.0, "r_donk_prevention": 0.0, "r_action_conv": 0.0,
+                "r_search_quality": 0.0, "r_search_tempo": 0.0, "r_early_aggro": 0.0,
+            }
+            
+            for i in range(2):
+                player_samples = samples[i]
+                n_steps = len(player_samples)
+                if n_steps == 0:
+                    continue
+                    
+                first_turn_of_player = player_samples[0][1].get("turn", 1)
+                went_second = (first_turn_of_player == 2)
+                
+                num_attacks = sum(1 for _, pre in player_samples if pre.get("action_type") == 13)
+                if i == result:
+                    if num_attacks == 0:
+                        terminal_reward = -0.50  # Disqualify passive 0-attack deckout wins
+                    elif final_turn <= 5:
+                        terminal_reward = 1.50   # Early Win Velocity Bonus (+0.50)
+                    elif final_turn <= 10:
+                        terminal_reward = 1.25   # Fast Win Velocity Bonus (+0.25)
+                    elif final_turn <= 20:
+                        terminal_reward = 1.00   # Standard Win
+                    else:
+                        terminal_reward = 0.50   # Slow Win Decay
+                elif result == 2:
+                    terminal_reward = 0.0
+                elif result == -1:
+                    terminal_reward = -1.0
+                else:
+                    terminal_reward = -1.0
+
+                rewards = []
+                has_attacked_flag = False
+                has_taken_prize_flag = False
+                has_lost_prize_flag = False
+                last_mimikyu_retreat_turn = -999
+                for step_idx in range(n_steps):
+                    sample_obj, pre = player_samples[step_idx]
+                    
+                    if step_idx < n_steps - 1:
+                        _, post = player_samples[step_idx + 1]
+                    else:
+                        final_obs = to_observation_class(obs)
+                        final_ps = final_obs.current.players[i]
+                        final_opp_ps = final_obs.current.players[1 - i]
+                        final_active_pk = final_ps.active[0] if (len(final_ps.active) > 0 and final_ps.active[0] is not None) else None
+                        final_active_id = final_active_pk.id if final_active_pk else -1
+                        final_active_energies = count_effective_energy_cards(final_active_pk.energyCards) if final_active_pk else 0
+                        
+                        final_opp_active_pk = final_opp_ps.active[0] if (len(final_opp_ps.active) > 0 and final_opp_ps.active[0] is not None) else None
+                        final_opp_active_id = final_opp_active_pk.id if final_opp_active_pk else -1
+                        
+                        final_bench_list = [p for p in final_ps.bench if p is not None]
+                        final_bench_ids = [p.id for p in final_bench_list]
+                        final_stadium_id = final_obs.current.stadium[0].id if (len(final_obs.current.stadium) > 0 and final_obs.current.stadium[0] is not None) else -1
+                        
+                        post = {
+                            "prizes": len(final_ps.prize),
+                            "opp_prizes": len(final_opp_ps.prize),
+                            "energy": count_attached_energy(final_ps),
+                            "active_energy": count_active_energy(final_ps),
+                            "pokemon": count_pokemon(final_ps),
+                            "opp_pokemon": count_pokemon(final_opp_ps),
+                            "opp_bench_ids": [p.id for p in final_opp_ps.bench if p is not None],
+                            "bench_size": len(final_bench_list),
+                            "deck_size": final_ps.deckCount,
+                            "opp_deck_size": final_opp_ps.deckCount,
+                            "energy_attached_flag": True,
+                            "active_id": final_active_id,
+                            "active_energies": final_active_energies,
+                            "opp_active_id": final_opp_active_id,
+                            "active_hp": final_active_pk.hp if final_active_pk else 0,
+                            "opp_active_hp": final_opp_active_pk.hp if final_opp_active_pk else 0,
+                            "stadium_id": final_stadium_id,
+                            "bench_ids": final_bench_ids,
+                            "bench_energies": [count_effective_energy_cards(p.energyCards) for p in final_ps.bench if p is not None],
+                            "bench_damage": [p.maxHp - p.hp for p in final_ps.bench if p is not None],
+                            "hand_size": len(final_ps.hand) if final_ps.hand is not None else 0,
+                            "hand_ids": [c.id for c in final_ps.hand if c is not None] if final_ps.hand is not None else [],
+                            "discard_size": len(final_ps.discard) if final_ps.discard is not None else 0,
+                            "discard_energy": sum(1 for c in final_ps.discard if c is not None and c.id in [1, 5, 15]),
+                            "turn": final_obs.current.turn,
+                            "has_attack_option": False,
+                            "has_attach_option": False,
+                            "lockout_turns": episode_lockouts[i]
+                        }
+                    
+                    prizes_taken = pre["prizes"] - post["prizes"]
+                    prizes_lost = pre["opp_prizes"] - post["opp_prizes"]
+                    opp_kos = pre["opp_pokemon"] - post["opp_pokemon"]
+                    own_kos = pre["pokemon"] - post["pokemon"]
+                    energy_attached = post["energy"] - pre["energy"]
+                    active_energy_attached = post.get("active_energy", 0) - pre.get("active_energy", 0)
+                    bench_energy_attached = energy_attached - active_energy_attached
+                    
+                    action_type = pre.get("action_type", -1)
+                    
+                    lockout_turns = pre.get("lockout_turns", 0)
+                    opp_deck_size = pre.get("opp_deck_size", 40)
+                    if action_type not in (0, 14):  # Active move (play, attach, evolve, attack, etc.)
+                        r_stall = 0.0
+                    elif opp_deck_size <= 5:
+                        r_stall = 0.0
+                    else:
+                        r_stall = -0.002
+                        if lockout_turns > 3:
+                            r_stall -= min(0.05, 0.005 * (lockout_turns - 3))
+                    r_prize_t = prizes_taken * 0.5 if prizes_taken > 0 else 0.0
+                    if prizes_taken > 0 and not has_taken_prize_flag:
+                        r_prize_t += 0.50
+                        has_taken_prize_flag = True
+                    r_prize_l = - (prizes_lost * 0.35) if prizes_lost > 0 else 0.0
+                    if prizes_lost > 0 and not has_lost_prize_flag:
+                        r_prize_l -= 0.35
+                        has_lost_prize_flag = True
+                    r_ko = prizes_taken * 0.30 if prizes_taken > 0 else 0.0
+                    r_own_ko = - (own_kos * 0.15) if own_kos > 0 else 0.0
+
+                    # NOTE: Inline r_en was removed to eliminate duplicate reward calculation with energy_evaluator.py.
+                    # All energy attachment rewards and overcharge penalties are handled by r_strategic -> energy_evaluator pipeline.
+                    r_en = 0.0
+                    r_no_en = -0.05 if (action_type != 8 and pre.get("has_energy_in_hand", False)) else 0.0
+                        
+                    comp_dict = calculate_strategic_reward_components(pre, post, action_type, step_idx, went_second, i, opponent_name)
+                    r_strategic = sum(comp_dict.values())
+
+                    r_bench = 0.0
+                    if post["bench_size"] == 0:
+                        r_bench -= 0.05
+                        if post.get("turn", 0) <= 2:
+                            r_bench -= 0.05
+                    elif post["bench_size"] >= 3 and any(cid in (65, 66, 67) for cid in post.get("opp_bench_ids", []) + [post.get("opp_active_id", -1)]):
+                        r_bench -= 0.05
+                    elif post["bench_size"] == 5:
+                        r_bench -= 0.02
+
+                    r_deck = 0.0
+                    if post["deck_size"] == 0:
+                        r_deck -= 0.50
+                        
+                    STRATEGIC_SCALE = 0.50
+                    step_reward = r_stall + r_prize_t + r_prize_l + r_ko + r_own_ko + r_no_en + r_bench + r_deck + (r_strategic * STRATEGIC_SCALE)
+                    step_reward = max(-0.25, min(0.25, step_reward))
+
+                    if i == my_player_idx:
+                        rc_worker["prize_taken"] += r_prize_t
+                        rc_worker["prize_lost"] += r_prize_l
+                        rc_worker["kos"] += r_ko
+                        rc_worker["own_kos"] += r_own_ko
+                        rc_worker["energy"] += comp_dict.get("r_attack_ready", 0.0)
+                        rc_worker["no_energy"] += r_no_en
+                        rc_worker["bench"] += r_bench
+                        rc_worker["deckout"] += r_deck
+                        rc_worker["stall"] += r_stall
+                        rc_worker["strategic"] += r_strategic
+                        for ck, cv in comp_dict.items():
+                            if ck in rc_worker:
+                                rc_worker[ck] += cv
+                        
+                    rewards.append(step_reward)
+                    
+                if i == my_player_idx:
+                    rc_worker["terminal"] += terminal_reward
+                    
+                processed_samples.extend(compute_gae_advantages(player_samples, rewards, terminal_reward))
+
+            entropy_accum = 0.0
+            entropy_count = 0
+            for sample_obj, _ in samples[my_player_idx]:
+                if sample_obj is not None and hasattr(sample_obj, 'policy') and len(sample_obj.policy) > 1:
+                    policy_probs = [max(1e-8, p) for p in sample_obj.policy]
+                    p_sum = sum(policy_probs)
+                    if p_sum > 0:
+                        import math
+                        probs_norm = [p / p_sum for p in policy_probs]
+                        entropy = -sum(p * math.log(p) for p in probs_norm)
+                        entropy_accum += entropy
+                        entropy_count += 1
+                        
+            result_queue.put(("PLAY_SELF_COMPLETE", (worker_id, processed_samples, result, final_turn, rc_worker, entropy_accum, entropy_count, action_counts, played_cards, expert_log, went_second, my_player_idx, total_steps, disagreement_steps)))
+            
+        elif cmd == "EVAL":
+            sample_deck, opponent_deck, opponent_name = args
+            
+            try:
+                obs, start_data = battle_start(sample_deck, opponent_deck)
+                if start_data.errorPlayer >= 0:
+                    result_queue.put(("EVAL_COMPLETE", (worker_id, opponent_name, -1.0)))
+                    continue
+            except Exception as e:
+                result_queue.put(("EVAL_COMPLETE", (worker_id, opponent_name, -1.0)))
+                continue
+                
+            your_index = obs["current"]["yourIndex"]
+            step_count = 0
+            while True:
+                step_count += 1
+                if obs["current"]["result"] >= 0 or step_count > 400:
+                    break
+                
+                curr_player = obs["current"]["yourIndex"]
+                
+                if curr_player == your_index:
+                    options = obs.get("select", {}).get("option", [])
+                    if len(options) <= 1:
+                        selected = [0]
+                    else:
+                        eval_search_count = 0
+                        selected, _ = mcts_agent(obs, sample_deck, client, search_count=eval_search_count, temperature=0.0, opponent_name=opponent_name)
+
+                else:
+                    if opponent_name.startswith("Rulebasedmodel"):
+                        try:
+                            selected = rule_based_opponent_agent(opponent_name, obs)
+                        except Exception as e:
+                            selected = random_agent(obs)
+                    else:
+                        selected = random_agent(obs)
+                try:
+                    obs = battle_select(selected)
+                except IndexError:
+                    selected = random_agent(obs)
+                    obs = battle_select(selected)
+                
+            battle_finish()
+            result = obs["current"]["result"]
+            
+            if result == 2:
+                outcome = 0.5
+            elif result == your_index:
+                outcome = 1.0
+            else:
+                outcome = 0.0
+                
+            result_queue.put(("EVAL_COMPLETE", (worker_id, opponent_name, outcome)))

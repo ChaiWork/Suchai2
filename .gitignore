@@ -2,6 +2,12 @@
 # Pokémon TCG AI — .gitignore
 # ============================================================
 
+# ---- Opponent Deck Directories ----
+# These are large collections of rule-based agent decks used for evaluation.
+# They are not required to understand the core AI architecture.
+decks/
+Rulebasedmodel/
+
 # ---- Model Checkpoints (too large for GitHub; see models/README.md) ----
 *.pth
 *.pt
@@ -79,3 +85,4 @@ desktop.ini
 
 # ---- Scratch / One-off Scripts ----
 scratch/
+
