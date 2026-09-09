@@ -82,8 +82,8 @@ The expert bonus decays with epoch (NN dominates over time) and scales with:
 **Requirements:** Python 3.10+, PyTorch 2.x, CUDA-capable GPU (recommended)
 
 ```bash
-git clone https://github.com/ChaiWork/Suchai2.git
-cd Suchai2
+git clone https://github.com/ChaiWork/PTCG-AI.git
+cd PTCG-AI
 pip install -r requirements.txt
 ```
 
